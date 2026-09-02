@@ -101,21 +101,27 @@ def joint_pos_target_l2(env: ManagerBasedRLEnv, target: float, asset_cfg: SceneE
     # compute the reward
     return torch.sum(torch.square(joint_pos - target), dim=1)
 
-def standing_joint_pos_target_l2(
-    env: ManagerBasedRLEnv, target: float, command_name: str, asset_cfg: SceneEntityCfg
+def standing_joint_default_deviation_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    height_gate: float = 0.735,
 ) -> torch.Tensor:
-    """Penalize joint position deviation from a target value, gated to the standing regime.
+    """Penalize squared deviation from the default joint positions, gated by commanded height.
 
-    Same formulation as :func:`joint_pos_target_l2`, but active only when the commanded height
-    is at least 0.735 m (near standing). During squatting, hip flexion and ankle dorsiflexion
-    are mechanically required, so an ungated deviation penalty would fight the core task.
+    Matches the official HOMIE ``deviation_hip/ankle_joint`` semantics: the deviation is measured
+    against the asset's default joint positions (non-zero for the G1 leg pitch joints), and the
+    term is active only when the commanded height reaches ``height_gate``. During deep squatting,
+    hip flexion and ankle dorsiflexion are mechanically required, so the gate keeps the penalty
+    out of the low-height regime.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     joint_pos = wrap_to_pi(asset.data.joint_pos[:, asset_cfg.joint_ids])
-    deviation = torch.sum(torch.square(joint_pos - target), dim=1)
-    # standing-height gate (official HOMIE design)
+    default_pos = wrap_to_pi(asset.data.default_joint_pos[:, asset_cfg.joint_ids])
+    deviation = torch.sum(torch.square(joint_pos - default_pos), dim=1)
+    # commanded-height gate (official HOMIE design)
     height_command_w = env.command_manager.get_term(command_name).height_command_world
-    gate = (height_command_w[:, 0] >= 0.735).float()
+    gate = (height_command_w[:, 0] >= height_gate).float()
     return deviation * gate
 
 def track_lin_vel_xy_yaw_frame_exp(
@@ -169,6 +175,57 @@ def knee_guidance_l1(
     q_norm = (joint_pos - limits[..., 0]) / (limits[..., 1] - limits[..., 0]).clamp(min=1e-6)
     # penalize the mismatch between the height error sign and the knee flexion level
     return torch.abs(height_error.unsqueeze(1) * (q_norm - 0.5)).norm(dim=1)
+
+def leg_synergy_manifold_exp(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, sigma: float = 0.2
+) -> torch.Tensor:
+    """Reward keeping each leg's sagittal pitch joints on a 2D synergy manifold [-1/0].
+
+    The three pitch joints per leg (hip / knee / ankle) are first normalized by their full range
+    of motion, :math:`\\tilde{q}_i = (q_i - q_{0,i}) / (q_{i,max} - q_{i,min})`, so that the large
+    knee travel cannot mask fine ankle adjustments. In this normalized space two orthogonal
+    synergy directions are fixed a priori:
+
+    * :math:`u_1` (PC1, lower-limb folding synergy): unit vector of :math:`v_1 = [0.5, 1.0, 0.5]`,
+      coupling knee and ankle folding during squatting;
+    * :math:`u_2` (PC2, hip-torso balancing synergy): Gram-Schmidt orthogonalization of
+      :math:`v_2 = [1.0, -0.2, -0.5]` against :math:`u_1`, capturing hip pitch compensating the
+      torso pitch balance.
+
+    The squared orthogonal distance to the plane spanned by :math:`V_{syn} = [u_1, u_2]`,
+    :math:`\\|d_\\perp\\|^2 = \\tilde{q}^T P_\\perp \\tilde{q}` with
+    :math:`P_\\perp = I - V_{syn} V_{syn}^T`, is accumulated over both legs and mapped through a
+    Gaussian kernel: :math:`\\exp(-\\|d_\\perp\\|^2 / \\sigma^2) - 1 \\in [-1, 0]`. ``sigma`` is the
+    manifold bandwidth: at a residual distance of one sigma the penalty reaches 63% of its
+    maximum. The result is non-positive, so it is meant to be mounted with a positive weight.
+
+    Note:
+        ``asset_cfg.joint_names`` must list the six pitch joints in the order
+        ``[left_hip, left_knee, left_ankle, right_hip, right_knee, right_ankle]``; indices are
+        resolved by name with ``preserve_order=True`` to guarantee this order regardless of the
+        asset's internal joint order.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    # resolve the six pitch joints in the exact configured order
+    joint_ids, _ = asset.find_joints(asset_cfg.joint_names, preserve_order=True)
+    # normalized positions: offset from the default pose, scaled by the full range of motion
+    q = asset.data.joint_pos[:, joint_ids]
+    q0 = asset.data.default_joint_pos[:, joint_ids]
+    limits = asset.data.joint_pos_limits[:, joint_ids]  # (E, 6, 2)
+    rom = (limits[..., 1] - limits[..., 0]).clamp(min=1e-6)
+    q_norm = ((q - q0) / rom).reshape(-1, 3)  # (E*2, 3), rows = [left leg, right leg]
+    # fixed synergy basis: u1 = normalize(v1), u2 = Gram-Schmidt(v2) against u1
+    v1 = torch.tensor([0.5, 1.0, 0.5], device=env.device)
+    u1 = v1 / v1.norm()
+    v2 = torch.tensor([1.0, -0.2, -0.5], device=env.device)
+    u2 = v2 - (v2 @ u1) * u1
+    u2 = u2 / u2.norm()
+    # orthogonal-complement projector P_perp = I - u1 u1^T - u2 u2^T (symmetric)
+    p_perp = torch.eye(3, device=env.device) - torch.outer(u1, u1) - torch.outer(u2, u2)
+    # squared orthogonal distance to the synergy plane, accumulated over both legs
+    residual = q_norm @ p_perp  # symmetric projector: q @ P == (P q^T)^T
+    dist_sq = torch.square(residual).sum(dim=1).reshape(-1, 2).sum(dim=1)  # (E,)
+    return torch.exp(-dist_sq / sigma**2) - 1.0
 
 def feet_ground_parallel_var(
     env: ManagerBasedRLEnv,

@@ -289,35 +289,47 @@ class RewardsCfg:
     )
 
     # =====================================================================
-    # 蹲下引导（膝关节屈曲/伸展方向引导）
+    # 下肢协同约束（2D 协同流形，替代膝关节引导）
     # =====================================================================
-    # 膝关节引导：r = Σ|e·(q_norm - 0.5)|，高度误差加权约束膝关节偏离行程中点，
-    # 防止“跪式下蹲”等病态解；高度到位（e≈0）时约束自动消失（负权重惩罚）
-    knee_guidance = RewTerm(
-        func=mdp.knee_guidance_l1,
-        weight=-0.75,
+    # 下肢协同流形奖励：r = exp(-||d_⊥||²/σ²) - 1 ∈ [-1, 0]（函数返回非正值，正权重挂载）；
+    # 双腿矢状面 hip/knee/ankle 三 Pitch 关节按全行程归一（相对默认位，防止膝大变幅
+    # 掩盖踝微调），惩罚偏离 PC1 折叠协同 [0.5,1,0.5] 与 PC2 髋部平衡补偿 [1,-0.2,-0.5]
+    # （Gram-Schmidt 正交化）张成的 2D 协同平面；关节顺序由函数内 preserve_order 保证；
+    # sigma 为流形带宽（残差距离达 sigma 时惩罚至满值 63%），0.2 ≈ 膝关节 33° 容差；
+    # 注意过小会使严重病态姿态饱和在 -1 附近梯度变平，训练卡死时可放宽至 0.3~0.5
+    leg_synergy = RewTerm(
+        func=mdp.leg_synergy_manifold_exp,
+        weight=0.75,
         params={
-            "command_name": "pelvis_height",
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_knee_joint"]),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    "left_hip_pitch_joint",
+                    "left_knee_joint",
+                    "left_ankle_pitch_joint",
+                    "right_hip_pitch_joint",
+                    "right_knee_joint",
+                    "right_ankle_pitch_joint",
+                ],
+            ),
+            "sigma": 0.2,
         },
     )
-    # 髋关节回默认位：仅在站立高度（命令 ≥ 0.735 m）约束，深蹲必须屈髋故门控保留；
-    # 本项目 USD 默认关节位置均为 0，等价于偏离默认位惩罚（门控版自定义函数）
+    # 髋关节回默认位：偏离默认位平方惩罚，命令高度 ≥ 0.735 m 门控（低区间放行屈髋）；
+    # 默认位从资产动态读取（本项目 hip_yaw/roll 默认 0）
     hip_default_deviation = RewTerm(
-        func=mdp.standing_joint_pos_target_l2,
+        func=mdp.standing_joint_default_deviation_l2,
         weight=-0.5,
         params={
-            "target": 0.0,
             "command_name": "pelvis_height",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw_joint", ".*_hip_roll_joint"]),
         },
     )
-    # 踝关节回默认位：同上门控，仅站立高度约束踝关节（深蹲背屈是机械必需，不可全区间惩罚）
+    # 踝关节回默认位：同上门控；默认位动态读取（ankle_pitch 默认 -0.2，不可用固定 target=0）
     ankle_default_deviation = RewTerm(
-        func=mdp.standing_joint_pos_target_l2,
+        func=mdp.standing_joint_default_deviation_l2,
         weight=-0.5,
         params={
-            "target": 0.0,
             "command_name": "pelvis_height",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"]),
         },
@@ -357,7 +369,7 @@ class RewardsCfg:
     # 复用既有 feet_slide（其实现即该公式，返回正惩罚量）
     feet_slip = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.25,
+        weight=-0.3,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"]),
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
