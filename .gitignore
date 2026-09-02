@@ -82,6 +82,7 @@ _build
 
 # Dev-time files, generated stuff
 **/__*
+!**/__init__.py
 
 # Isaac Lab CI environments in native mode
 **/_isaaclab_install_ci_*
