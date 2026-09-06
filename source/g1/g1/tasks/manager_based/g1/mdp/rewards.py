@@ -184,19 +184,21 @@ def leg_synergy_manifold_exp(
     The three pitch joints per leg (hip / knee / ankle) are first normalized by their full range
     of motion, :math:`\\tilde{q}_i = (q_i - q_{0,i}) / (q_{i,max} - q_{i,min})`, so that the large
     knee travel cannot mask fine ankle adjustments. In this normalized space two orthogonal
-    synergy directions are fixed a priori:
+    synergy directions are fitted from data:
 
-    * :math:`u_1` (PC1, lower-limb folding synergy): unit vector of :math:`v_1 = [-0.5, 1.0, -0.5]`,
+    * :math:`u_1` (PC1, lower-limb folding synergy): unit vector of :math:`v_1 = [-0.371, 0.807, -0.459]`,
       following the G1 joint sign conventions during squatting (hip flexion negative, knee
-      flexion positive, ankle dorsiflexion negative), coupling the three pitch joints into a
-      single folding direction;
-    * :math:`u_2` (PC2, hip-torso balancing synergy): Gram-Schmidt orthogonalization of
-      :math:`v_2 = [-1.0, -0.2, 0.5]` against :math:`u_1`, capturing hip pitch compensating the
-      torso pitch balance.
+      flexion positive, ankle dorsiflexion negative);
+    * :math:`u_2` (PC2, secondary compensation mode): :math:`v_2 = [-0.548, 0.209, 0.810]`,
+      Gram-Schmidt orthogonalized against :math:`u_1` (the fitted vectors are already
+      near-orthogonal; the projection is kept as a numerical safeguard for rounding).
 
-    The joint-direction signs (equivalently a sign matrix :math:`S = \\text{diag}(-1, +1, -1)`)
-    are baked into the basis vectors, so the synergy plane matches the physical squatting
-    trajectory in raw normalized coordinates.
+    Both basis vectors are the leading two columns of a non-centered SVD fitted on retargeted
+    squatting data in coordinates anchored at the default pose :math:`q_0` and scaled by the
+    full range of motion (99.7% of the data variance explained); the joint-direction signs
+    (equivalently a sign matrix :math:`S = \\text{diag}(-1, +1, -1)`) are inherently reflected
+    in the fitted vectors, so the synergy plane matches the physical squatting trajectory in
+    raw normalized coordinates.
 
     The squared orthogonal distance to the plane spanned by :math:`V_{syn} = [u_1, u_2]`,
     :math:`\\|d_\\perp\\|^2 = \\tilde{q}^T P_\\perp \\tilde{q}` with
@@ -220,13 +222,13 @@ def leg_synergy_manifold_exp(
     limits = asset.data.joint_pos_limits[:, joint_ids]  # (E, 6, 2)
     rom = (limits[..., 1] - limits[..., 0]).clamp(min=1e-6)
     q_norm = ((q - q0) / rom).reshape(-1, 3)  # (E*2, 3), rows = [left leg, right leg]
-    # fixed synergy basis: u1 = normalize(v1), u2 = Gram-Schmidt(v2) against u1.
-    # Joint sign conventions (G1): hip flexion (-), knee flexion (+), ankle dorsiflexion (-),
-    # i.e. the physical squat direction v_phys = [-0.5, 1.0, -0.5]; the sign matrix
-    # S = diag(-1, +1, -1) is baked into both basis vectors.
-    v1 = torch.tensor([-0.5, 1.0, -0.5], device=env.device)
+    # data-driven synergy basis: leading two columns of a q0-anchored non-centered SVD fitted
+    # on retargeted squatting data (99.7% variance explained). G1 sign conventions (hip flex -,
+    # knee flex +, ankle dorsiflex -) are inherently reflected; Gram-Schmidt is kept as a
+    # numerical safeguard for the 3-decimal rounding of the fitted columns.
+    v1 = torch.tensor([-0.371, 0.807, -0.459], device=env.device)
     u1 = v1 / v1.norm()
-    v2 = torch.tensor([-1.0, -0.2, 0.5], device=env.device)
+    v2 = torch.tensor([-0.548, 0.209, 0.810], device=env.device)
     u2 = v2 - (v2 @ u1) * u1
     u2 = u2 / u2.norm()
     # orthogonal-complement projector P_perp = I - u1 u1^T - u2 u2^T (symmetric)
