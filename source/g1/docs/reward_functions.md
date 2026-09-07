@@ -6,7 +6,8 @@
 
 ## 一、总体说明
 
-- **任务**：双足机器人指定髋高（命令范围约 0.60 ~ 0.77 m）原地平衡站立与蹲起，零速度指令。
+- **任务**：双足机器人统一任务指令（四模式 STAND/SQUAT/WALK/SQUAT_WALK）：指定髋高
+  （命令范围约 0.60 ~ 0.77 m）平衡站立与蹲起，以及机体系速度跟随行走（vx/vy/ωz）。
 - **在用奖励项**：24 项（另有 1 项 `knee_guidance` 已注释保留，作消融基线）。
 - **权重生效机制**：Isaac Lab `RewardManager` 运行时按 `weight × r × dt` 累积，本项目
   `dt = 1/60 s`（`sim.dt=1/120`，`decimation=2`）。官方 HOMIE 在训练初始化时将权重乘策略
@@ -41,12 +42,16 @@
 - 简介：髋高对指令的跟踪，`r = exp(-4·|e|)`（官方 L1 指数核，零点梯度恒为 4，保留精细
   到位信号）。与官方的差异：官方相对脚底测高，本项目参考系不变、用世界系骨盆高度。
 
-### 4. zero_velocity —— 静止零速度约束
+### 4. track_velocity —— 速度跟踪（核心任务奖励）
 
-- 来源：Own（`zero_velocity_exp`）
+- 来源：Own（`track_velocity_exp`，参照 HOMIE `tracking_x/y/ang_vel` 高斯核）
 - 权重：+1.0
-- 简介：`r = exp(-4vx²) + exp(-4vy²) + exp(-4ω_yaw²)`，静止时满分 3.0，`std=0.25`。
-  官方无对应项，为本项目原地站立任务特化设计。
+- 简介：`r = Σ_i exp(-(v_cmd_i − v_actual_i)²/(2σ²))`，逐轴（vx/vy/ωz）高斯核，满分
+  3.0，`std=0.25`。指令取 `task_command` 速度切片 `[:, 1:4]`，误差用机体系
+  （`root_lin_vel_b` / `root_ang_vel_b`，与指令自带 metrics 同口径）。**单一未门控项
+  统一四模式**：STAND/SQUAT 指令速度为 0 → 退化为静止约束（与旧 `zero_velocity_exp`
+  逐位一致）；WALK/SQUAT_WALK → 跟踪非零指令。`zero_velocity_exp`（世界系静止惩罚）
+  本体保留作消融回退，已不在配置中挂载。
 
 ### 5. leg_synergy —— 下肢 2D 协同流形
 
@@ -217,12 +222,15 @@
 - 官方有、本项目未启用的项：`dof_acc`（-2.5e-7，关节空间加速度正则——已由动作空间二阶
   平滑 `action_smoothness` 替代）、`joint_tracking_error`、`joint_power`、`action_vanish`、
   `contact_momentum`、`dof_vel`（均为官方 CONSIDER 级可选项，视后续训练表现按需开启）。
+- 行走步态质量项（`feet_air_time` +0.05 / `feet_clearance` -0.25 / `contact_momentum`）：
+  行走专属、需 WALK 门控，且参考实现基于 isaacgym（需按 Isaac Lab ContactSensor 重写），
+  暂缓；待行走成为主任务时再评估（见主目录 TODO P2c）。
 
 ## 五、单步奖励预算（理想站姿，权重 × r × dt 口径）
 
 - `alive`：+0.0083
 - `track_pelvis_height`（e≈0）：+0.033
-- `zero_velocity`（满分 3.0）：+0.050
+- `track_velocity`（静止满分 3.0）：+0.050
 - `no_fly`：+0.0125
 - **合计正向基底 ≈ +0.10 / 步**
 

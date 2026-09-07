@@ -96,14 +96,28 @@ class G1SceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command specifications for the MDP."""
 
-    pelvis_height = mdp.UniformHeightCommandCfg(
+    # 统一任务指令项（SquatWalkCommand）：4 维 [h_offset, vx, vy, ωz]，髋高偏移（相对
+    # 默认站立髋高）与机体系速度目标联合采样。每 episode 先抽一次四模式互斥：
+    #   STAND(0.4) 原髋高站立 | SQUAT(0.4) 变髋高蹲起（零速） | WALK(0.2) 速度跟随行走（默认髋高）
+    #   SQUAT_WALK(0.0) 指定髋高下行走（混合模式预留槽位，纯配置即可启用）
+    # 单时钟双节奏：髋高每 (2,4) s 重采样都重抽（保留中途调髋高技能），速度仅在
+    # episode 首抽一次（步态不中途切换）；奖励的模式门控见主目录 TODO P2。
+    # 观测经切片消费（velocity_commands 3 维 + pelvis_height_cmd 1 维，见 PolicyCfg），
+    # 观测总维 83，旧 checkpoint 不兼容。
+    task_command = mdp.SquatWalkCommandCfg(
         asset_name="robot",
         resampling_time_range=(2.0, 4.0),
-        rel_default_envs=0.2,
-        ranges=mdp.UniformHeightCommandCfg.Ranges(height_offset=(-0.15, 0.02)),
+        rel_mode_envs=(0.4, 0.4, 0.2, 0.0),
+        ranges=mdp.SquatWalkCommandCfg.Ranges(
+            height_offset=(-0.15, 0.02),
+            lin_vel_x=(-0.3, 0.6),
+            lin_vel_y=(-0.15, 0.15),
+            ang_vel_z=(-0.8, 0.8),
+        ),
         height_success_threshold=0.03,
         debug_vis=True,
     )
+
 
 @configclass
 class ActionsCfg:
@@ -123,71 +137,32 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
+        """Policy observations, concatenated into a flat 83-D vector.
+
+        Order: base state (9) -> task command (4) -> joint state (58) -> last action (12).
         """
-        # observation terms (order preserved)
-        # =====================================================================
-        # 分组一：基座本体状态（本体感知，IMU 可获取量）
-        # =====================================================================
-        # 基座线速度：机体系下 xyz 三轴线速度（3 维），±0.1 均匀噪声模拟传感器误差
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
-        # 基座角速度：机体系下 roll/pitch/yaw 角速度（3 维），±0.2 噪声（陀螺仪噪声更大）
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        # 投影重力：重力向量投影到机体系（3 维），隐式提供躯干倾斜姿态信息，±0.05 噪声
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-        )
 
-        # =====================================================================
-        # 分组二：任务指令（策略的目标输入）
-        # =====================================================================
-        # 速度指令：当前 base_velocity 命令（vx, vy, yaw 角速度，3 维），
-        # 不加噪声（指令由上层给出，视为真值）
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-
-        # =====================================================================
-        # 分组三：关节状态（本体感知，编码器可获取量）
-        # =====================================================================
-        # 关节位置：各关节角度相对默认位姿的偏差（全部关节），±0.01 噪声模拟编码器精度
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        # 关节速度：各关节角速度（全部关节），±1.5 噪声（速度估计噪声远大于位置）
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
-
-        # =====================================================================
-        # 分组四：动作历史（支撑 PD 位置控制与平滑性）
-        # =====================================================================
-        # 上一步动作：上一次输出的动作目标，帮助策略感知当前控制目标，支撑平滑控制
-        actions = ObsTerm(func=mdp.last_action)
-
-        # =====================================================================
-        # 分组五：地形感知（平地任务已禁用）
-        # =====================================================================
-        # 地形高度扫描：置为 None 关闭，平地任务无需地形信息，减少观测维度
-        height_scan = None
-        """
-        # 本体状态
+        # 基座本体状态（IMU 可获取量）：线速度 ±0.1、角速度 ±0.2（陀螺仪噪声更大）、
+        # 投影重力 ±0.05（隐式提供躯干倾斜姿态）
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-        )
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
 
-        # 任务指令，当前pelvis_height的命令
-        pelvis_height_cmd = ObsTerm(func=mdp.generated_commands, params={"command_name": "pelvis_height"})
+        # 任务指令：task_command 4 维联合指令的切片，视为真值不加噪声；
+        # 速度 (vx, vy, ωz) 机体系 3 维 + 髋高偏移（相对默认站立髋高）1 维
+        velocity_commands = ObsTerm(func=mdp.task_command_velocity, params={"command_name": "task_command"})
+        pelvis_height_cmd = ObsTerm(func=mdp.task_command_height, params={"command_name": "task_command"})
 
-        # 关节状态（位置和速度）
+        # 关节状态（编码器可获取量）：位置 ±0.01、速度 ±1.5（速度估计噪声远大于位置）
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
 
-        # 动作历史
+        # 上一步动作：支撑 PD 位置控制与平滑性
         actions = ObsTerm(func=mdp.last_action)
-        
+
         def __post_init__(self):
-            # 启用噪声注入（训练时对观测加扰，提升鲁棒性；_PLAY 配置中会关闭）
+            # 训练时启用噪声注入（_PLAY 配置关闭）；所有观测项拼接为扁平向量
             self.enable_corruption = True
-            # 将所有观测项拼接成一个扁平向量，作为策略网络的单一输入
             self.concatenate_terms = True
 
 
@@ -261,7 +236,15 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
+    """Reward terms for the MDP.
+
+    注释约定：每项仅一行「语义 + 公式要点 + 门控」，公式推导、基向量来源、参数
+    敏感性等细节见 mdp/rewards.py 各函数 docstring。两类通用门控：
+
+    * 高度门控：命令髋高 ≥ 0.735 m（站立区间）才生效，深蹲区间放行；
+    * 零速模式门控：读 task_command 的 mode 缓冲，仅 STAND/SQUAT 生效，
+      WALK/SQUAT_WALK 放行（挂 ``velocity_command_name`` 参数即启用）。
+    """
 
     # =====================================================================
     # 生存与失败信号
@@ -272,46 +255,41 @@ class RewardsCfg:
     terminating = RewTerm(func=mdp.is_terminated, weight=-200.0)
 
     # =====================================================================
-    # 任务奖励（髋高追踪 + 静止零速度约束）
+    # 任务奖励（髋高追踪 + 速度跟踪）
     # =====================================================================
-    # 髋高追踪：r = exp(-4·|e|)（官方实现的绝对误差指数核），世界系测量；
-    # 零误差附近梯度恒为 4，保留精细到位信号（平方核在 e→0 时梯度趋零）
+    # 髋高追踪：r = exp(-4·|e|)，绝对误差指数核（官方），零误差附近梯度恒定保留精细到位信号
     track_pelvis_height = RewTerm(
         func=mdp.track_pelvis_height_exp,
         weight=2.0,
-        params={"command_name": "pelvis_height"},
+        params={"command_name": "task_command"},
     )
-    # 静止零速度约束：r = exp(-4·vx²) + exp(-4·vy²) + exp(-4·ω_yaw²)，静止时满分 3.0（本项目公式，官方无对应项）
-    zero_velocity = RewTerm(
-        func=mdp.zero_velocity_exp,
+    # 速度跟踪（核心任务奖励，统一四模式）：r = Σexp(-e²/(2σ²))，vx/vy/ωz 三轴机体系误差，
+    # 满分 3.0；指令取 task_command 速度切片 [vx,vy,ωz]，误差用机体系（与指令 metrics 同口径）。
+    # STAND/SQUAT 指令速度为 0 → 退化为静止约束（替代原 zero_velocity，无需门控）；
+    # WALK/SQUAT_WALK → 跟踪非零指令。zero_velocity_exp 本体保留作回退/消融。
+    track_velocity = RewTerm(
+        func=mdp.track_velocity_exp,
         weight=1.0,
-        params={"std": 0.25},
+        params={"command_name": "task_command", "std": 0.25},
     )
 
     # =====================================================================
     # 下肢协同约束（2D 协同流形）
     # =====================================================================
-    # 膝关节引导：r = Σ|e·(q_norm - 0.5)|，
-    # 高度误差加权约束膝关节偏离行程中点，防“跪式下蹲”等病态解，
-    # 高度到位（e≈0）时约束自动消失（负权重挂载）；
+    # 膝关节引导（消融基线，注释保留）：高度误差加权约束膝偏离行程中点，防“跪式下蹲”；
+    # 启用时补 "velocity_command_name": "task_command"（与 leg_synergy 门控口径一致）
     # knee_guidance = RewTerm(
     #     func=mdp.knee_guidance_l1,
     #     weight=-0.75,
     #     params={
-    #         "command_name": "pelvis_height",
+    #         "command_name": "task_command",
     #         "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_knee_joint"]),
     #     },
     # )
-    # 下肢协同流形奖励（替代 knee_guidance）：
-    #   公式：r = exp(-||d_⊥||²/σ²) - 1 ∈ [-1, 0]，函数返回非正值，正权重挂载；
-    #   双腿矢状面 hip/knee/ankle 三 Pitch 关节按全行程归一（相对默认位，
-    #   防膝大变幅掩盖踝微调），惩罚偏离 PC1 折叠协同 [-0.371,0.807,-0.459] 与
-    #   PC2 次级补偿模态 [-0.548,0.209,0.810]（Gram-Schmidt 正交化）张成的 2D 协同平面；
-    #   基向量来自重定向蹲起数据、以默认位为锚点的非中心化 SVD 拟合（解释 99.7% 方差），
-    #   天然内含 G1 关节符号约定（蹲下时髋/踝为负、膝为正）；
-    #   六关节顺序由函数内 preserve_order 按名解析，不依赖资产内部关节序；
-    #   sigma 为流形带宽：残差距离达 sigma 时惩罚至满值 63%，0.2 ≈ 膝关节 33° 容差；
-    #   过小会使严重病态姿态饱和在 -1 附近梯度变平，训练卡死时可放宽至 0.3~0.5
+    # 下肢协同流形（替代 knee_guidance）：r = exp(-||d⊥||²/σ²) - 1 ∈ [-1, 0]（正权重挂载），
+    # 双腿 hip/knee/ankle 按全行程归一后惩罚偏离 2D 协同平面（蹲起数据非中心化 SVD 拟合，
+    # 解释 99.7% 方差，内含 G1 符号约定）；sigma=0.2 为流形带宽（≈膝 33° 容差），
+    # 训练卡死时可放宽至 0.3~0.5；零速模式门控（行走步态天然偏离矢状面蹲起流形）
     leg_synergy = RewTerm(
         func=mdp.leg_synergy_manifold_exp,
         weight=0.75,
@@ -328,33 +306,34 @@ class RewardsCfg:
                 ],
             ),
             "sigma": 0.2,
+            "velocity_command_name": "task_command",
         },
     )
-    # 髋关节回默认位：偏离默认位平方惩罚，命令高度 ≥ 0.735 m 门控（低区间放行屈髋）；
-    # 默认位从资产动态读取（本项目 hip_yaw/roll 默认 0）
+    # 髋关节回默认位：偏离默认位平方惩罚（官方 deviation_hip）；高度 + 零速模式双门控
     hip_default_deviation = RewTerm(
         func=mdp.standing_joint_default_deviation_l2,
         weight=-0.5,
         params={
-            "command_name": "pelvis_height",
+            "command_name": "task_command",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw_joint", ".*_hip_roll_joint"]),
+            "velocity_command_name": "task_command",
         },
     )
-    # 踝关节回默认位：同上门控；默认位动态读取（ankle_pitch 默认 -0.2，不可用固定 target=0）
+    # 踝关节回默认位：同上双门控；默认位动态读取（ankle_pitch 默认 -0.2，不可用固定 target=0）
     ankle_default_deviation = RewTerm(
         func=mdp.standing_joint_default_deviation_l2,
         weight=-0.5,
         params={
-            "command_name": "pelvis_height",
+            "command_name": "task_command",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"]),
+            "velocity_command_name": "task_command",
         },
     )
 
     # =====================================================================
     # 躯干姿态与速度稳定性约束（使用 Isaac Lab 内置函数）
     # =====================================================================
-    # 躯干朝向惩罚：r = -||g_x||² - ||g_y||²，惩罚重力在躯干 x/y 轴的投影，保持直立不翻转；
-    # 内置 flat_orientation_l2 即该公式实现，取躯干连杆投影重力（注：root 为 pelvis）
+    # 躯干朝向惩罚：r = -||g_xy||²，惩罚重力在躯干 x/y 轴投影，保持直立（内置 flat_orientation_l2）
     flat_orientation = RewTerm(
         func=mdp.flat_orientation_l2,
         weight=-1.5,
@@ -368,8 +347,8 @@ class RewardsCfg:
     # =====================================================================
     # 足端约束（贴地、防滑、平行、接触力）
     # =====================================================================
-    # 脚掌贴地约束：r = -Σ Var(H_i)，以足底四角点高度方差近似，量级较小（约 1e-3 级）
-    # 故权重取大值；仅持续接触 ≥ 3·dt 的脚参与（官方门控，避免抬脚瞬态误罚）
+    # 脚掌贴地约束：r = -Σ Var(足底四角点高度)，量级 ~1e-3 故权重大；
+    # 仅持续接触 ≥ 3·dt 的脚参与 + 零速模式门控
     feet_ground_parallel = RewTerm(
         func=mdp.feet_ground_parallel_var,
         weight=-50.0,
@@ -378,10 +357,10 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"]),
             "foot_length": 0.18,
             "foot_width": 0.08,
+            "velocity_command_name": "task_command",
         },
     )
-    # 足部防滑惩罚：r = -Σ ||v_i|| · I_contact，触地期间惩罚足端水平切向速度，
-    # 复用既有 feet_slide（其实现即该公式，返回正惩罚量）
+    # 足部防滑惩罚：r = -Σ ||v_foot|| · I_contact，触地期间惩罚足端水平速度（复用 feet_slide）
     feet_slip = RewTerm(
         func=mdp.feet_slide,
         weight=-0.3,
@@ -390,19 +369,17 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
         },
     )
-    # 双足平行约束（官方实现）：r = -Var(D)，D 为左右脚三点（跟/中/尖）对应点间距集合，
-    # 三点沿足长方向间隔 0.18 m 合成；仅在站立高度（命令 ≥ 0.735 m）生效，
-    # 深蹲区间双脚布局本就不同故不约束（权重照抄官方未乘 dt 值）
+    # 双足平行约束（官方）：r = -Var(左右脚跟/中/尖三点间距)；高度 + 零速模式双门控，权重照抄官方
     feet_parallel = RewTerm(
         func=mdp.feet_parallel_var,
         weight=-3.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
-            "command_name": "pelvis_height",
+            "command_name": "task_command",
+            "velocity_command_name": "task_command",
         },
     )
-    # 足端接触力峰值惩罚：r = -Σ ReLU(||F|| - F_max)，限制足端接触力超限，
-    # 保护踝关节与真机结构（内置，阈值 400 N 与官方 max_contact_force 一致）
+    # 足端接触力峰值惩罚：r = -Σ ReLU(||F|| - 400 N)，保护踝关节与真机结构（内置，阈值同官方）
     feet_contact_forces = RewTerm(
         func=mdp.contact_forces,
         weight=-2.5e-4,
@@ -417,25 +394,27 @@ class RewardsCfg:
         weight=0.75,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"])},
     )
-    # 站立蠕行惩罚：惩罚离地脚数量（垂直接触力 < 0.1 N 视为离地），
-    # 抑制原地踏步/离地蠕动（官方 stand_still，已去门控）
+    # 站立蠕行惩罚：惩罚离地脚数量（< 0.1 N 视为离地），抑制原地踏步（官方）；
+    # 零速模式门控（行走必须抬脚，恢复官方 HOMIE 语义）
     stand_still = RewTerm(
         func=mdp.stand_still,
         weight=-0.15,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"])},
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"]),
+            "velocity_command_name": "task_command",
+        },
     )
 
     # =====================================================================
     # 横向安全间距（双脚 / 双膝）
     # =====================================================================
-    # 双脚横向安全距离：双边钳制——下界防并拢（常开），上界防越分越开（仅站立高度 ≥0.735 m
-    # 门控，深蹲允许宽站姿）；公式整体非正，正权重作惩罚语义（与官方一致）
+    # 双脚横向安全距离：双边钳制——下界防并拢（常开），上界防越分（仅高度门控），正权重惩罚语义
     feet_lateral = RewTerm(
         func=mdp.feet_lateral_separation,
         weight=0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
-            "command_name": "pelvis_height",
+            "command_name": "task_command",
             "min_distance": 0.2,
             "max_distance": 0.35,
         },
@@ -446,7 +425,7 @@ class RewardsCfg:
         weight=1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=["left_knee_link", "right_knee_link"]),
-            "command_name": "pelvis_height",
+            "command_name": "task_command",
             "min_distance": 0.2,
             "max_distance": 0.35,
         },
@@ -464,10 +443,8 @@ class RewardsCfg:
     # =====================================================================
     # 能耗约束（关节空间）
     # =====================================================================
-    # 扭矩输出惩罚（官方形式）：r = -Σ(τ_i / k_i)²，按刚度归一使髋/踝不同量级可比；
-    # 仅下肢受控关节（不含腰/臂/手），防止深蹲保持时力矩爆炸（负权重惩罚）。
-    # 注：踝关节实际刚度仅 20，直接归一会使踝扭矩主导整个惩罚项（踝 20 Nm → 1 rad²，
-    # 而髋 100 Nm 才 1 rad²），故踝采用等效刚度 100 与髋膝对齐量级（负权重惩罚）
+    # 扭矩输出惩罚（官方）：r = -Σ(τ/k)²，按刚度归一使髋/踝量级可比；仅下肢关节；
+    # 踝实际刚度 20 会主导惩罚，取等效刚度 100 与髋膝对齐
     dof_torques = RewTerm(
         func=mdp.joint_torques_l2_normalized,
         weight=-2.5e-6,
@@ -489,8 +466,7 @@ class RewardsCfg:
     # =====================================================================
     # 关节限位与扭矩超限约束（安全硬边界）
     # =====================================================================
-    # 关节位置限制：r = -Σ ReLU(|θ - θ_0| 越界量)，内置 joint_pos_limits 即对软限位外超出量
-    # 的 ReLU 求和（软限位 = 硬限位 × 0.9），作用于腿部全部受控关节（负权重惩罚）
+    # 关节位置限位：r = -Σ ReLU(软限位外超出量)，软限位 = 硬限位 × 0.9（内置）
     dof_pos_limits = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-2.0,
@@ -501,8 +477,7 @@ class RewardsCfg:
             )
         },
     )
-    # 扭矩超限限制：r = -Σ ReLU(|τ| - τ_max)，惩罚驱动指令超出额定扭矩；
-    # 仅对显式执行器（DCMotor 腿/踝）有效，腰/臂/手的隐式执行器限位为 inf 会被自动跳过（负权重惩罚）
+    # 扭矩超限惩罚：r = -Σ ReLU(|τ| - τ_max)；隐式执行器限位 inf 自动跳过（内置）
     dof_torque_limits = RewTerm(
         func=mdp.joint_torque_limits,
         weight=-0.1,
@@ -513,8 +488,7 @@ class RewardsCfg:
             )
         },
     )
-    # 关节速度限位：r = -Σ ReLU(|ω| - ω_max·soft_ratio)（内置，超限量裁剪至 1 防爆炸），
-    # 官方权重极小（-2e-3），仅轻度约束腿部关节速度接近极限（负权重惩罚）
+    # 关节速度限位：r = -Σ ReLU(|ω| - ω_max·soft_ratio)，超限量裁剪至 1（内置，权重照抄官方）
     dof_vel_limits = RewTerm(
         func=mdp.joint_vel_limits,
         weight=-2e-3,

@@ -101,11 +101,29 @@ def joint_pos_target_l2(env: ManagerBasedRLEnv, target: float, asset_cfg: SceneE
     # compute the reward
     return torch.sum(torch.square(joint_pos - target), dim=1)
 
+def _zero_command_gate(
+    env: ManagerBasedRLEnv, command_name: str | None, zero_modes: tuple[int, ...]
+) -> torch.Tensor | None:
+    """Return a 0/1 gate active only in zero-velocity command modes, or None.
+
+    Reads the discrete per-episode ``mode`` buffer of the unified task command
+    (:class:`SquatWalkCommand`) instead of thresholding the commanded velocity norm: the gate
+    is 1 where the mode is one of ``zero_modes`` (defaults to STAND=0 / SQUAT=1, the modes
+    sampled with exactly zero velocity) and 0 elsewhere (WALK=2 / SQUAT_WALK=3). Returns None
+    when ``command_name`` is None so that callers stay backward compatible (no gating).
+    """
+    if command_name is None:
+        return None
+    mode = env.command_manager.get_term(command_name).mode
+    return torch.isin(mode, torch.tensor(zero_modes, dtype=torch.long, device=mode.device)).float()
+
 def standing_joint_default_deviation_l2(
     env: ManagerBasedRLEnv,
     command_name: str,
     asset_cfg: SceneEntityCfg,
     height_gate: float = 0.735,
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
 ) -> torch.Tensor:
     """Penalize squared deviation from the default joint positions, gated by commanded height.
 
@@ -114,6 +132,10 @@ def standing_joint_default_deviation_l2(
     term is active only when the commanded height reaches ``height_gate``. During deep squatting,
     hip flexion and ankle dorsiflexion are mechanically required, so the gate keeps the penalty
     out of the low-height regime.
+
+    When ``velocity_command_name`` is given, the term is additionally gated to zero-velocity
+    command environments (see :func:`_zero_command_gate`), so walking gaits are not forced back
+    to the standing default pose.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     joint_pos = wrap_to_pi(asset.data.joint_pos[:, asset_cfg.joint_ids])
@@ -122,6 +144,10 @@ def standing_joint_default_deviation_l2(
     # commanded-height gate (official HOMIE design)
     height_command_w = env.command_manager.get_term(command_name).height_command_world
     gate = (height_command_w[:, 0] >= height_gate).float()
+    # zero-velocity-command gate (optional): inactive while a walking command is tracked
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    if zero_gate is not None:
+        gate = gate * zero_gate
     return deviation * gate
 
 def track_lin_vel_xy_yaw_frame_exp(
@@ -154,13 +180,17 @@ def knee_guidance_l1(
     command_name: str,
     asset_cfg: SceneEntityCfg,
     soft_limits: bool = True,
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
 ) -> torch.Tensor:
     """Guide knee flexion/extension based on the sign of the pelvis height error [m·rad].
 
     Computes :math:`-\\|(h_r - h_{cmd}) \\cdot ((q - q_{min})/(q_{max} - q_{min}) - 1/2)\\|` over the
     knee joints. When the pelvis is above the commanded height, knee flexion (large normalized
     position) is encouraged; when below, knee extension is encouraged. Knee limits are read from
-    the asset data (soft limits by default), so no manual range parameters are needed.
+    the asset data (soft limits by default), so no manual range parameters are needed. When
+    ``velocity_command_name`` is given, the term is additionally gated to zero-velocity command
+    environments (see :func:`_zero_command_gate`).
     """
     asset: Articulation = env.scene[asset_cfg.name]
     # pelvis height error: positive when the pelvis is above the commanded height
@@ -174,10 +204,16 @@ def knee_guidance_l1(
         limits = asset.data.joint_pos_limits[:, asset_cfg.joint_ids]
     q_norm = (joint_pos - limits[..., 0]) / (limits[..., 1] - limits[..., 0]).clamp(min=1e-6)
     # penalize the mismatch between the height error sign and the knee flexion level
-    return torch.abs(height_error.unsqueeze(1) * (q_norm - 0.5)).norm(dim=1)
+    penalty = torch.abs(height_error.unsqueeze(1) * (q_norm - 0.5)).norm(dim=1)
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    return penalty if zero_gate is None else penalty * zero_gate
 
 def leg_synergy_manifold_exp(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, sigma: float = 0.2
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    sigma: float = 0.2,
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
 ) -> torch.Tensor:
     """Reward keeping each leg's sagittal pitch joints on a 2D synergy manifold [-1/0].
 
@@ -206,7 +242,10 @@ def leg_synergy_manifold_exp(
     Gaussian kernel: :math:`\\exp(-\\|d_\\perp\\|^2 / \\sigma^2) - 1 \\in [-1, 0]`. ``sigma`` is the
     manifold bandwidth: at a residual distance of one sigma the penalty reaches 63% of its
     maximum. The result is non-positive, so it is meant to be mounted with a positive weight.
-
+    When ``velocity_command_name`` is given, the term is additionally gated to zero-velocity
+    command environments (see :func:`_zero_command_gate`), since the walking swing/stance gait
+    naturally leaves the sagittal squatting manifold.
+    
     Note:
         ``asset_cfg.joint_names`` must list the six pitch joints in the order
         ``[left_hip, left_knee, left_ankle, right_hip, right_knee, right_ankle]``; indices are
@@ -236,7 +275,9 @@ def leg_synergy_manifold_exp(
     # squared orthogonal distance to the synergy plane, accumulated over both legs
     residual = q_norm @ p_perp  # symmetric projector: q @ P == (P q^T)^T
     dist_sq = torch.square(residual).sum(dim=1).reshape(-1, 2).sum(dim=1)  # (E,)
-    return torch.exp(-dist_sq / sigma**2) - 1.0
+    reward = torch.exp(-dist_sq / sigma**2) - 1.0
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    return reward if zero_gate is None else reward * zero_gate
 
 def feet_ground_parallel_var(
     env: ManagerBasedRLEnv,
@@ -244,6 +285,8 @@ def feet_ground_parallel_var(
     sensor_cfg: SceneEntityCfg,
     foot_length: float = 0.18,
     foot_width: float = 0.08,
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
 ) -> torch.Tensor:
     """Penalize the height variance of the four sole corners of each foot [m^2].
 
@@ -251,7 +294,9 @@ def feet_ground_parallel_var(
     the foot frame. Their world heights follow from the foot body pose, and the variance across
     the four points is zero only when the sole is parallel to the ground plane. Following the
     official implementation, only feet in sustained contact (at least ``3 * dt``) contribute,
-    so transient swing phases are not penalized.
+    so transient swing phases are not penalized. When ``velocity_command_name`` is given, the
+    term is additionally gated to zero-velocity command environments (see
+    :func:`_zero_command_gate`), where flat-foot contact is the intended stance.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     body_pos = asset.data.body_pos_w.torch[:, asset_cfg.body_ids]  # (E, B, 3)
@@ -271,16 +316,26 @@ def feet_ground_parallel_var(
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     sustained_contact = contact_sensor.data.current_contact_time.torch[:, sensor_cfg.body_ids] >= 3.0 * env.step_dt
     # sum the gated height variance over the feet
-    return (corner_heights.var(dim=-1, unbiased=False) * sustained_contact).sum(dim=1)
+    reward = (corner_heights.var(dim=-1, unbiased=False) * sustained_contact).sum(dim=1)
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    return reward if zero_gate is None else reward * zero_gate
 
-def feet_parallel_var(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, command_name: str) -> torch.Tensor:
+def feet_parallel_var(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str,
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
+) -> torch.Tensor:
     """Penalize non-parallel foot orientations via the variance of foot-pair distances [m^2].
 
     Each sole is approximated by three points along its length (heel, middle, toe). The set
     :math:`D` contains the three left-right distances between corresponding points, and
     :math:`\\text{Var}(D)` is zero only when the two feet are parallel, matching the official
     implementation. The term is gated to the standing regime (commanded height >= 0.735 m),
-    where foot symmetry matters; during squatting the foot layout naturally differs.
+    where foot symmetry matters; during squatting the foot layout naturally differs. When
+    ``velocity_command_name`` is given, the term is additionally gated to zero-velocity command
+    environments (see :func:`_zero_command_gate`), since a walking gait staggers the feet.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     body_pos = asset.data.body_pos_w.torch[:, asset_cfg.body_ids]  # (E, 2, 3), [left, right]
@@ -299,6 +354,10 @@ def feet_parallel_var(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, command
     # standing-height gate: active only when the commanded height is near standing
     height_command_w = env.command_manager.get_term(command_name).height_command_world
     gate = (height_command_w[:, 0] >= 0.735).float()
+    # zero-velocity-command gate (optional): inactive while a walking command is tracked
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    if zero_gate is not None:
+        gate = gate * zero_gate
     return feet_distances_var * gate
 
 def feet_lateral_separation(
@@ -353,23 +412,34 @@ def no_fly(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Reward keeping at least one foot grounded [0/1].
 
     Returns 1.0 when at least one foot maintains contact, preventing both feet from lifting
-    simultaneously during the standing task. The official version gates this on a zero
-    velocity command, which is always true for this task (no locomotion commands).
+    simultaneously (no jumping / aerial phase). The official HOMIE version gates this on a zero
+    velocity command; the gate is dropped here because at least one grounded foot is required
+    in every task mode -- standing, squatting and walking all keep a foot down, so the term
+    stays valid (and intentionally ungated) across the four modes.
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     contacts = contact_sensor.data.net_forces_w.torch[:, sensor_cfg.body_ids, 2] > 0.5
     return (contacts.sum(dim=1) >= 1).float()
 
-def stand_still(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def stand_still(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
+) -> torch.Tensor:
     """Penalize feet losing contact while standing still [#feet].
 
     Returns the number of feet whose vertical contact force dropped below 0.1 N, i.e. airborne
-    twitching or stepping-in-place is penalized for each lifted foot. The official version
-    gates this on a zero velocity command, which is always true for this task.
+    twitching or stepping-in-place is penalized for each lifted foot. When
+    ``velocity_command_name`` is given, the penalty is gated to zero-velocity command
+    environments (see :func:`_zero_command_gate`), restoring the official HOMIE semantics:
+    lifting feet is a required part of any walking gait.
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     airborne = contact_sensor.data.net_forces_w.torch[:, sensor_cfg.body_ids, 2] < 0.1
-    return airborne.sum(dim=1).float()
+    reward = airborne.sum(dim=1).float()
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    return reward if zero_gate is None else reward * zero_gate
 
 def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize feet sliding.
@@ -406,8 +476,9 @@ def feet_air_time_positive_biped(env, command_name: str, threshold: float, senso
     single_stance = torch.sum(in_contact.int(), dim=1) == 1
     reward = torch.min(torch.where(single_stance.unsqueeze(-1), in_mode_time, 0.0), dim=1)[0]
     reward = torch.clamp(reward, max=threshold)
-    # no reward for zero command
-    reward *= torch.linalg.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > 0.1
+    # no reward for zero command; the linear velocity target lives at elements 1-2 of the
+    # 4-D unified command [h, vx, vy, wz] (a 3-D-command [:, :2] slice would grab [h, vx])
+    reward *= torch.linalg.norm(env.command_manager.get_command(command_name)[:, 1:3], dim=1) > 0.1
     return reward
 
 def track_pelvis_height_exp(env, command_name: str) -> torch.Tensor:
@@ -421,24 +492,85 @@ def track_pelvis_height_exp(env, command_name: str) -> torch.Tensor:
     error = torch.abs(env.scene["robot"].data.root_pos_w.torch[:, 2] - height_command_w[:, 0])
     return torch.exp(-error * 4.0)
 
-def zero_velocity_exp(env: ManagerBasedRLEnv, std: float = 0.25, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def track_velocity_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "task_command",
+    std: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward tracking the commanded base velocity with per-axis exponential kernels [0/3].
+
+    Reads the body-frame velocity slice ``[vx, vy, wz]`` (elements 1-3) of the unified task
+    command and rewards matching the robot's base-frame velocity. The reward is the sum of
+    three Gaussian kernels, one per axis ``i in {x, y, yaw}``:
+
+        r = sum_i exp( -(v_cmd_i - v_actual_i)^2 / (2 * std^2) )
+
+    Each axis contributes at most 1, so the term is bounded in ``[0, 3]`` and is meant to be
+    mounted with a positive weight (matching the former ``zero_velocity_exp`` budget).
+
+    A single term covers all four task modes without any gating, because the command value
+    itself selects the objective: STAND / SQUAT command exactly zero velocity, so the term
+    degrades to the standing-still reward, while WALK / SQUAT_WALK command a nonzero velocity
+    that the policy is rewarded for following. This makes it a drop-in replacement for the
+    mode-gated ``zero_velocity_exp``.
+
+    Note:
+        The linear error uses the base-frame velocity ``root_lin_vel_b[:, :2]`` and the yaw
+        error ``root_ang_vel_b[:, 2]``, matching the frame of the command's own tracking
+        metrics (``error_vel_xy`` / ``error_vel_yaw``) so the reward and the logged error stay
+        consistent. On flat ground with the upright posture enforced elsewhere, base frame and
+        gravity-aligned yaw frame coincide to first order.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    # body-frame velocity target [vx, vy, wz] (elements 1-3 of the 4-D unified command)
+    vel_command_b = env.command_manager.get_command(command_name)[:, 1:4]
+    denom = 2.0 * std**2
+    vx_err = asset.data.root_lin_vel_b.torch[:, 0] - vel_command_b[:, 0]
+    vy_err = asset.data.root_lin_vel_b.torch[:, 1] - vel_command_b[:, 1]
+    wz_err = asset.data.root_ang_vel_b.torch[:, 2] - vel_command_b[:, 2]
+    return (
+        torch.exp(-torch.square(vx_err) / denom)
+        + torch.exp(-torch.square(vy_err) / denom)
+        + torch.exp(-torch.square(wz_err) / denom)
+    )
+
+def zero_velocity_exp(
+    env: ManagerBasedRLEnv,
+    std: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
+) -> torch.Tensor:
     """Reward for keeping the base stationary using squared-error exponential kernels.
 
     Sums three exponential terms over the horizontal linear velocities and the yaw rate,
     :math:`\\exp(-v_x^2/(2\\sigma^2)) + \\exp(-v_y^2/(2\\sigma^2)) + \\exp(-\\omega_{yaw}^2/(2\\sigma^2))`.
     With the default ``std = 0.25`` this reduces to
-    :math:`\\exp(-4 v_x^2) + \\exp(-4 v_y^2) + \\exp(-4 \\omega_{yaw}^2)`.
+    :math:`\\exp(-8 v_x^2) + \\exp(-8 v_y^2) + \\exp(-8 \\omega_{yaw}^2)`.
+
+    When ``velocity_command_name`` is given, the reward is gated to zero-velocity command
+    environments (see :func:`_zero_command_gate`): standing still is only the objective for
+    STAND / SQUAT modes, while WALK / SQUAT_WALK environments track a nonzero velocity target.
+
+    Note:
+        Superseded in the deployed config by :func:`track_velocity_exp`, which folds this
+        standing-still objective and the walking velocity tracking into a single ungated term
+        (it degrades to this reward when the commanded velocity is zero). Kept as a fallback
+        for ablation against the world-frame standing penalty.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     denom = 2.0 * std**2
     vx = asset.data.root_lin_vel_w.torch[:, 0]
     vy = asset.data.root_lin_vel_w.torch[:, 1]
     yaw_rate = asset.data.root_ang_vel_w.torch[:, 2]
-    return (
+    reward = (
         torch.exp(-torch.square(vx) / denom)
         + torch.exp(-torch.square(vy) / denom)
         + torch.exp(-torch.square(yaw_rate) / denom)
     )
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    return reward if zero_gate is None else reward * zero_gate
 
 def feet_spread_x_l2(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize horizontal (x) distance between feet and pelvis to prevent splits-style lowering."""
