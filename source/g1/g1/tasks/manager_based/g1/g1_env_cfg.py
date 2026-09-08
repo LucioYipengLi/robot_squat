@@ -8,6 +8,7 @@
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -549,8 +550,33 @@ class TerminationsCfg:
 @configclass
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
-    #terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+    # 地形难度课程（平地任务，禁用）
+    # terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
     terrain_levels = None
+
+    # 指令范围课程（绩效驱动·全局，非时间驱动）：智能体稳定跟踪当前指令范围后，逐档放宽采样范围。
+    # 两条轴独立推进，各自门控于指令项在 reset 时结算的逐 episode 成功率：
+    # - 高度轴：全部环境 success_rate > 0.95 时，height_offset 由 [-0.15, 0.02] 扩向 [-0.45, 0.05]
+    #   （更深蹲）。此轴按用户选择用“全部环境成功率”门控（= TensorBoard Metrics/success_rate）；该值被
+    #   STAND/WALK 的零高度偏移平凡成功抬高，故 0.95 实际约要求“蹲起成功率 87.5%”。
+    # - 速度轴：仅 WALK 模式 episode 的 success_rate_vel > 0.95 时，lin_vel_x 由 [-0.3, 0.6] 扩向
+    #   [-0.5, 1.0]、lin_vel_y 由 [-0.15, 0.15] 扩向 [-0.2, 0.2]；ang_vel_z 保持 [-0.8, 0.8] 不变。
+    # 扩展单调（只朝最终范围生长）且自限速（放宽→更难→成功率回落→暂停），最终范围是“上限”：
+    # 若 -0.45 深蹲在 0.03 m 容差下达不到门控，范围会自适应停在中途（本版接受此停顿）。
+    command_range = CurrTerm(
+        func=mdp.command_range_curriculum,
+        params={
+            "command_name": "task_command",
+            "height_success_gate": 0.95,
+            "height_offset_final": (-0.45, 0.05),
+            "height_step": 0.005,
+            "vel_success_gate": 0.95,
+            "lin_vel_x_final": (-0.5, 1.0),
+            "lin_vel_y_final": (-0.2, 0.2),
+            "vel_step": 0.01,
+            "update_period": 200,
+        },
+    )
 
 ##
 # Environment configuration

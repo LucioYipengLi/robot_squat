@@ -323,6 +323,11 @@ class SquatWalkCommand(CommandTerm):
         self.height_command_world = torch.zeros(self.num_envs, 1, device=self.device)
         # -- per-episode task mode buffer (one of MODE_STAND / MODE_SQUAT / MODE_WALK / MODE_SQUAT_WALK)
         self.mode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # -- mode of the just-ended episode, captured in ``reset`` right before ``mode`` is redrawn.
+        #    It stays aligned with the finalized per-episode ``metrics`` (which describe that same
+        #    ended episode), so consumers -- e.g. the command-range curriculum -- can mask a metric
+        #    by the mode that produced it. ``mode`` itself already points at the new episode by then.
+        self.last_mode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         # -- mask for env commanded to the default height (STAND or WALK modes)
         self.is_default_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # -- normalized mode sampling weights
@@ -425,6 +430,10 @@ class SquatWalkCommand(CommandTerm):
             (mean_error_xy < self.cfg.vel_xy_success_threshold)
             & (mean_error_yaw < self.cfg.vel_yaw_success_threshold)
         ).float()
+
+        # -- capture the ending episode's mode so it stays aligned with the metrics finalized above
+        #    (stage 2 below overwrites ``self.mode`` with the freshly drawn new-episode mode)
+        self.last_mode[env_ids] = self.mode[env_ids]
 
         # -- stage 2: draw the per-episode task modes before the resample chain consumes them
         num = len(env_ids)
