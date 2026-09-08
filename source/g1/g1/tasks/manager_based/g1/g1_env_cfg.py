@@ -404,6 +404,19 @@ class RewardsCfg:
             "velocity_command_name": "task_command",
         },
     )
+    # 步态质量·摆动相时长（正奖励，行走专属）：r = min(支撑相/摆动相时长) 截断至 threshold，
+    # 仅“单脚支撑 + 线速度指令非零(‖[vx,vy]‖>0.1)”时给分——自动只在 WALK/SQUAT_WALK 生效，
+    # STAND/SQUAT 零速指令下恒 0（防原地抬脚刷分），无需额外门控。鼓励迈出足够长的步子、
+    # 抑制高频碎步蹭行。threshold=0.5 s ≈ G1 常速半步周期；weight 为初值，按消融再调。
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time_positive_biped,
+        weight=0.5,
+        params={
+            "command_name": "task_command",
+            "threshold": 0.5,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"]),
+        },
+    )
 
     # =====================================================================
     # 横向安全间距（双脚 / 双膝）
