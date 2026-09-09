@@ -48,11 +48,14 @@ def command_range_curriculum(
     *upper bound* -- it is reached only if the agent can still track it above the gate.
 
     Note:
-        * ``success_rate`` / ``success_rate_vel`` are the command term's persisted per-episode buffers
-          (each env holds its last finalized episode); averaging over all envs gives a stable rolling
-          global rate. The velocity gate masks by ``last_mode`` -- not the live ``mode`` -- because the
-          curriculum runs *before* the command term's reset, so ``mode`` already points at the new
-          episode while the metrics still describe the one that just ended.
+        * The gates read the command term's ``episode_success_rate`` / ``episode_success_rate_vel``
+          buffers -- dedicated per-episode buffers holding each env's last finalized success. They are
+          kept separate from ``term.metrics`` because the base ``CommandTerm.reset`` zeroes ``metrics``
+          right after logging it, while this curriculum runs *before* the next reset and would otherwise
+          always read zeros. Averaging over all envs gives a stable rolling global rate. The velocity
+          gate masks by ``last_mode`` -- not the live ``mode`` -- because the curriculum runs before the
+          command term's reset, so ``mode`` already points at the new episode while these buffers still
+          describe the one that just ended.
         * The expansion is applied only once every ``update_period`` control steps (a full episode is a
           few hundred steps), so each increment is followed by enough rollouts for the gated metric to
           react before the next one -- avoiding runaway expansion against the feedback latency.
@@ -71,19 +74,21 @@ def command_range_curriculum(
         update_period: Number of control steps between range updates.
 
     Returns:
-        Curriculum state logged under ``Curriculum/<term_name>/<key>``: the two gate signals and the
-        current live bounds of each expanding range.
+        Curriculum state logged under ``Curriculum/<term_name>/<key>``: the two gate signals plus each
+        expanding range's live bounds (``*_lo``/``*_hi``) and width (``*_span``).
     """
     term = env.command_manager.get_term(command_name)
     ranges = term.cfg.ranges
 
-    # -- gate signals (per-episode buffers persisted on the command term; no GPU->CPU sync yet)
-    height_success = term.metrics["success_rate"].mean()
+    # -- gate signals: read the command term's *persisted* per-episode success buffers, NOT
+    #    ``term.metrics`` -- the base ``CommandTerm.reset`` zeroes ``metrics`` after logging, and this
+    #    curriculum runs before the next reset, so ``metrics`` would always read ~0 here (no GPU->CPU sync).
+    height_success = term.episode_success_rate.mean()
     # WALK-mode episodes only (SQUAT_WALK also walks, but its proportion is 0 in the current config).
     # A masked mean via sum/clamp avoids both a sync and the NaN of an empty selection.
     walk_mask = (term.last_mode == term.MODE_WALK) | (term.last_mode == term.MODE_SQUAT_WALK)
     walk_mask = walk_mask.to(height_success.dtype)
-    vel_success = (term.metrics["success_rate_vel"] * walk_mask).sum() / walk_mask.sum().clamp_min(1.0)
+    vel_success = (term.episode_success_rate_vel * walk_mask).sum() / walk_mask.sum().clamp_min(1.0)
 
     # -- apply the expansion at most once per ``update_period`` steps
     if env.common_step_counter % update_period == 0:
@@ -105,8 +110,11 @@ def command_range_curriculum(
         "height_success": height_success,
         "height_offset_lo": ranges.height_offset[0],
         "height_offset_hi": ranges.height_offset[1],
+        "height_offset_span": ranges.height_offset[1] - ranges.height_offset[0],
         "vel_success": vel_success,
         "lin_vel_x_lo": ranges.lin_vel_x[0],
         "lin_vel_x_hi": ranges.lin_vel_x[1],
+        "lin_vel_x_span": ranges.lin_vel_x[1] - ranges.lin_vel_x[0],
         "lin_vel_y_hi": ranges.lin_vel_y[1],
+        "lin_vel_y_span": ranges.lin_vel_y[1] - ranges.lin_vel_y[0],
     }

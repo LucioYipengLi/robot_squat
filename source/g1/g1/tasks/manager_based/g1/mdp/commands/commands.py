@@ -338,6 +338,13 @@ class SquatWalkCommand(CommandTerm):
         self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["success_rate_vel"] = torch.zeros(self.num_envs, device=self.device)
+        # -- persisted per-episode success buffers for the command-range curriculum, kept OUTSIDE
+        #    ``self.metrics``: the base ``CommandTerm.reset`` zeroes every ``self.metrics`` entry right
+        #    after logging it, and ``CurriculumManager.compute`` runs *before* the next command reset
+        #    (see ``ManagerBasedRLEnv._reset_idx``), so a curriculum reading ``self.metrics`` would
+        #    always see zeros. These hold each env's last finalized episode success, never zeroed.
+        self.episode_success_rate = torch.zeros(self.num_envs, device=self.device)
+        self.episode_success_rate_vel = torch.zeros(self.num_envs, device=self.device)
         # -- per-episode running sums (cleared at episode reset)
         self._error_height_sum = torch.zeros(self.num_envs, device=self.device)
         self._error_xy_sum = torch.zeros(self.num_envs, device=self.device)
@@ -430,6 +437,12 @@ class SquatWalkCommand(CommandTerm):
             (mean_error_xy < self.cfg.vel_xy_success_threshold)
             & (mean_error_yaw < self.cfg.vel_yaw_success_threshold)
         ).float()
+
+        # -- persist the finalized success for the command-range curriculum: ``super().reset()`` below
+        #    zeroes every ``self.metrics`` entry, and the curriculum's ``compute`` runs before the next
+        #    reset, so it must read a buffer that survives the zeroing (``episode_success_rate*``).
+        self.episode_success_rate[env_ids] = self.metrics["success_rate"][env_ids]
+        self.episode_success_rate_vel[env_ids] = self.metrics["success_rate_vel"][env_ids]
 
         # -- capture the ending episode's mode so it stays aligned with the metrics finalized above
         #    (stage 2 below overwrites ``self.mode`` with the freshly drawn new-episode mode)
