@@ -117,6 +117,21 @@ def _zero_command_gate(
     mode = env.command_manager.get_term(command_name).mode
     return torch.isin(mode, torch.tensor(zero_modes, dtype=torch.long, device=mode.device)).float()
 
+def _walk_command_gate(
+    env: ManagerBasedRLEnv, command_name: str | None, walk_modes: tuple[int, ...] = (2, 3)
+) -> torch.Tensor | None:
+    """Return a 0/1 gate active only in walking command modes, or None.
+
+    Complement of :func:`_zero_command_gate`: reads the discrete per-episode ``mode`` buffer of the
+    unified task command (:class:`SquatWalkCommand`) and returns 1 where the mode is one of
+    ``walk_modes`` (defaults to WALK=2 / SQUAT_WALK=3) and 0 elsewhere (STAND=0 / SQUAT=1). Returns
+    None when ``command_name`` is None so callers stay backward compatible (no gating).
+    """
+    if command_name is None:
+        return None
+    mode = env.command_manager.get_term(command_name).mode
+    return torch.isin(mode, torch.tensor(walk_modes, dtype=torch.long, device=mode.device)).float()
+
 def standing_joint_default_deviation_l2(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -480,6 +495,58 @@ def feet_air_time_positive_biped(env, command_name: str, threshold: float, senso
     # 4-D unified command [h, vx, vy, wz] (a 3-D-command [:, :2] slice would grab [h, vx])
     reward *= torch.linalg.norm(env.command_manager.get_command(command_name)[:, 1:3], dim=1) > 0.1
     return reward
+
+def feet_gait_phase_clock(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    period: float = 0.7,
+    std: float = 0.3,
+    walk_modes: tuple[int, ...] = (2, 3),
+) -> torch.Tensor:
+    """Reward a periodic, anti-phase bipedal gait using a phase clock [0/1].
+
+    A clock phase ``phi = 2*pi*elapsed / period`` is derived from the built-in per-environment
+    counter ``env.episode_length_buf`` times ``env.step_dt`` (seconds since episode start). That
+    counter auto-resets per environment, so the phase restarts at 0 each episode and is naturally
+    desynchronized across environments -- no stateful cache or manual reset is needed.
+
+    The two feet get complementary sinusoidal desired-contact signals 180 deg apart,
+    ``desired[:, 0] = 0.5*(1 + sin(phi))`` and ``desired[:, 1] = 0.5*(1 - sin(phi))``, and the
+    reward is the mean Gaussian match ``exp(-(contact - desired)**2 / (2*std**2))`` between each
+    foot's binary contact state and its desired signal. One term therefore enforces gait
+    alternation, cadence (``period``), left/right symmetry and committed (non-shuffling) steps at
+    once. Because ``desired[:, 0] + desired[:, 1] = 1``, one foot is always weighted, keeping the
+    term compatible with :func:`no_fly`.
+
+    The two desired signals are exactly anti-phase, so the alternation is correct regardless of
+    which physical foot ``sensor_cfg.body_ids`` resolves to index 0 vs 1; the index-0 foot simply
+    leads the clock (weighted while ``sin(phi) > 0``). ``sensor_cfg`` must select exactly the two
+    feet. Contact uses the same criterion as :func:`no_fly` (net world-frame z force > 0.5 N), and
+    the term is gated to walking modes (see :func:`_walk_command_gate`) so STAND/SQUAT are
+    unaffected.
+
+    Intended to replace :func:`feet_air_time_positive_biped`, whose "longer swing is better up to a
+    cap, zero during double support" structure incentivized holding one leg paused in the air.
+
+    Args:
+        period: target gait cycle duration in seconds (one full cycle = one step per foot).
+        std: Gaussian match tolerance; smaller demands stricter footfall timing.
+        walk_modes: command modes where the term is active (defaults to WALK=2 / SQUAT_WALK=3).
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # 1) stateless phase from the per-env episode counter (seconds since episode start)
+    phase = 2.0 * torch.pi * (env.episode_length_buf * env.step_dt) / period
+    sin_phase = torch.sin(phase)
+    # 2) complementary desired-contact signals (sinusoidal soft targets -> smooth gradients)
+    desired = torch.stack((0.5 * (1.0 + sin_phase), 0.5 * (1.0 - sin_phase)), dim=1)  # (N, 2)
+    # 3) actual binary contact state (same criterion as no_fly), indexed to match `desired`
+    contact = (contact_sensor.data.net_forces_w.torch[:, sensor_cfg.body_ids, 2] > 0.5).float()
+    # 4) per-foot Gaussian match, averaged over the two feet -> [0, 1]
+    reward = torch.exp(-torch.square(contact - desired) / (2.0 * std**2)).mean(dim=1)
+    # 5) gate to walking modes
+    walk_gate = _walk_command_gate(env, command_name, walk_modes)
+    return reward if walk_gate is None else reward * walk_gate
 
 def track_pelvis_height_exp(env, command_name: str) -> torch.Tensor:
     """Reward for tracking the commanded pelvis height using an absolute-error exponential kernel.

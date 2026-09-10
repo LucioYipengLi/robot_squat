@@ -409,13 +409,34 @@ class RewardsCfg:
     # 仅“单脚支撑 + 线速度指令非零(‖[vx,vy]‖>0.1)”时给分——自动只在 WALK/SQUAT_WALK 生效，
     # STAND/SQUAT 零速指令下恒 0（防原地抬脚刷分），无需额外门控。鼓励迈出足够长的步子、
     # 抑制高频碎步蹭行。threshold=0.5 s ≈ G1 常速半步周期；weight 为初值，按消融再调。
-    feet_air_time = RewTerm(
-        func=mdp.feet_air_time_positive_biped,
+    # 【已停用·保留供 A/B 回调对比】min+clamp 结构只奖励"延长单支撑摆动"：封顶后悬停零成本、
+    # 双支撑归零→回避落脚，教出"一腿抬起悬停刷分、另一腿快速切换"的不对称步态。已改用下方
+    # feet_gait_phase（相位时钟）统一约束交替/节律/对称/防碎步。回调对比时：取消注释本项、
+    # 并注释掉 feet_gait_phase 即可。
+    # feet_air_time = RewTerm(
+    #     func=mdp.feet_air_time_positive_biped,
+    #     weight=0.5,
+    #     params={
+    #         "command_name": "task_command",
+    #         "threshold": 0.5,
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"]),
+    #     },
+    # )
+    # 步态质量·相位时钟（正奖励，行走专属）：由 episode_length_buf×step_dt 导出相位 2πt/T，
+    # 左右脚目标接触态取反相正弦（相差 180°），按高斯核匹配实际接触→一项同时约束交替/节律/
+    # 对称/防碎步，根除 air_time 的"悬停刷分"。无状态（相位随 episode 自动复位、各环境天然错相）；
+    # 仅 WALK/SQUAT_WALK 生效（mode 门控）。反相设计下 body_ids 左右顺序不影响交替正确性。
+    # period/std/weight 为初值，按消融调；period 与速度指令范围耦合，必要时按模式/速度缩放。
+    feet_gait_phase = RewTerm(
+        func=mdp.feet_gait_phase_clock,
         weight=0.5,
         params={
             "command_name": "task_command",
-            "threshold": 0.5,
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"]),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
+            ),
+            "period": 0.7,
+            "std": 0.3,
         },
     )
 

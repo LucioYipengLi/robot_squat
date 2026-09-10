@@ -27,6 +27,7 @@ __all__ = [
     "knee_lateral_separation",
     "feet_slide",
     "feet_air_time_positive_biped",
+    "feet_gait_phase_clock",
     "track_pelvis_height_exp",
     "track_velocity_exp",
     "zero_velocity_exp",
@@ -45,6 +46,7 @@ from isaaclab.envs.mdp import *  # noqa: F401, F403
 
 from .rewards import (
     feet_air_time_positive_biped,
+    feet_gait_phase_clock,
     feet_slide,
     joint_pos_target_l2,
     standing_joint_default_deviation_l2,
