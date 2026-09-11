@@ -500,24 +500,36 @@ def feet_gait_phase_clock(
     env: ManagerBasedRLEnv,
     command_name: str,
     sensor_cfg: SceneEntityCfg,
-    period: float = 0.7,
+    stride_freq_intercept: float = 1.19,
+    stride_freq_slope: float = 0.79,
     std: float = 0.3,
     walk_modes: tuple[int, ...] = (2, 3),
 ) -> torch.Tensor:
-    """Reward a periodic, anti-phase bipedal gait using a phase clock [0/1].
+    """Reward a periodic, anti-phase bipedal gait using a speed-adaptive phase clock [0/1].
 
     A clock phase ``phi = 2*pi*elapsed / period`` is derived from the built-in per-environment
     counter ``env.episode_length_buf`` times ``env.step_dt`` (seconds since episode start). That
     counter auto-resets per environment, so the phase restarts at 0 each episode and is naturally
     desynchronized across environments -- no stateful cache or manual reset is needed.
 
+    The stride ``period`` is **not fixed**: it follows the speed-linear cadence law of biomechanics
+    ``f = a + b*|vx|`` (stride frequency in Hz), i.e. ``period = 1 / (a + b*|vx|)``, so the robot
+    steps faster as it walks faster instead of chasing one cadence at every speed. With the
+    defaults (``a`` chosen so the zero-speed period ``1/a`` matches the inverted-pendulum natural
+    period ``pi*sqrt(L/g)`` for the G1 leg length) the period stays smooth, bounded and free of
+    singularities across the whole command range. This is unlike a naive linear-in-period law
+    ``period = T0 - k*|vx|``, which reaches ``period = 0`` at a finite speed and must be clamped.
+    Because the velocity command is frozen within an episode (:class:`SquatWalkCommand` redraws it
+    only at ``command_counter == 0``), ``period`` is constant per environment per episode, so
+    ``phi`` grows continuously with no mid-episode jump.
+
     The two feet get complementary sinusoidal desired-contact signals 180 deg apart,
     ``desired[:, 0] = 0.5*(1 + sin(phi))`` and ``desired[:, 1] = 0.5*(1 - sin(phi))``, and the
     reward is the mean Gaussian match ``exp(-(contact - desired)**2 / (2*std**2))`` between each
     foot's binary contact state and its desired signal. One term therefore enforces gait
-    alternation, cadence (``period``), left/right symmetry and committed (non-shuffling) steps at
-    once. Because ``desired[:, 0] + desired[:, 1] = 1``, one foot is always weighted, keeping the
-    term compatible with :func:`no_fly`.
+    alternation, a speed-appropriate cadence, left/right symmetry and committed (non-shuffling)
+    steps at once. Because ``desired[:, 0] + desired[:, 1] = 1``, one foot is always weighted,
+    keeping the term compatible with :func:`no_fly`.
 
     The two desired signals are exactly anti-phase, so the alternation is correct regardless of
     which physical foot ``sensor_cfg.body_ids`` resolves to index 0 vs 1; the index-0 foot simply
@@ -530,12 +542,19 @@ def feet_gait_phase_clock(
     cap, zero during double support" structure incentivized holding one leg paused in the air.
 
     Args:
-        period: target gait cycle duration in seconds (one full cycle = one step per foot).
+        stride_freq_intercept: zero-speed stride frequency ``a`` [Hz]; ``1/a`` is the standing
+            stride period, defaulted to the G1 inverted-pendulum natural period (~0.84 s).
+        stride_freq_slope: cadence-vs-speed slope ``b`` [Hz/(m/s)]; how fast the stride frequency
+            rises per unit forward speed.
         std: Gaussian match tolerance; smaller demands stricter footfall timing.
         walk_modes: command modes where the term is active (defaults to WALK=2 / SQUAT_WALK=3).
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    # 1) stateless phase from the per-env episode counter (seconds since episode start)
+    # 1) speed-adaptive stride period (f = a + b*|vx|) and the stateless phase from the per-env
+    #    episode counter (seconds since episode start); vx is frozen within an episode, so the
+    #    period is constant per env and the phase grows continuously with no mid-episode jump
+    vx = env.command_manager.get_command(command_name)[:, 1]
+    period = 1.0 / (stride_freq_intercept + stride_freq_slope * torch.abs(vx))  # (N,)
     phase = 2.0 * torch.pi * (env.episode_length_buf * env.step_dt) / period
     sin_phase = torch.sin(phase)
     # 2) complementary desired-contact signals (sinusoidal soft targets -> smooth gradients)

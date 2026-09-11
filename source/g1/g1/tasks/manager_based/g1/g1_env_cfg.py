@@ -426,7 +426,10 @@ class RewardsCfg:
     # 左右脚目标接触态取反相正弦（相差 180°），按高斯核匹配实际接触→一项同时约束交替/节律/
     # 对称/防碎步，根除 air_time 的"悬停刷分"。无状态（相位随 episode 自动复位、各环境天然错相）；
     # 仅 WALK/SQUAT_WALK 生效（mode 门控）。反相设计下 body_ids 左右顺序不影响交替正确性。
-    # period/std/weight 为初值，按消融调；period 与速度指令范围耦合，必要时按模式/速度缩放。
+    # 步态周期 T 速度自适应（方案B·步频线性）：f = a + b·|vx| [Hz]，T = 1/f。a=stride_freq_intercept
+    # 定零速步频（1/a≈0.84s 对齐 G1 倒立摆自然周期 pi·sqrt(L/g)），b=stride_freq_slope 定步频随速度增幅；
+    # 该式全程光滑有界无奇点（优于 T=T0-k·|vx| 周期线性式，后者有限速度处撞 T=0）。速度 episode 内冻结
+    # →T 逐环境恒定→相位连续无跳变。vx≈0.3 时 T≈0.70（衔接原固定值）。a/b/std/weight 为初值，按消融调。
     feet_gait_phase = RewTerm(
         func=mdp.feet_gait_phase_clock,
         weight=0.5,
@@ -435,7 +438,8 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
             ),
-            "period": 0.7,
+            "stride_freq_intercept": 1.19,
+            "stride_freq_slope": 0.79,
             "std": 0.3,
         },
     )
