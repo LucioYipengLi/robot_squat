@@ -215,6 +215,22 @@ class EventCfg:
     )
 
     # interval
+    # 机械臂随机干扰（loco-manipulation 鲁棒性）：机械臂不在 action space，是智能体不可控的
+    # 扰动源。每 1~3 s（per-env 异步，is_global_time 默认 False）在默认位姿附近 ±0.5 rad 采样
+    # 关节目标并 clamp 到限位，写入 PD 目标缓冲区，由 implicit actuator 逐步驱动机械臂运动，
+    # 对浮动基下肢产生真实的 CoM 偏移与反作用力扰动。实现见 mdp/events.py:ArmDisturbanceEvent。
+    arm_disturbance = EventTerm(
+        func=mdp.ArmDisturbanceEvent,
+        mode="interval",
+        interval_range_s=(1.5, 3.0),
+        params={
+            # 仅机械臂关节（肩/肘/腕，双臂共 14 DOF）；与下肢 action 的 joint_names 互斥，
+            # 且为关节子集（不会被 SceneEntityCfg 优化成 slice(None)）
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*shoulder.*", ".*elbow.*", ".*wrist.*"]),
+            "joint_noise": 0.5,  # [rad] 默认位姿附近的对称随机幅度
+        },
+    )
+
     # push_robot = EventTerm(
     #     func=mdp.push_by_setting_velocity,
     #     mode="interval",
