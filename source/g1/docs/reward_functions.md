@@ -12,8 +12,8 @@
 - **权重生效机制**：Isaac Lab `RewardManager` 运行时按 `weight × r × dt` 累积，本项目
   `dt = 1/60 s`（`sim.dt=1/120`，`decimation=2`）。官方 HOMIE 在训练初始化时将权重乘策略
   步长 0.02 s——两者时间积分语义等效（逐秒贡献相同），**官方权重数值直接照抄，无需换算**。
-- **训练规模**：`num_envs=4096`，episode 6 s（360 步），PPO（`num_steps_per_env=24`，
-  `gamma=0.99`，`lr=3e-4` adaptive）。
+- **训练规模**：`num_envs=4096`，episode 6 s（360 步），PPO（`num_steps_per_env=50`，
+  `max_iterations=10000`，`gamma=0.99`，`lr=3e-4` adaptive）。
 
 **来源标记说明**：
 

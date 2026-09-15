@@ -621,6 +621,22 @@ class CurriculumCfg:
         },
     )
 
+    # 手臂干扰幅度课程：随策略存活率单调爬升 joint_noise（隐式 interval 课程只控触发频率、不控幅度）。
+    # 从 EventCfg.arm_disturbance 当前的 joint_noise(=0.5) 起爬，上限 joint_noise_final=0.8。
+    # survival_gate=0.95 是高门槛——仅当策略近乎满存活（EMA>5.7 s / 6 s）才放行下一次 +noise_step，把
+    # 幅度爬升留给已成熟的策略；noise_step=0.005 rad（≈0.29°/次）细粒度爬升，单步过猛会把存活打回门槛
+    # 下而反复暂停。切勿同时对 interval_range_s 做课程——频率已由 episode 存活时长隐式控制。
+    arm_disturbance_magnitude = CurrTerm(
+        func=mdp.arm_disturbance_magnitude_curriculum,
+        params={
+            "event_term_name": "arm_disturbance",
+            "survival_gate": 0.95,
+            "joint_noise_final": 0.8,
+            "noise_step": 0.005,
+            "update_period": 2000,
+        },
+    )
+
 ##
 # Environment configuration
 ##
