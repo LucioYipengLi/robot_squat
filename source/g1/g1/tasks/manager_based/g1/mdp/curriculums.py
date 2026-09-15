@@ -124,31 +124,38 @@ def command_range_curriculum(
 # id(env). Curriculum functions are stateless and each call only sees the just-reset subset, so we smooth
 # those unbiased finished-length samples into a rolling estimate -- same cache pattern as
 # rewards._action_acc_prev2_cache.
-_arm_survival_ema_cache: dict[int, torch.Tensor] = {}
+_survival_ema_cache: dict[int, torch.Tensor] = {}
 
 
-def arm_disturbance_magnitude_curriculum(
+def upper_body_disturbance_magnitude_curriculum(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
-    event_term_name: str = "arm_disturbance",
+    event_term_name: str = "upper_body_disturbance",
+    target_group: int = 0,
     survival_gate: float = 0.85,
-    joint_noise_final: float = 0.8,
-    noise_step: float = 0.02,
+    frac_final: float = 0.5,
+    frac_step: float = 0.005,
     ema_beta: float = 0.02,
     update_period: int = 2000,
 ) -> dict[str, float]:
-    """Ramp the arm-disturbance magnitude (``joint_noise``) up while the policy keeps surviving.
+    """Ramp one disturbance group's magnitude (``joint_noise_frac``) up while the policy keeps surviving.
 
     A performance-driven companion to the *implicit* interval curriculum. The interval event already
     gates disturbance *frequency* on episode length (it can only fire once an episode outlives
     ``interval_range_s[0]``), which naturally withholds the disturbance until the policy can stand. This
-    term adds the missing axis -- disturbance *magnitude* -- so the arms can be pushed beyond the fixed
-    ``joint_noise`` the event was mounted with, instead of switching on at full strength.
+    term adds the missing axis -- disturbance *magnitude* -- so the selected joint group can be pushed
+    beyond the fixed ``joint_noise_frac`` it was mounted with, instead of switching on at full strength.
+
+    :class:`UpperBodyDisturbanceEvent` organizes its joints into ``disturb_groups`` (arms, waist, ...),
+    each with an independently mounted ``joint_noise_frac`` (a fraction in [0, 1] of each joint's
+    default-to-limit margin). This curriculum ramps only the group at ``target_group`` (default 0 =
+    arms); the other groups stay fixed at their mounted values.
 
     It reads the live event cfg via :meth:`EventManager.get_term_cfg` (a reference, not a copy) and
-    mutates ``params["joint_noise"]`` in place; because :class:`ArmDisturbanceEvent.__call__` re-reads
-    ``joint_noise`` from ``**term_cfg.params`` on every fire, the new magnitude takes effect on the next
-    disturbance without touching the event code or re-instantiating the term.
+    mutates ``params["disturb_groups"][target_group]["joint_noise_frac"]`` in place; because
+    :class:`UpperBodyDisturbanceEvent.__call__` re-reads each group's ``joint_noise_frac`` from
+    ``**term_cfg.params`` on every fire, the new magnitude takes effect on the next disturbance without
+    touching the event code or re-instantiating the term.
 
     Design mirrors :func:`command_range_curriculum`:
 
@@ -156,7 +163,7 @@ def arm_disturbance_magnitude_curriculum(
       ``CurriculumManager.compute`` runs at the very top of ``_reset_idx`` (before ``episode_length_buf``
       is zeroed at its end), so ``env.episode_length_buf[env_ids]`` still holds the finished lengths ->
       an unbiased survival signal (fraction of ``max_episode_length`` reached).
-    * **Monotonic + self-pacing** -- ``joint_noise`` only creeps toward ``joint_noise_final`` (never
+    * **Monotonic + self-pacing** -- ``joint_noise_frac`` only creeps toward ``frac_final`` (never
       decays), and only while the EMA survival holds above ``survival_gate``. Raising the magnitude makes
       surviving harder, which pulls the EMA back below the gate and pauses the ramp, so it settles at the
       largest magnitude the policy can survive -- the same negative feedback as the command curriculum.
@@ -168,51 +175,55 @@ def arm_disturbance_magnitude_curriculum(
         * The EMA is kept as a 0-dim GPU tensor and updated in place, so the per-call cost has no
           GPU->CPU sync; the only sync is the ``bool(ema > survival_gate)`` check, which runs at most once
           per ``update_period`` steps.
-        * When enabling this term, set the event's mounted ``joint_noise`` to the desired *floor*
-          (e.g. 0.15): the ramp starts from the live cfg value and climbs to ``joint_noise_final``.
+        * When enabling this term, set the target group's mounted ``joint_noise_frac`` to the desired
+          *floor* (e.g. 0.15): the ramp starts from that live value and climbs to ``frac_final``.
         * Do **not** also curriculum ``interval_range_s`` -- frequency is already governed by the implicit
           episode-length gate, and a second controller on the same axis would fight it.
 
     Args:
         env: The environment instance.
         env_ids: The environment indices being reset (their finished episode lengths feed the gate).
-        event_term_name: Name of the :class:`ArmDisturbanceEvent` term in the event manager.
-        survival_gate: Mean normalized episode length (in [0, 1]) above which ``joint_noise`` ramps up.
-        joint_noise_final: Target disturbance magnitude [rad]; the ramp's upper bound.
-        noise_step: Per-update increment of ``joint_noise`` [rad].
+        event_term_name: Name of the :class:`UpperBodyDisturbanceEvent` term in the event manager.
+        target_group: Index into ``params["disturb_groups"]`` selecting which group's ``joint_noise_frac``
+            to ramp (default 0 = the arm group; the waist group is left fixed at its mounted value).
+        survival_gate: Mean normalized episode length (in [0, 1]) above which ``joint_noise_frac`` ramps.
+        frac_final: Target magnitude as a fraction [0, 1] of the default-to-limit margin; the ramp's
+            upper bound.
+        frac_step: Per-update increment of ``joint_noise_frac`` [0, 1].
         ema_beta: Smoothing factor of the survival EMA (smaller = slower/steadier gate).
         update_period: Number of control steps between magnitude updates (same units as
             :func:`command_range_curriculum`, which is mounted at 5000).
 
     Returns:
         Curriculum state logged under ``Curriculum/<term_name>/<key>``: the survival EMA gate signal
-        (``survival_ema``) and the live disturbance magnitude (``joint_noise``).
+        (``survival_ema``) and the live disturbance magnitude fraction (``joint_noise_frac``).
     """
     # live reference to the event term cfg (get_term_cfg returns the stored object, not a copy);
-    # params["joint_noise"] is a plain Python float re-read by the event on every fire.
+    # the target group's joint_noise_frac is a plain Python float re-read by the event on every fire.
     event_cfg = env.event_manager.get_term_cfg(event_term_name)
-    joint_noise = float(event_cfg.params["joint_noise"])
+    group = event_cfg.params["disturb_groups"][target_group]
+    frac = float(group["joint_noise_frac"])
 
     # -- gate signal: mean normalized length of the JUST-FINISHED episodes (the reset subset)
     if len(env_ids) > 0:
         finished = env.episode_length_buf[env_ids].to(torch.float32) / float(env.max_episode_length)
         batch_mean = finished.mean()  # 0-dim GPU tensor
-        ema = _arm_survival_ema_cache.get(id(env))
+        ema = _survival_ema_cache.get(id(env))
         if ema is None:
             ema = batch_mean.clone()
         else:
             ema.mul_(1.0 - ema_beta).add_(batch_mean, alpha=ema_beta)  # in-place rolling EMA, no sync
-        _arm_survival_ema_cache[id(env)] = ema
+        _survival_ema_cache[id(env)] = ema
     else:
-        ema = _arm_survival_ema_cache.get(id(env), torch.zeros((), device=env.device))
+        ema = _survival_ema_cache.get(id(env), torch.zeros((), device=env.device))
 
     # -- ramp at most once per update_period steps; monotonic up; self-paced by the survival gate
     if env.common_step_counter % update_period == 0:
-        if bool(ema > survival_gate) and joint_noise < joint_noise_final:
-            joint_noise = min(joint_noise + noise_step, joint_noise_final)
-            event_cfg.params["joint_noise"] = joint_noise
+        if bool(ema > survival_gate) and frac < frac_final:
+            frac = min(frac + frac_step, frac_final)
+            group["joint_noise_frac"] = frac
 
     return {
         "survival_ema": ema,
-        "joint_noise": joint_noise,
+        "joint_noise_frac": frac,
     }

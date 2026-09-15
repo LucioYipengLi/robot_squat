@@ -39,8 +39,8 @@ __all__ = [
     "feet_air_time_penalty",
     "base_yaw_rate_l2",
     "command_range_curriculum",
-    "arm_disturbance_magnitude_curriculum",
-    "ArmDisturbanceEvent",
+    "upper_body_disturbance_magnitude_curriculum",
+    "UpperBodyDisturbanceEvent",
 ]
 
 # Forward stable MDP terms lazily, then override with environment-specific terms below.
@@ -79,6 +79,6 @@ from .rewards import (
 
 from .commands.commands import SquatWalkCommand, UniformHeightCommand
 from .commands.commands_cfg import SquatWalkCommandCfg, UniformHeightCommandCfg
-from .curriculums import arm_disturbance_magnitude_curriculum, command_range_curriculum
-from .events import ArmDisturbanceEvent
+from .curriculums import command_range_curriculum, upper_body_disturbance_magnitude_curriculum
+from .events import UpperBodyDisturbanceEvent
 from .observations import task_command_height, task_command_velocity

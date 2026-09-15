@@ -215,19 +215,34 @@ class EventCfg:
     )
 
     # interval
-    # 机械臂随机干扰（loco-manipulation 鲁棒性）：机械臂不在 action space，是智能体不可控的
-    # 扰动源。每 1~3 s（per-env 异步，is_global_time 默认 False）在默认位姿附近 ±0.5 rad 采样
-    # 关节目标并 clamp 到限位，写入 PD 目标缓冲区，由 implicit actuator 逐步驱动机械臂运动，
-    # 对浮动基下肢产生真实的 CoM 偏移与反作用力扰动。实现见 mdp/events.py:ArmDisturbanceEvent。
-    arm_disturbance = EventTerm(
-        func=mdp.ArmDisturbanceEvent,
+    # 上肢随机干扰（loco-manipulation 鲁棒性）：双臂 + 腰部均不在 action space，是智能体不可控的
+    # 扰动源。每 1~3 s（per-env 异步，is_global_time 默认 False）在各组「默认位姿→限位余量」内按百分比
+    # 采样关节目标并 clamp 到限位，写入 PD 目标缓冲区，由 implicit actuator 逐步驱动上肢运动，对浮动基
+    # 下肢产生真实的 CoM 偏移与反作用力扰动。实现见 mdp/events.py:UpperBodyDisturbanceEvent。
+    # 每组幅度 joint_noise_frac 单独定义，单位是「默认位姿→各方向限位余量」的百分比 [0,1]：同一 frac 按
+    # 每个关节的实际余量自动缩放绝对弧度，故非对称限位（elbow）与组内 ROM 差异（waist_yaw ±150° >>
+    # waist_roll/pitch ±30°）无需逐关节手调。手臂取 0.3；腰部刚度大（200）、是平衡核心，取保守 0.12——
+    # 注意纯百分比下 yaw 余量大，其绝对偏移（≈0.31 rad）明显大于 roll/pitch（≈0.06 rad）；若需分别控制，
+    # 可把腰部再拆成 yaw / roll+pitch 两组各给 frac。
+    upper_body_disturbance = EventTerm(
+        func=mdp.UpperBodyDisturbanceEvent,
         mode="interval",
         interval_range_s=(1.5, 3.0),
         params={
-            # 仅机械臂关节（肩/肘/腕，双臂共 14 DOF）；与下肢 action 的 joint_names 互斥，
-            # 且为关节子集（不会被 SceneEntityCfg 优化成 slice(None)）
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*shoulder.*", ".*elbow.*", ".*wrist.*"]),
-            "joint_noise": 0.5,  # [rad] 默认位姿附近的对称随机幅度
+            # 分组列表：EventManager 会递归 resolve 每组嵌套的 SceneEntityCfg（填充 joint_ids）。
+            # 各组须为互斥的关节子集，且均排除下肢（与下肢 action 的 joint_names 互斥，无写入冲突）。
+            "disturb_groups": [
+                {
+                    # 组 0：双臂（肩/肘/腕，共 14 DOF）——轻质外周，可大幅随机摆动
+                    "asset_cfg": SceneEntityCfg("robot", joint_names=[".*shoulder.*", ".*elbow.*", ".*wrist.*"]),
+                    "joint_noise_frac": 0.2,  # [0,1] 默认位姿→限位余量的百分比（课程爬升的 floor）
+                },
+                {
+                    # 组 1：腰部（yaw/roll/pitch，共 3 DOF）——刚度大、平衡核心、ROM 小，保守幅度
+                    "asset_cfg": SceneEntityCfg("robot", joint_names=["waist_.*_joint"]),
+                    "joint_noise_frac": 0.1,  # [0,1] 余量百分比；yaw≈0.31rad、roll/pitch≈0.06rad
+                },
+            ],
         },
     )
 
@@ -621,18 +636,20 @@ class CurriculumCfg:
         },
     )
 
-    # 手臂干扰幅度课程：随策略存活率单调爬升 joint_noise（隐式 interval 课程只控触发频率、不控幅度）。
-    # 从 EventCfg.arm_disturbance 当前的 joint_noise(=0.5) 起爬，上限 joint_noise_final=0.8。
-    # survival_gate=0.95 是高门槛——仅当策略近乎满存活（EMA>5.7 s / 6 s）才放行下一次 +noise_step，把
-    # 幅度爬升留给已成熟的策略；noise_step=0.005 rad（≈0.29°/次）细粒度爬升，单步过猛会把存活打回门槛
-    # 下而反复暂停。切勿同时对 interval_range_s 做课程——频率已由 episode 存活时长隐式控制。
-    arm_disturbance_magnitude = CurrTerm(
-        func=mdp.arm_disturbance_magnitude_curriculum,
+    # 上肢干扰幅度课程：随策略存活率单调爬升指定组的 joint_noise_frac（隐式 interval 课程只控触发频率、不控幅度）。
+    # target_group=0 只爬升手臂组：从 EventCfg.upper_body_disturbance 手臂组当前的 frac(=0.3) 起爬，上限
+    # frac_final=0.5（约用到余量一半）；腰部组（target_group=1）保持固定 0.12 不爬升（刚度大、平衡核心，更保守）。
+    # survival_gate=0.95 是高门槛——仅当策略近乎满存活（EMA>5.7 s / 6 s）才放行下一次 +frac_step，把幅度爬升
+    # 留给已成熟的策略；frac_step=0.005（每次 +0.5% 余量）细粒度爬升，单步过猛会把存活打回门槛下而反复暂停。
+    # 切勿同时对 interval_range_s 做课程——频率已由 episode 存活时长隐式控制。
+    upper_body_disturbance_magnitude = CurrTerm(
+        func=mdp.upper_body_disturbance_magnitude_curriculum,
         params={
-            "event_term_name": "arm_disturbance",
+            "event_term_name": "upper_body_disturbance",
+            "target_group": 0,
             "survival_gate": 0.95,
-            "joint_noise_final": 0.8,
-            "noise_step": 0.005,
+            "frac_final": 0.8,
+            "frac_step": 0.005,
             "update_period": 2000,
         },
     )
