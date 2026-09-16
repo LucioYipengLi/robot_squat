@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from isaaclab.managers import SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -31,3 +32,26 @@ def task_command_velocity(env: ManagerBasedRLEnv, command_name: str = "task_comm
     base-frame linear velocities (x, y) [m/s] and yaw angular velocity [rad/s].
     """
     return env.command_manager.get_command(command_name)[:, 1:4]
+
+
+def upper_body_joint_pos_target_rel(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Upper-body joint PD targets relative to their default positions [rad].
+
+    Returns the commanded PD position targets for the upper-body joints in ``asset_cfg``
+    (arms + waist) minus their default positions. These targets are written by
+    ``UpperBodyDisturbanceEvent`` and, per the manager-based step order (interval events fire
+    before observation computation), lead the actual limb motion by at least one step. Feeding
+    them to the policy gives the lower body a feed-forward cue to anticipate the momentum
+    disturbance produced by upper-limb motion.
+
+    Note:
+        Only the *commanded* target enters this term. External pushes / contact act on the
+        measured joint positions (already observed via ``joint_pos_rel``) and never corrupt
+        this reading, keeping target uncertainty and external disturbance decoupled.
+    """
+    asset = env.scene[asset_cfg.name]
+    target = asset.data.joint_pos_target.torch[:, asset_cfg.joint_ids]
+    default = asset.data.default_joint_pos.torch[:, asset_cfg.joint_ids]
+    return target - default

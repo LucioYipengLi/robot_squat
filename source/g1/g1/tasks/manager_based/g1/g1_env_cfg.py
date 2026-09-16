@@ -138,9 +138,10 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Policy observations, concatenated into a flat 83-D vector.
+        """Policy observations, concatenated into a flat 100-D vector.
 
-        Order: base state (9) -> task command (4) -> joint state (58) -> last action (12).
+        Order: base state (9) -> task command (4) -> joint state (58) -> last action (12)
+        -> upper-body PD target (17).
         """
 
         # 基座本体状态（IMU 可获取量）：线速度 ±0.1、角速度 ±0.2（陀螺仪噪声更大）、
@@ -160,6 +161,19 @@ class ObservationsCfg:
 
         # 上一步动作：支撑 PD 位置控制与平滑性
         actions = ObsTerm(func=mdp.last_action)
+
+        # 上肢 PD 目标（前馈预判信号）：UpperBodyDisturbanceEvent 写入的上肢目标（相对 default），
+        # 领先实际运动 ≥1 step，让下肢预判上肢运动产生的动量扰动；外部扰动只作用于实际关节位置，
+        # 不进入此读数。Unoise ±0.02 模拟 IK 解算 / 目标读数的不确定性
+        upper_body_target = ObsTerm(
+            func=mdp.upper_body_joint_pos_target_rel,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", joint_names=[".*shoulder.*", ".*elbow.*", ".*wrist.*", "waist_.*_joint"]
+                )
+            },
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+        )
 
         def __post_init__(self):
             # 训练时启用噪声注入（_PLAY 配置关闭）；所有观测项拼接为扁平向量

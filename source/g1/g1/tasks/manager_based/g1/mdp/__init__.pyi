@@ -10,6 +10,7 @@ __all__ = [
     "SquatWalkCommand",
     "task_command_height",
     "task_command_velocity",
+    "upper_body_joint_pos_target_rel",
     "joint_pos_target_l2",
     "standing_joint_default_deviation_l2",
     "action_acc_l2",
@@ -81,4 +82,4 @@ from .commands.commands import SquatWalkCommand, UniformHeightCommand
 from .commands.commands_cfg import SquatWalkCommandCfg, UniformHeightCommandCfg
 from .curriculums import command_range_curriculum, upper_body_disturbance_magnitude_curriculum
 from .events import UpperBodyDisturbanceEvent
-from .observations import task_command_height, task_command_velocity
+from .observations import task_command_height, task_command_velocity, upper_body_joint_pos_target_rel
