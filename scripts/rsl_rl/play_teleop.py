@@ -508,14 +508,18 @@ class ComVisualizer:
         try:
             self._draw.clear_lines()
             z = self._ground_z + 0.005  # 略抬升避免与地面 z-fighting
-            points: list[float] = []
+            # draw_lines 需 4 个等长列表：起点集、终点集、每线 RGBA、每线像素宽度
+            # (点与色均以 tuple 提供，pybind 自动转 Float3 / ColorRgba)
+            starts: list[tuple] = []
+            ends: list[tuple] = []
             for i in range(n):
                 x0, y0 = hull[i]
                 x1, y1 = hull[(i + 1) % n]
-                points.extend([x0, y0, z, x1, y1, z])
-            colors = [0.1, 1.0, 0.1, 1.0] * (2 * n)  # 每点 RGBA
-            sizes = [3.0] * n  # 每线宽度
-            self._draw.draw_lines(points, colors, sizes)
+                starts.append((x0, y0, z))
+                ends.append((x1, y1, z))
+            colors = [(0.1, 1.0, 0.1, 1.0)] * n  # 每线 RGBA
+            widths = [3.0] * n  # 每线像素宽度
+            self._draw.draw_lines(starts, ends, colors, widths)
         except Exception as e:  # noqa: BLE001
             if not self._line_warned:
                 print(f"[WARN] 支撑多边形边线绘制失败({e})，仅显示顶点。")
