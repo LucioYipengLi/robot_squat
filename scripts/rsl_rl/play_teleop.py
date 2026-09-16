@@ -25,6 +25,7 @@
     Q / ←        wz +（左转）        E / →        wz -（右转）
     Z            h  +（升高/站直）   X            h  -（降低/下蹲）
     SPACE        归零（回到默认站立） H            打印按键帮助
+    C            切换重心投影 / 支撑多边形可视化
 
     [手柄 · Xbox 布局]
     左摇杆 上/下   vx 前进/后退（比例，松杆归零）
@@ -103,6 +104,7 @@ HELP_TEXT = (
     "  Q / ← : wz +  左转          E / → : wz -  右转\n"
     "  Z     : h  +  升高/站直     X     : h  -  降低/下蹲\n"
     "  SPACE : 归零 (默认站立)     H     : 打印本帮助\n"
+    "  C     : 切换重心投影 / 支撑多边形可视化\n"
     "[手柄 · Xbox 布局]\n"
     "  左摇杆 上/下 : vx  前进/后退 (比例，松杆归零)\n"
     "  左摇杆 左/右 : wz  左转/右转 (比例，松杆归零)\n"
@@ -135,6 +137,7 @@ class KeyboardCommandTeleop:
         self.vy = 0.0
         self.wz = 0.0
         self.enabled = False
+        self.show_com = False  # C 键切换：整机重心投影 + 双脚支撑多边形可视化
         self._subscription = None
 
         try:
@@ -190,6 +193,10 @@ class KeyboardCommandTeleop:
         # 帮助
         elif key == kb.H:
             print(HELP_TEXT)
+        # 重心 / 支撑多边形可视化开关
+        elif key == kb.C:
+            self.show_com = not self.show_com
+            print(f"\n[VIS] 重心可视化：{'ON' if self.show_com else 'OFF'}")
 
     def reset(self) -> None:
         """Zero the command (回到默认站立)。"""
@@ -379,6 +386,168 @@ def install_manual_command(env, get_command):
     return apply
 
 
+class ComVisualizer:
+    """按键触发的整机重心(CoM)地面投影 + 双脚支撑多边形可视化。
+
+    整机 CoM 由所有 body 的质量加权质心求得::
+
+        com = sum(body_mass * body_com_pose_w[:, :3]) / sum(body_mass)
+
+    支撑多边形取双脚足底 8 个角点 ``(±foot_length/2, ±foot_width/2)`` 投影到地面后的
+    2D 凸包，足底角点定义与 :func:`mdp.rewards.feet_ground_parallel_var` 一致。CoM 地面
+    投影(红球)落在凸包(绿线)内表示静态平衡裕度为正，越靠边裕度越小。
+
+    绘制分两层，保证在不同 Isaac Sim 版本下都能工作：
+
+    * ``VisualizationMarkers`` 画点(CoM 投影红球 + 8 个足底角点黄球)——始终可用；
+    * Isaac Sim ``debug_draw`` 画凸包边线——可选，import 失败时自动退化为只显示顶点。
+    """
+
+    def __init__(self, env, foot_length: float = 0.18, foot_width: float = 0.08):
+        from isaaclab.markers import VisualizationMarkers
+        from isaaclab.markers.config import SPHERE_MARKER_CFG
+        from isaaclab.utils.math import quat_apply
+
+        self._quat_apply = quat_apply
+        self.robot = env.unwrapped.scene["robot"]
+        device = env.unwrapped.device
+        # 世界系投影平面高度：取单环境原点 z(平地假设)
+        self._ground_z = float(env.unwrapped.scene.env_origins[0, 2].item())
+
+        # 双脚 ankle_roll body 索引(左右顺序无关，凸包统一处理)
+        foot_ids, foot_names = self.robot.find_bodies(".*_ankle_roll_link")
+        self._foot_body_ids = foot_ids
+        print(f"[INFO] CoM 可视化就绪，支撑足 body: {foot_names}")
+
+        # 足底四角点偏移(脚坐标系)，与 rewards.feet_ground_parallel_var 一致
+        half_l, half_w = foot_length / 2.0, foot_width / 2.0
+        self._corner_offsets = torch.tensor(
+            [[half_l, half_w, 0.0], [half_l, -half_w, 0.0], [-half_l, half_w, 0.0], [-half_l, -half_w, 0.0]],
+            device=device,
+        )
+        # 单位四元数(w,x,y,z)：球体旋转不变，仅作 visualize 占位
+        self._identity_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)
+
+        # --- markers：CoM 投影(红) + 足底角点(黄) ---
+        com_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/projection")
+        com_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
+        com_cfg.markers["sphere"].radius = 0.03
+        self._com_marker = VisualizationMarkers(com_cfg)
+
+        corner_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/foot_corners")
+        corner_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.8, 0.0)
+        corner_cfg.markers["sphere"].radius = 0.015
+        self._corner_marker = VisualizationMarkers(corner_cfg)
+
+        # --- debug_draw：凸包边线(兼容 Isaac Sim 4.x/5.x，失败则退化为仅顶点) ---
+        self._draw = None
+        try:
+            from isaacsim.util.debug_draw import _debug_draw
+
+            self._draw = _debug_draw.acquire_debug_draw_interface()
+            print("[INFO] CoM 可视化：debug_draw(isaacsim.util) 就绪，绘制支撑多边形边线。")
+        except Exception:  # noqa: BLE001
+            try:
+                from omni.isaac.debug_draw import _debug_draw
+
+                self._draw = _debug_draw.acquire_debug_draw_interface()
+                print("[INFO] CoM 可视化：debug_draw(omni.isaac) 就绪，绘制支撑多边形边线。")
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] debug_draw 不可用({e})，支撑多边形仅显示 8 个顶点(不连边)。")
+
+        self._visible = False
+        self._line_warned = False
+
+    def _whole_body_com(self) -> torch.Tensor:
+        """质量加权整机重心(世界系)，shape (1, 3)。"""
+        data = self.robot.data
+        mass = data.body_mass.torch  # (1, nb)
+        com_pos = data.body_com_pose_w.torch[..., :3]  # (1, nb, 3)
+        weighted = (mass.unsqueeze(-1) * com_pos).sum(dim=1)  # (1, 3)
+        return weighted / mass.sum(dim=1, keepdim=True)  # (1, 3) / (1, 1)
+
+    def _foot_corners_world(self) -> torch.Tensor:
+        """双脚足底 8 角点世界坐标，shape (8, 3)。"""
+        data = self.robot.data
+        body_pos = data.body_pos_w.torch[0, self._foot_body_ids]  # (2, 3)
+        body_quat = data.body_quat_w.torch[0, self._foot_body_ids]  # (2, 4)
+        corners = self._quat_apply(
+            body_quat.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 4),  # (8, 4)
+            self._corner_offsets.repeat(2, 1),  # (8, 3)
+        ).reshape(2, 4, 3)  # (2, 4, 3)
+        corners += body_pos.unsqueeze(1)  # 平移到世界坐标
+        return corners.reshape(8, 3)
+
+    @staticmethod
+    def _convex_hull_2d(points: list[list[float]]) -> list[list[float]]:
+        """Andrew 单调链求 2D 凸包，返回逆时针顶点(不含重复终点)。"""
+        pts = sorted({(round(x, 5), round(y, 5)) for x, y in points})
+        if len(pts) <= 2:
+            return [list(p) for p in pts]
+
+        def cross(o, a, b) -> float:
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower: list[tuple] = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0.0:
+                lower.pop()
+            lower.append(p)
+        upper: list[tuple] = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0.0:
+                upper.pop()
+            upper.append(p)
+        return [list(p) for p in lower[:-1] + upper[:-1]]
+
+    def _draw_hull_edges(self, hull: list[list[float]]) -> None:
+        """用 debug_draw 画凸包闭合边线(绿色)。API 差异时静默退化并只警告一次。"""
+        n = len(hull)
+        if self._draw is None or n < 2:
+            return
+        try:
+            self._draw.clear_lines()
+            z = self._ground_z + 0.005  # 略抬升避免与地面 z-fighting
+            points: list[float] = []
+            for i in range(n):
+                x0, y0 = hull[i]
+                x1, y1 = hull[(i + 1) % n]
+                points.extend([x0, y0, z, x1, y1, z])
+            colors = [0.1, 1.0, 0.1, 1.0] * (2 * n)  # 每点 RGBA
+            sizes = [3.0] * n  # 每线宽度
+            self._draw.draw_lines(points, colors, sizes)
+        except Exception as e:  # noqa: BLE001
+            if not self._line_warned:
+                print(f"[WARN] 支撑多边形边线绘制失败({e})，仅显示顶点。")
+                self._line_warned = True
+
+    def update(self) -> None:
+        """重算并绘制 CoM 投影与支撑多边形(每帧调用)。"""
+        com_proj = self._whole_body_com().clone()  # (1, 3)
+        com_proj[:, 2] = self._ground_z  # 投影到地面
+        corners_proj = self._foot_corners_world().clone()  # (8, 3)
+        corners_proj[:, 2] = self._ground_z
+        # 画点(首次显示时打开可见性；hidden 状态下 visualize 会被后端跳过)
+        if not self._visible:
+            self._com_marker.set_visibility(True)
+            self._corner_marker.set_visibility(True)
+            self._visible = True
+        self._com_marker.visualize(com_proj, self._identity_quat)
+        self._corner_marker.visualize(corners_proj, self._identity_quat.expand(8, -1))
+        # 凸包边线
+        self._draw_hull_edges(self._convex_hull_2d(corners_proj[:, :2].tolist()))
+
+    def clear(self) -> None:
+        """隐藏 markers 并清除边线(不可见时为 no-op)。"""
+        if self._visible:
+            self._com_marker.set_visibility(False)
+            self._corner_marker.set_visibility(False)
+            self._visible = False
+        if self._draw is not None:
+            with contextlib.suppress(Exception):
+                self._draw.clear_lines()
+
+
 # -- argparse ----------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Interactively teleoperate an RSL-RL policy checkpoint.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments (forced to 1 for teleop).")
@@ -498,6 +667,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # --- 键盘 / 手柄 teleop + 指令接管 ---
         kb_teleop = KeyboardCommandTeleop()
         gp_teleop = GamepadCommandTeleop()
+        com_visualizer = ComVisualizer(env)
 
         def merged_command() -> tuple[float, float, float, float]:
             """叠加键盘与手柄指令并钳制（仅用其一时另一方贡献零）。"""
@@ -531,6 +701,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         policy.reset(dones)
                     else:
                         policy_nn.reset(dones)
+
+                # 重心 / 支撑多边形可视化：C 键切换
+                if kb_teleop.show_com:
+                    com_visualizer.update()
+                else:
+                    com_visualizer.clear()
 
                 # 指令反馈：仅在目标变化时刷新终端显示
                 cmd = merged_command()
