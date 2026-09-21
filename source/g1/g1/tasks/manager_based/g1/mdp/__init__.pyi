@@ -41,6 +41,7 @@ __all__ = [
     "base_yaw_rate_l2",
     "command_range_curriculum",
     "upper_body_disturbance_magnitude_curriculum",
+    "squat_walk_mode_introduction_curriculum",
     "UpperBodyDisturbanceEvent",
 ]
 
@@ -80,6 +81,10 @@ from .rewards import (
 
 from .commands.commands import SquatWalkCommand, UniformHeightCommand
 from .commands.commands_cfg import SquatWalkCommandCfg, UniformHeightCommandCfg
-from .curriculums import command_range_curriculum, upper_body_disturbance_magnitude_curriculum
+from .curriculums import (
+    command_range_curriculum,
+    upper_body_disturbance_magnitude_curriculum,
+    squat_walk_mode_introduction_curriculum,
+)
 from .events import UpperBodyDisturbanceEvent
 from .observations import task_command_height, task_command_velocity, upper_body_joint_pos_target_rel

@@ -469,29 +469,53 @@ class SquatWalkCommand(CommandTerm):
     def _resample_command(self, env_ids: Sequence[int]):
         """Resample the task command for the specified environments under the current modes.
 
-        Height: sampled uniformly from ``cfg.ranges.height_offset`` and forced to zero for
-        STAND/WALK modes; the absolute world-frame target is then composed from the env
-        origin, the default pelvis height, and the sampled offset. Redrawn at *every*
-        resample so mid-episode height changes stay in the training distribution.
+        Height: STAND/WALK are forced to the default height (zero offset). SQUAT redraws its offset
+        from the full ``cfg.ranges.height_offset`` at *every* resample (mid-episode height changes
+        stay in the training distribution). SQUAT_WALK redraws *only* at the episode-start resample
+        (frozen within an episode, so its velocity envelope stays self-consistent) and its offset is
+        capped to ``[envelope_depth_frac * height_offset[0], height_offset[1]]`` so it never falls
+        into the zero-speed cutoff band. The absolute world-frame target is then composed from the
+        env origin, the default pelvis height, and the sampled offset.
 
-        Velocity: sampled uniformly from the configured velocity ranges for WALK/SQUAT_WALK
-        modes and zeroed otherwise, but *only* at the episode-start resample. The base class
-        increments ``command_counter`` after ``_resample_command``, so ``counter == 0``
-        identifies exactly the resample triggered by :meth:`reset`; mid-episode resamples
-        leave the velocity untouched (no gait switching within an episode).
+        Velocity: drawn *only* at the episode-start resample (``command_counter == 0``; the base class
+        increments the counter afterwards, so mid-episode resamples leave velocity untouched -- no gait
+        switching within an episode), and zeroed for STAND/SQUAT. For WALK/SQUAT_WALK each axis is
+        sampled from a per-env band shrunk by a height--velocity **trapezoid envelope**: with the
+        squat-depth ratio ``r = h_offset / height_offset[0]`` in [0, 1], the scale ``s(r)`` falls
+        linearly from 1 at ``r = 0`` to a per-axis floor at ``r = envelope_depth_frac`` (vx ->
+        ``envelope_vx_floor``, wz -> ``envelope_wz_floor``) and is cut to 0 beyond it; vy is left
+        unscaled. WALK has ``h_offset = 0 => r = 0 => s = 1``, so it keeps the full band automatically.
 
         Args:
             env_ids: The environment indices to resample the command for.
         """
         mode = self.mode[env_ids]
-        squat_mask = (mode == self.MODE_SQUAT) | (mode == self.MODE_SQUAT_WALK)
+        is_squat = mode == self.MODE_SQUAT
+        is_squat_walk = mode == self.MODE_SQUAT_WALK
+        # episode-start resample flag: drives both the SQUAT_WALK height freeze and every velocity draw
+        first_of_episode = self.command_counter[env_ids] == 0
+
+        h_lo, h_hi = self.cfg.ranges.height_offset
+        frac = self.cfg.envelope_depth_frac
 
         # -- height dimension: pelvis height offset relative to the default standing height
-        h = torch.empty(len(env_ids), device=self.device)
-        self.height_command_offset[env_ids, 0] = h.uniform_(*self.cfg.ranges.height_offset)
-        # -- STAND / WALK modes stand at the default height
-        self.height_command_offset[env_ids[~squat_mask], 0] = 0.0
-        self.is_default_env[env_ids] = ~squat_mask
+        # SQUAT: redraw over the full band [h_lo, h_hi] at every resample (mid-episode height changes)
+        squat_ids = env_ids[is_squat]
+        if len(squat_ids) > 0:
+            self.height_command_offset[squat_ids, 0] = torch.empty(
+                len(squat_ids), device=self.device
+            ).uniform_(h_lo, h_hi)
+        # SQUAT_WALK: redraw only at episode start (frozen mid-episode); depth capped to frac*h_lo so it
+        # stays inside the walkable envelope band (never in the zero-speed cutoff region)
+        sw_ids = env_ids[is_squat_walk & first_of_episode]
+        if len(sw_ids) > 0:
+            self.height_command_offset[sw_ids, 0] = torch.empty(
+                len(sw_ids), device=self.device
+            ).uniform_(frac * h_lo, h_hi)
+        # STAND / WALK: stand at the default height (zero offset)
+        default_mask = ~(is_squat | is_squat_walk)
+        self.height_command_offset[env_ids[default_mask], 0] = 0.0
+        self.is_default_env[env_ids] = default_mask
 
         # compose the absolute pelvis height target in world frame
         default_pelvis_height = self.robot.data.default_root_pose.torch[env_ids, 2]
@@ -501,22 +525,41 @@ class SquatWalkCommand(CommandTerm):
             env_origin_z + default_pelvis_height + self.height_command_offset[env_ids, 0]
         )
 
-        # -- velocity dimension: redrawn only at the episode-start resample
-        first_of_episode = self.command_counter[env_ids] == 0
+        # -- velocity dimension: redrawn only at the episode-start resample, under the trapezoid envelope
         episode_start_ids = env_ids[first_of_episode]
         if len(episode_start_ids) > 0:
-            walk_mask = (
-                (mode == self.MODE_WALK) | (mode == self.MODE_SQUAT_WALK)
-            ) & first_of_episode
+            walk_mask = ((mode == self.MODE_WALK) | is_squat_walk) & first_of_episode
             walk_ids = env_ids[walk_mask]
             still_ids = episode_start_ids[~walk_mask[first_of_episode]]
-            r = torch.empty(len(walk_ids), device=self.device)
-            # -- linear velocity - x direction
-            self.vel_command_b[walk_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
-            # -- linear velocity - y direction
-            self.vel_command_b[walk_ids, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
-            # -- ang vel yaw - rotation around z
-            self.vel_command_b[walk_ids, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
+            n = len(walk_ids)
+            if n > 0:
+                vx_lo, vx_hi = self.cfg.ranges.lin_vel_x
+                vy_lo, vy_hi = self.cfg.ranges.lin_vel_y
+                wz_lo, wz_hi = self.cfg.ranges.ang_vel_z
+                # squat-depth ratio r = h_off / h_lo in [0, 1] (h_lo < 0 by config; positive offsets
+                # -- standing taller -- clamp to r = 0, i.e. the full band)
+                h_off = self.height_command_offset[walk_ids, 0]
+                r_depth = torch.clamp(h_off / h_lo, 0.0, 1.0)
+                # trapezoid scale: linear 1 -> s_floor across r in [0, frac], hard-cut to 0 beyond frac
+                ramp = torch.clamp(r_depth / frac, 0.0, 1.0)
+                in_band = r_depth <= frac
+                s_floor_vx = min(self.cfg.envelope_vx_floor / vx_hi, 1.0) if vx_hi > 0.0 else 1.0
+                s_floor_wz = min(self.cfg.envelope_wz_floor / wz_hi, 1.0) if wz_hi > 0.0 else 1.0
+                zeros = torch.zeros_like(ramp)
+                s_vx = torch.where(in_band, 1.0 - (1.0 - s_floor_vx) * ramp, zeros)
+                s_wz = torch.where(in_band, 1.0 - (1.0 - s_floor_wz) * ramp, zeros)
+                # per-env band [s*lo, s*hi], sampled with an independent uniform per axis
+                u_x = torch.rand(n, device=self.device)
+                u_y = torch.rand(n, device=self.device)
+                u_z = torch.rand(n, device=self.device)
+                vx_lo_e, vx_hi_e = s_vx * vx_lo, s_vx * vx_hi
+                wz_lo_e, wz_hi_e = s_wz * wz_lo, s_wz * wz_hi
+                # -- linear velocity - x direction (enveloped)
+                self.vel_command_b[walk_ids, 0] = vx_lo_e + (vx_hi_e - vx_lo_e) * u_x
+                # -- linear velocity - y direction (NOT enveloped; already low)
+                self.vel_command_b[walk_ids, 1] = vy_lo + (vy_hi - vy_lo) * u_y
+                # -- ang vel yaw - rotation around z (enveloped)
+                self.vel_command_b[walk_ids, 2] = wz_lo_e + (wz_hi_e - wz_lo_e) * u_z
             # -- STAND / SQUAT modes keep a zero velocity target
             self.vel_command_b[still_ids] = 0.0
 

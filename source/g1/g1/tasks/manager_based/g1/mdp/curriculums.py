@@ -227,3 +227,92 @@ def upper_body_disturbance_magnitude_curriculum(
         "survival_ema": ema,
         "joint_noise_frac": frac,
     }
+
+
+# module-level one-shot latch recording whether the SQUAT_WALK mode has already been introduced, keyed by
+# id(env). Curriculum functions are stateless and are re-invoked on every reset, so without this latch the
+# mode weights would be rewritten (and a GPU copy paid) on every call after the trigger. Same cache pattern
+# as _survival_ema_cache above.
+_mode_intro_latch: dict[int, bool] = {}
+
+
+def squat_walk_mode_introduction_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    command_name: str = "task_command",
+    trigger_step: int = 400_000,
+    target_mode_weights: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
+) -> dict[str, float]:
+    """Introduce the SQUAT_WALK mode at a fixed training step by rewriting the command mode weights.
+
+    A **round-driven** (not performance-driven) curriculum that flips the unified :class:`SquatWalkCommand`
+    from its mounted mode weights -- which reserve SQUAT_WALK at 0.0 -- to ``target_mode_weights`` once
+    training has progressed far enough for STAND/SQUAT/WALK to be mature. Unlike :func:`command_range_curriculum`,
+    it gates on the *training step counter* rather than a success metric, because the operator watches the
+    curves and picks the introduction point by hand. This also sidesteps the AND-gating probability collapse
+    of binding a brand-new mode to several performance gates at once (a new mode would drag each gated metric
+    down and stall its own introduction).
+
+    Why it rewrites ``term._mode_probs`` and **not** ``cfg.rel_mode_envs``:
+        :class:`SquatWalkCommand.__init__` caches ``cfg.rel_mode_envs`` once into the GPU tensor
+        ``self._mode_probs``, and :meth:`SquatWalkCommand.reset` draws every episode's mode from that tensor
+        via ``torch.multinomial`` -- it never re-reads the cfg. Mutating ``cfg.rel_mode_envs`` at runtime is
+        therefore a no-op; the live ``_mode_probs`` tensor must be overwritten in place. ``copy_`` keeps the
+        existing tensor object (and its device/dtype), so the change is picked up by the very next reset.
+
+    Timing:
+        ``CurriculumManager.compute`` runs at the top of ``ManagerBasedRLEnv._reset_idx``, *before*
+        ``command_manager.reset``. So on the first reset whose ``env.common_step_counter`` has reached
+        ``trigger_step``, the new weights are in place before that same reset draws modes -- the introduced
+        distribution takes effect immediately for the envs resetting at that step.
+
+        ``common_step_counter`` advances by 1 per ``env.step()``, i.e. by ``num_steps_per_env`` per RSL-RL
+        iteration. Hence ``trigger_step = trigger_iter * num_steps_per_env`` (e.g. iteration 8000 with
+        ``num_steps_per_env = 50`` -> ``trigger_step = 400_000``).
+
+    Interaction with :func:`command_range_curriculum`:
+        The velocity envelope in :meth:`SquatWalkCommand._resample_command` derives its per-axis floor scale
+        from the *live* ``ranges`` (nominal band). To keep that nominal stable while the new mode is being
+        learned, prefer to **stagger** the two curricula or **freeze** the velocity axis around the
+        introduction step (CASE 7.3); otherwise a simultaneously widening ``lin_vel_x`` shifts the envelope
+        semantics under the freshly introduced SQUAT_WALK episodes.
+
+    Note:
+        * One-shot: the weights are rewritten exactly once per env (latched in ``_mode_intro_latch``); later
+          calls only report state. ``target_mode_weights`` need not sum to 1 (``multinomial`` normalizes).
+        * No GPU->CPU sync on the hot path: the returned ``squat_walk_weight`` is a 0-dim tensor (like
+          :func:`command_range_curriculum`'s signals); the latch check is pure Python.
+
+    Args:
+        env: The environment instance.
+        env_ids: The environment indices being reset (unused; the switch is global and one-shot).
+        command_name: Name of the :class:`SquatWalkCommand` term in the command manager.
+        trigger_step: ``common_step_counter`` value at which SQUAT_WALK is introduced
+            (``= trigger_iter * num_steps_per_env``).
+        target_mode_weights: ``(STAND, SQUAT, WALK, SQUAT_WALK)`` weights written into ``_mode_probs`` at the
+            trigger; the SQUAT_WALK slot (index 3) must be positive to actually introduce the mode.
+
+    Returns:
+        Curriculum state logged under ``Curriculum/<term_name>/<key>``: ``squat_walk_weight`` (the live
+        SQUAT_WALK weight, index 3 of ``_mode_probs``) and ``introduced`` (1.0 once switched, else 0.0), so the
+        switch moment is visible in TensorBoard.
+    """
+    term = env.command_manager.get_term(command_name)
+
+    # -- one-shot switch: rewrite the live mode-weight tensor the first time the counter reaches the trigger
+    introduced = _mode_intro_latch.get(id(env), False)
+    if not introduced and env.common_step_counter >= trigger_step:
+        term._mode_probs.copy_(
+            torch.tensor(
+                target_mode_weights,
+                dtype=term._mode_probs.dtype,
+                device=term._mode_probs.device,
+            )
+        )
+        _mode_intro_latch[id(env)] = True
+        introduced = True
+
+    return {
+        "squat_walk_weight": term._mode_probs[3],
+        "introduced": float(introduced),
+    }

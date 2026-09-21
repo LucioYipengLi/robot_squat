@@ -668,6 +668,28 @@ class CurriculumCfg:
         },
     )
 
+    # SQUAT_WALK 模式引入课程（轮次驱动·全局一次性，非绩效驱动）：训练推进到指定步数后，把指令项的四模式
+    # 权重从挂载值 (0.4, 0.4, 0.2, 0.0)（SQUAT_WALK 预留为 0）一次性改写为 target_mode_weights，让
+    # STAND/SQUAT/WALK 自然成熟后再过渡进蹲走能力。选轮次驱动而非绩效驱动：操作者人工观察训练曲线选定引入
+    # 点，且规避“新模式同时绑定多个绩效门控→拉低各门控指标→自我停滞”的 AND 概率坍缩。关键：改写的是指令项
+    # 运行时缓存的 _mode_probs 张量（reset 只读它、从不回读 cfg.rel_mode_envs），故改 cfg 无效——详见
+    # squat_walk_mode_introduction_curriculum 的 docstring。
+    # trigger_step 换算：common_step_counter 每 env.step() +1，即每训练轮 +num_steps_per_env(50)；故
+    # trigger_step = trigger_iter × 50，此处 400000 = 第 8000 轮引入（max_iterations=10000）。注意该计数
+    # 为 env 侧、resume 时从 0 重新计（RSL-RL 只恢复迭代号 it），故本 trigger 以“本次进程内步数”为准。
+    # target_mode_weights 选择：默认四模式均分 (0.25×4)；若担心遗忘成熟模式可偏向保留，如 (0.2, 0.25,
+    # 0.25, 0.3)。SQUAT_WALK 槽位（index 3）必须 > 0 才真正引入。
+    # 首版建议：引入前后冻结 command_range 的速度轴（或与之错峰），使包络 nom（ranges.lin_vel_x/ang_vel_z）
+    # 稳定——否则速度范围同时扩宽会在新引入的 SQUAT_WALK episode 下漂移包络语义（CASE §7.3）。
+    squat_walk_mode_introduction = CurrTerm(
+        func=mdp.squat_walk_mode_introduction_curriculum,
+        params={
+            "command_name": "task_command",
+            "trigger_step": 400_000,
+            "target_mode_weights": (0.25, 0.25, 0.25, 0.25),
+        },
+    )
+
 ##
 # Environment configuration
 ##

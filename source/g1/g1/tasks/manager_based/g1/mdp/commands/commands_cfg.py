@@ -127,6 +127,39 @@ class SquatWalkCommandCfg(CommandTermCfg):
     ranges: Ranges = MISSING
     """Distribution ranges for the height and velocity command dimensions."""
 
+    envelope_depth_frac: float = 0.8
+    """Knee point of the height--velocity trapezoid, as a fraction of the deepest squat [0, 1].
+
+    The conditional velocity envelope scales the walkable speed down as the commanded squat
+    deepens. With squat-depth ratio ``r = h_offset / ranges.height_offset[0]`` (0 at the default
+    height, 1 at the deepest sampled offset), the scale factor ``s(r)`` falls linearly from 1 at
+    ``r = 0`` to a per-axis floor at ``r = envelope_depth_frac``, then is cut to 0 beyond it. The
+    same fraction also caps SQUAT_WALK's height sampling to ``[envelope_depth_frac *
+    height_offset[0], height_offset[1]]`` so SQUAT_WALK never enters the zero-speed cutoff band
+    (its target speed stays at or above the floor, keeping it consistent with the gait-phase
+    reward). SQUAT still samples the full ``height_offset`` range. Defaults to 0.8.
+    """
+
+    envelope_vx_floor: float = 0.2
+    """Forward-x velocity ceiling [m/s] at the deepest walkable squat (``r = envelope_depth_frac``).
+
+    The vx band ``ranges.lin_vel_x`` is scaled toward this absolute floor as the squat deepens; at
+    ``r = envelope_depth_frac`` the sampled forward ceiling equals this value, keeping a slow but
+    nonzero gait instead of shrinking into a near-immobile crawl (a pure triangle would). The floor
+    is an absolute anchor: the implied scale ``s_floor = envelope_vx_floor / ranges.lin_vel_x[1]``
+    is recomputed from the live ``ranges`` each resample, so widening ``lin_vel_x`` via the
+    command-range curriculum keeps this floor fixed. The lower (backward) bound is scaled by the
+    same ``s(r)`` to preserve the band's asymmetry. vy is intentionally NOT enveloped. Defaults to 0.2.
+    """
+
+    envelope_wz_floor: float = 0.3
+    """Yaw-rate ceiling [rad/s] at the deepest walkable squat (``r = envelope_depth_frac``).
+
+    Same trapezoid as :attr:`envelope_vx_floor` but for the yaw band ``ranges.ang_vel_z``; at
+    ``r = envelope_depth_frac`` the sampled ``|yaw|`` ceiling equals this value. Both yaw bounds
+    are scaled by the same ``s(r)`` (the band is symmetric). Defaults to 0.3.
+    """
+
     height_success_threshold: float = 0.03
     """Threshold on the per-episode mean pelvis height tracking error [m]. Defaults to 0.03.
 
