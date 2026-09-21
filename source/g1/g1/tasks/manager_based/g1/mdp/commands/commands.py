@@ -10,6 +10,7 @@ from __future__ import annotations
 
 
 import logging
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -241,7 +242,13 @@ class SquatWalkCommand(CommandTerm):
     r"""Unified command generator coupling pelvis height and base velocity into one joint
     per-episode task distribution.
 
-    The command is a 4-D vector ``[h_offset, vx, vy, wz]``: a pelvis height offset relative
+    指令为 6 维 ``[h_offset, vx, vy, wz, com_dx, com_dy]``，前四维索引保持不变。
+    COM 两维是在双踝中点、双脚平均朝向的水平系内的目标 [m]，仅 STAND/SQUAT
+    生效；WALK/SQUAT_WALK 输入归零且跟踪奖励屏蔽。零偏置仍是有效的居中任务。
+    偏置每次重采样更新，并按二维速率上限渐变；观测只包含有效目标，不包含实际 COM
+    或启用标志。参考系实时随双足几何更新，不承担世界系足位保持或接触安全判定。
+
+    The first four elements specify a pelvis height offset relative
     to the default standing height, plus a base-frame linear/angular velocity target. At the
     start of every episode each environment is assigned one of four discrete modes
     (:attr:`mode`, drawn with weights ``cfg.rel_mode_envs``), and the per-dimension sampling
@@ -264,7 +271,7 @@ class SquatWalkCommand(CommandTerm):
     The absolute world-frame height target (:attr:`height_command_world`) keeps the interface
     consumed by the existing height-gated reward terms, and :attr:`mode` is exposed for
     mode-based reward gating. The offset form and the velocity are exposed to the policy
-    through the 4-D :attr:`command` property.
+    through the first four elements of :attr:`command`.
     """
 
     cfg: SquatWalkCommandCfg
@@ -305,14 +312,28 @@ class SquatWalkCommand(CommandTerm):
                 " (STAND, SQUAT, WALK, SQUAT_WALK) with a positive sum."
             )
 
-        # obtain the robot asset
-        # -- robot
-        self.robot: Articulation = env.scene[cfg.asset_name]
+        for name in ("com_offset_x", "com_offset_y"):
+            bounds = getattr(cfg.ranges, name)
+            if len(bounds) != 2 or not all(math.isfinite(v) for v in bounds) or not bounds[0] <= 0 <= bounds[1]:
+                raise ValueError(f"{name} 必须为有限、升序且包含零的区间。")
+        if not math.isfinite(cfg.com_target_speed) or cfg.com_target_speed <= 0:
+            raise ValueError("com_target_speed 必须为有限正数 [m/s]。")
+        if not 0 <= cfg.com_zero_probability <= 1:
+            raise ValueError("com_zero_probability 必须位于 [0, 1]。")
+        if not math.isfinite(cfg.com_success_threshold) or cfg.com_success_threshold <= 0:
+            raise ValueError("com_success_threshold 必须为有限正数 [m]。")
 
-        # create buffers to store the command
-        # -- command: unified 4-D task command [h_offset, vx, vy, wz]
-        #    (exposed to the policy via the ``command`` property)
-        self.task_command = torch.zeros(self.num_envs, 4, device=self.device)
+        # 双踝仅定义几何参考系，不等同于接触检测或真实支撑域。
+        self.robot: Articulation = env.scene[cfg.asset_name]
+        self._com_foot_ids, _ = self.robot.find_bodies(list(cfg.com_foot_body_names), preserve_order=True)
+        if len(self._com_foot_ids) != 2 or len(set(self._com_foot_ids)) != 2:
+            raise ValueError("COM 参考系必须精确匹配两个不同的足部 link。")
+
+        # 前四维兼容原切片；最后两维是限速后的有效 COM 目标。
+        self.task_command = torch.zeros(self.num_envs, 6, device=self.device)
+        self.com_offset = self.task_command[:, 4:6]
+        self.com_target_offset = torch.zeros(self.num_envs, 2, device=self.device)
+        self._manual_command: torch.Tensor | None = None
         # -- views into the unified buffer (in-place writes propagate to ``task_command``)
         #    height offset relative to the default standing height [m]
         self.height_command_offset = self.task_command[:, :1]
@@ -350,16 +371,23 @@ class SquatWalkCommand(CommandTerm):
         self._error_xy_sum = torch.zeros(self.num_envs, device=self.device)
         self._error_yaw_sum = torch.zeros(self.num_envs, device=self.device)
         self._step_count = torch.zeros(self.num_envs, device=self.device)
+        self._com_error_sum = torch.zeros(self.num_envs, device=self.device)
+        self._com_success_sum = torch.zeros(self.num_envs, device=self.device)
+        self._com_step_count = torch.zeros(self.num_envs, device=self.device)
 
         # adds cmd kind and element names for leapp export
         # during export, semantic data about this command will be used to annotate the command input
-        self.cfg.cmd_kind = self.cfg.cmd_kind or "command/body/height_velocity"
+        self.cfg.cmd_kind = self.cfg.cmd_kind or "command/body/height_velocity_com"
         self.cfg.element_names = self.cfg.element_names or [
             "pelvis_height_offset",
             "lin_vel_x",
             "lin_vel_y",
             "ang_vel_z",
+            "com_offset_x_support",
+            "com_offset_y_support",
         ]
+        if len(self.cfg.element_names) != 6:
+            raise ValueError("task_command 的导出 element_names 必须包含六个元素。")
 
     def __str__(self) -> str:
         """Return a string representation of the command generator."""
@@ -370,17 +398,98 @@ class SquatWalkCommand(CommandTerm):
         msg += f"\tLinear velocity range: x={self.cfg.ranges.lin_vel_x}, y={self.cfg.ranges.lin_vel_y} (m/s)\n"
         msg += f"\tAngular velocity range: z={self.cfg.ranges.ang_vel_z} (rad/s)\n"
         msg += f"\tMode weights (STAND, SQUAT, WALK, SQUAT_WALK): {self.cfg.rel_mode_envs}\n"
-        msg += f"\tHeight success threshold: {self.cfg.height_success_threshold} (m)"
+        msg += f"\tHeight success threshold: {self.cfg.height_success_threshold} (m)\n"
+        msg += f"\tCOM offset: x={self.cfg.ranges.com_offset_x}, y={self.cfg.ranges.com_offset_y} (m)\n"
+        msg += f"\tCOM target speed: {self.cfg.com_target_speed} (m/s); STAND/SQUAT only"
         return msg
 
     @property
     def command(self) -> torch.Tensor:
-        """The unified task command ``[h_offset, vx, vy, wz]``. Shape is (num_envs, 4).
-
-        The height offset is relative to the default standing height [m]; the velocity
-        components are expressed in the robot's base frame [m/s, m/s, rad/s].
-        """
+        """返回六维指令 [h, vx, vy, wz, com_dx, com_dy]，末两维为双足水平系有效目标 [m]。"""
         return self.task_command
+
+    @property
+    def com_tracking_mask(self) -> torch.Tensor:
+        """仅供模式门控使用，不作为策略观测。"""
+        return (self.mode == self.MODE_STAND) | (self.mode == self.MODE_SQUAT)
+
+    def whole_body_com_w(self) -> torch.Tensor:
+        """读取本帧物理质量和刚体质心，返回全身质量加权 COM，shape (N, 3) [m]。
+
+        来源：Own。使用 body_com_pose_w 而非 link 原点；质量每次现读以兼容质量随机化。
+        只包含机器人 articulation 内刚体，不自动计入独立抓持物。
+        """
+        mass = self.robot.data.body_mass.torch
+        positions = self.robot.data.body_com_pose_w.torch[..., :3]
+        return (mass.unsqueeze(-1) * positions).sum(dim=1) / mass.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+    def com_support_frame_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回双踝中点和水平朝向四元数，shape (N, 3)/(N, 4)。
+
+        X 轴取双脚前向单位向量的水平圆均值，Y 向左；使用框架四元数约定。
+        退化的相反脚朝向使用根节点 yaw 兜底，不按接触力移动原点。
+        """
+        data = self.robot.data
+        positions = data.body_pos_w.torch[:, self._com_foot_ids]
+        quats = data.body_quat_w.torch[:, self._com_foot_ids]
+        forward = torch.zeros_like(positions)
+        forward[..., 0] = 1.0
+        forward = math_utils.quat_apply(quats.reshape(-1, 4), forward.reshape(-1, 3)).reshape_as(positions)
+        xy = forward[..., :2]
+        xy = xy / torch.linalg.vector_norm(xy, dim=-1, keepdim=True).clamp_min(1e-6)
+        mean_xy = xy.sum(dim=1)
+        root_forward = torch.zeros_like(positions[:, 0])
+        root_forward[:, 0] = 1.0
+        root_forward = math_utils.quat_apply(math_utils.yaw_quat(data.root_quat_w.torch), root_forward)
+        valid = torch.linalg.vector_norm(mean_xy, dim=-1, keepdim=True) > 1e-6
+        mean_xy = torch.where(valid, mean_xy, root_forward[:, :2])
+        yaw = torch.atan2(mean_xy[:, 1], mean_xy[:, 0])
+        zeros = torch.zeros_like(yaw)
+        return positions.mean(dim=1), math_utils.quat_from_euler_xyz(zeros, zeros, yaw)
+
+    def com_error_xy(self) -> torch.Tensor:
+        """本帧全身 COM 与有效目标的双足水平系误差，shape (N, 2) [m]。
+
+        奖励先于 CommandManager.compute 执行，故必须现读物理状态，不缓存上一帧 COM。
+        """
+        origin, quat = self.com_support_frame_w()
+        actual = math_utils.quat_apply_inverse(quat, self.whole_body_com_w() - origin)[:, :2]
+        return actual - self.com_offset
+
+    def com_target_pos_w(self) -> torch.Tensor:
+        """有效 COM 目标的世界坐标 [m]；Z 仅为参考点高度，可视化时另投影到地面。"""
+        origin, quat = self.com_support_frame_w()
+        offset = torch.zeros_like(origin)
+        offset[:, :2] = self.com_offset
+        return origin + math_utils.quat_apply(quat, offset)
+
+    def set_manual_command(self, command: torch.Tensor) -> None:
+        """接收完整 (N, 6) 人工目标，不替换采样/更新钩子，也不推进平滑时钟。
+
+        前四维沿用人工高度/速度语义；COM 输入按配置限幅。非静止模式清零 COM。
+        """
+        if command.shape != self.task_command.shape or not torch.isfinite(command).all():
+            raise ValueError("人工指令必须为有限的 (num_envs, 6) 张量。")
+        self._manual_command = command.to(device=self.device, dtype=self.task_command.dtype).clone()
+        self._apply_manual_command(torch.arange(self.num_envs, device=self.device))
+
+    def _apply_manual_command(self, env_ids):
+        """写入人工原始目标；供外部输入和 reset 重采样共用。"""
+        command = self._manual_command[env_ids]
+        self.task_command[env_ids, :4] = command[:, :4]
+        has_vel = (command[:, 1:4].abs() > 1e-3).any(dim=1)
+        has_squat = command[:, 0].abs() > 1e-3
+        self.mode[env_ids] = has_squat.long() + 2 * has_vel.long()
+        self.is_default_env[env_ids] = ~has_squat
+        self.height_command_world[env_ids, 0] = (
+            self._env.scene.env_origins[env_ids, 2]
+            + self.robot.data.default_root_pose.torch[env_ids, 2] + command[:, 0]
+        )
+        self.com_target_offset[env_ids, 0] = command[:, 4].clamp(*self.cfg.ranges.com_offset_x)
+        self.com_target_offset[env_ids, 1] = command[:, 5].clamp(*self.cfg.ranges.com_offset_y)
+        walk_ids = env_ids[has_vel]
+        self.com_target_offset[walk_ids] = 0.0
+        self.com_offset[walk_ids] = 0.0
 
     def _update_metrics(self):
         """Accumulate the per-step height and velocity tracking error sums and the step counter.
@@ -400,6 +509,12 @@ class SquatWalkCommand(CommandTerm):
         self._error_xy_sum += error_xy
         self._error_yaw_sum += error_yaw
         self._step_count += 1.0
+        # reset 后第一帧没有执行新 episode 动作，不混入 COM 统计。
+        active = self.com_tracking_mask & (self._env.episode_length_buf > 0)
+        com_error = torch.linalg.vector_norm(self.com_error_xy(), dim=-1)
+        self._com_error_sum += torch.where(active, com_error, 0.0)
+        self._com_success_sum += (active & (com_error < self.cfg.com_success_threshold)).float()
+        self._com_step_count += active.float()
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         """Draw the new episode's task modes and finalize tracking metrics.
@@ -448,6 +563,17 @@ class SquatWalkCommand(CommandTerm):
         #    (stage 2 below overwrites ``self.mode`` with the freshly drawn new-episode mode)
         self.last_mode[env_ids] = self.mode[env_ids]
 
+        # COM 统计只聚合实际生效步，行走 episode 不以零误差稀释结果。
+        com_count = self._com_step_count[env_ids].sum()
+        com_stats = {}
+        if com_count > 0:
+            com_stats = {
+                "error_com_xy": (self._com_error_sum[env_ids].sum() / com_count).item(),
+                "success_rate_com": (self._com_success_sum[env_ids].sum() / com_count).item(),
+            }
+        self.com_offset[env_ids] = 0.0
+        self.com_target_offset[env_ids] = 0.0
+
         # -- stage 2: draw the per-episode task modes before the resample chain consumes them
         num = len(env_ids)
         self.mode[env_ids] = torch.multinomial(self._mode_probs.expand(num, -1), num_samples=1).squeeze(-1)
@@ -464,6 +590,10 @@ class SquatWalkCommand(CommandTerm):
         self._error_xy_sum[env_ids] = 0.0
         self._error_yaw_sum[env_ids] = 0.0
         self._step_count[env_ids] = 0.0
+        self._com_error_sum[env_ids] = 0.0
+        self._com_success_sum[env_ids] = 0.0
+        self._com_step_count[env_ids] = 0.0
+        extras.update(com_stats)
         return extras
 
     def _resample_command(self, env_ids: Sequence[int]):
@@ -489,6 +619,21 @@ class SquatWalkCommand(CommandTerm):
         Args:
             env_ids: The environment indices to resample the command for.
         """
+        if self._manual_command is not None:
+            self._apply_manual_command(env_ids)
+            return
+        # COM 与髋高复用重采样时钟；行走输入恒零，不改变原速度采样节奏。
+        self.com_target_offset[env_ids] = 0.0
+        still_ids = env_ids[self.com_tracking_mask[env_ids]]
+        self.com_target_offset[still_ids, 0] = torch.empty(len(still_ids), device=self.device).uniform_(
+            *self.cfg.ranges.com_offset_x
+        )
+        self.com_target_offset[still_ids, 1] = torch.empty(len(still_ids), device=self.device).uniform_(
+            *self.cfg.ranges.com_offset_y
+        )
+        zero_ids = still_ids[torch.rand(len(still_ids), device=self.device) < self.cfg.com_zero_probability]
+        self.com_target_offset[zero_ids] = 0.0
+
         mode = self.mode[env_ids]
         is_squat = mode == self.MODE_SQUAT
         is_squat_walk = mode == self.MODE_SQUAT_WALK
@@ -564,12 +709,14 @@ class SquatWalkCommand(CommandTerm):
             self.vel_command_b[still_ids] = 0.0
 
     def _update_command(self):
-        """Post-processes the task command.
-
-        Nothing to do here: mode constraints are fully enforced at resample time and both
-        command dimensions stay constant between resamples (no heading-control loop).
-        """
-        pass
+        """每个控制步仅推进一次 COM 目标；保持原高度和速度更新语义。"""
+        active = self.com_tracking_mask
+        self.com_target_offset[~active] = 0.0
+        delta = self.com_target_offset - self.com_offset
+        distance = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+        max_step = self.cfg.com_target_speed * self._env.step_dt
+        self.com_offset.add_(delta * (max_step / distance.clamp_min(1e-8)).clamp(max=1.0))
+        self.com_offset[~active] = 0.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Set debug visualization into visualization objects.
@@ -588,6 +735,11 @@ class SquatWalkCommand(CommandTerm):
                 # -- goal / current base velocity
                 self.goal_vel_visualizer = VisualizationMarkers(self.cfg.goal_vel_visualizer_cfg)
                 self.current_vel_visualizer = VisualizationMarkers(self.cfg.current_vel_visualizer_cfg)
+                self.goal_com_visualizer = VisualizationMarkers(self.cfg.goal_com_visualizer_cfg)
+                self.current_com_visualizer = VisualizationMarkers(self.cfg.current_com_visualizer_cfg)
+                # 创建时尚未刷新目标位置，先隐藏；回调再按模式和 COM 开关显示。
+                self.goal_com_visualizer.set_visibility(False)
+                self.current_com_visualizer.set_visibility(False)
             # set their visibility to true
             self.goal_height_visualizer.set_visibility(True)
             self.current_height_visualizer.set_visibility(True)
@@ -599,6 +751,8 @@ class SquatWalkCommand(CommandTerm):
                 self.current_height_visualizer.set_visibility(False)
                 self.goal_vel_visualizer.set_visibility(False)
                 self.current_vel_visualizer.set_visibility(False)
+                self.goal_com_visualizer.set_visibility(False)
+                self.current_com_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
         """Visualize the goal/current pelvis heights (spheres) and velocities (arrows)."""
@@ -626,6 +780,17 @@ class SquatWalkCommand(CommandTerm):
         # display velocity markers
         self.goal_vel_visualizer.visualize(arrow_pos_w, vel_des_arrow_quat, vel_des_arrow_scale)
         self.current_vel_visualizer.visualize(arrow_pos_w, vel_arrow_quat, vel_arrow_scale)
+        active = self.com_tracking_mask
+        visible = self.cfg.com_debug_vis and bool(active.any())
+        self.goal_com_visualizer.set_visibility(visible)
+        self.current_com_visualizer.set_visibility(visible)
+        if visible:
+            goal = self.com_target_pos_w()[active]
+            actual = self.whole_body_com_w()[active]
+            goal[:, 2] = self._env.scene.env_origins[active, 2] + 0.01
+            actual[:, 2] = goal[:, 2]
+            self.goal_com_visualizer.visualize(goal)
+            self.current_com_visualizer.visualize(actual)
 
     """
     Internal helpers.

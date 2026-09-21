@@ -10,6 +10,7 @@ __all__ = [
     "SquatWalkCommand",
     "task_command_height",
     "task_command_velocity",
+    "task_command_com",
     "upper_body_joint_pos_target_rel",
     "joint_pos_target_l2",
     "standing_joint_default_deviation_l2",
@@ -30,6 +31,7 @@ __all__ = [
     "feet_air_time_positive_biped",
     "feet_gait_phase_clock",
     "track_pelvis_height_exp",
+    "track_com_xy_exp",
     "track_velocity_exp",
     "zero_velocity_exp",
     "feet_spread_x_l2",
@@ -68,6 +70,7 @@ from .rewards import (
     knee_lateral_separation,
     track_lin_vel_xy_yaw_frame_exp,
     track_pelvis_height_exp,
+    track_com_xy_exp,
     track_velocity_exp,
     zero_velocity_exp,
     feet_spread_x_l2,
@@ -87,4 +90,4 @@ from .curriculums import (
     squat_walk_mode_introduction_curriculum,
 )
 from .events import UpperBodyDisturbanceEvent
-from .observations import task_command_height, task_command_velocity, upper_body_joint_pos_target_rel
+from .observations import task_command_com, task_command_height, task_command_velocity, upper_body_joint_pos_target_rel

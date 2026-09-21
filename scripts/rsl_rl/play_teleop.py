@@ -12,10 +12,10 @@
 * **摔倒等终止仍生效并自动恢复**：``base_contact`` / ``knee_contact`` / ``bad_ori`` /
   ``base_height_below_minimum`` 保留；触发后 ``ManagerBasedRLEnv`` 自动 reset，机器人
   在原地（无随机姿态/速度扰动）重新站起。
-* **键盘 / 手柄实时控制目标指令**：接管统一指令项 ``task_command``（4 维
-  ``[h_offset, vx, vy, wz]``）的重采样/更新钩子，把人工输入直接写入指令缓冲，覆盖
-  ``SquatWalkCommand`` 的随机采样，从而手动给定髋高偏移与机体系速度目标。键盘与
-  Xbox 布局手柄可同时使用，两者指令叠加后钳制到训练分布范围。
+* **键盘 / 手柄实时控制目标指令**：通过 ``set_manual_command`` 提交六维
+  ``[h_offset, vx, vy, wz, com_dx, com_dy]``，保留指令项的模式约束和 COM 目标限速。
+  高度/速度键盘与手柄叠加；COM 通过 I/K、J/L 调整，V 清零，仅 STAND/SQUAT 生效。
+  当前策略输入为 102 维，旧 100 维 checkpoint 需要重训或显式迁移。
 
 控制映射（Isaac Sim 窗口需处于焦点）::
 
@@ -25,7 +25,9 @@
     Q / ←        wz +（左转）        E / →        wz -（右转）
     Z            h  +（升高/站直）   X            h  -（降低/下蹲）
     SPACE        归零（回到默认站立） H            打印按键帮助
-    C            切换重心投影 / 支撑多边形可视化
+    C            切换 COM 实际/目标投影及双脚几何包络
+    I / K        COM 前 / 后        J / L        COM 左 / 右
+    V            仅 COM 偏置归零（仍跟踪双踝中点）
 
     [手柄 · Xbox 布局]
     左摇杆 上/下   vx 前进/后退（比例，松杆归零）
@@ -91,6 +93,7 @@ HEIGHT_OFFSET_LIMIT = (-0.45, 0.05)
 LIN_VEL_STEP = 0.1  # m/s，每按一次键 / 方向键的线速度增量
 ANG_VEL_STEP = 0.2  # rad/s，每按一次键的偏航角速度增量
 HEIGHT_STEP = 0.05  # m，每按一次键的髋高偏移增量
+COM_OFFSET_STEP = 0.002  # m，每次按键 2 mm；上下限从当前任务配置读取
 
 # 手柄（Xbox 布局）参数
 GAMEPAD_DEADZONE = 0.08  # 摇杆死区，抑制中位漂移
@@ -104,7 +107,9 @@ HELP_TEXT = (
     "  Q / ← : wz +  左转          E / → : wz -  右转\n"
     "  Z     : h  +  升高/站直     X     : h  -  降低/下蹲\n"
     "  SPACE : 归零 (默认站立)     H     : 打印本帮助\n"
-    "  C     : 切换重心投影 / 支撑多边形可视化\n"
+    "  C     : 切换 COM 实际/目标投影及双脚几何包络\n"
+    "  I / K : COM 前 / 后       J / L : COM 左 / 右（每次 2 mm）\n"
+    "  V     : 仅 COM 偏置归零（仍跟踪中点）；行走时 COM 指令屏蔽\n"
     "[手柄 · Xbox 布局]\n"
     "  左摇杆 上/下 : vx  前进/后退 (比例，松杆归零)\n"
     "  左摇杆 左/右 : wz  左转/右转 (比例，松杆归零)\n"
@@ -126,16 +131,20 @@ class KeyboardCommandTeleop:
     """Read keyboard events from the Isaac Sim window and maintain a manual task command.
 
     通过 ``carb.input`` 订阅键盘事件（Isaac Sim 原生输入，无需 tkinter/pynput 等 GUI 依赖）。
-    维护 4 维指令状态 ``[h, vx, vy, wz]``，每次按键按固定步长增减并钳制到训练分布范围内。
+    维护 6 维指令状态 ``[h, vx, vy, wz, com_dx, com_dy]``，COM 范围从任务配置读取。
     若在无窗口（headless）模式下无法获取键盘，则退化为保持零指令并打印警告。
     """
 
-    def __init__(self) -> None:
-        # 指令状态：h_offset, vx, vy, wz
+    def __init__(self, com_x_limits=(-0.01, 0.01), com_y_limits=(-0.01, 0.01)) -> None:
+        # 保留高度/速度输入语义，追加 COM 原始目标；限速由指令项执行。
         self.h = 0.0
         self.vx = 0.0
         self.vy = 0.0
         self.wz = 0.0
+        self.com_dx = 0.0
+        self.com_dy = 0.0
+        self.com_x_limits = com_x_limits
+        self.com_y_limits = com_y_limits
         self.enabled = False
         self.show_com = False  # C 键切换：整机重心投影 + 双脚支撑多边形可视化
         self._subscription = None
@@ -187,6 +196,16 @@ class KeyboardCommandTeleop:
             self.h = _clamp(self.h + HEIGHT_STEP, *HEIGHT_OFFSET_LIMIT)
         elif key == kb.X:
             self.h = _clamp(self.h - HEIGHT_STEP, *HEIGHT_OFFSET_LIMIT)
+        elif key == kb.I:
+            self.com_dx = _clamp(self.com_dx + COM_OFFSET_STEP, *self.com_x_limits)
+        elif key == kb.K:
+            self.com_dx = _clamp(self.com_dx - COM_OFFSET_STEP, *self.com_x_limits)
+        elif key == kb.J:
+            self.com_dy = _clamp(self.com_dy + COM_OFFSET_STEP, *self.com_y_limits)
+        elif key == kb.L:
+            self.com_dy = _clamp(self.com_dy - COM_OFFSET_STEP, *self.com_y_limits)
+        elif key == kb.V:
+            self.com_dx = self.com_dy = 0.0
         # 归零
         elif key == kb.SPACE:
             self.reset()
@@ -204,10 +223,12 @@ class KeyboardCommandTeleop:
         self.vx = 0.0
         self.vy = 0.0
         self.wz = 0.0
+        self.com_dx = 0.0
+        self.com_dy = 0.0
 
-    def as_tuple(self) -> tuple[float, float, float, float]:
-        """Return the command as ``(h, vx, vy, wz)``."""
-        return (self.h, self.vx, self.vy, self.wz)
+    def as_tuple(self) -> tuple[float, float, float, float, float, float]:
+        """返回人工原始目标 (h, vx, vy, wz, com_dx, com_dy)。"""
+        return (self.h, self.vx, self.vy, self.wz, self.com_dx, self.com_dy)
 
 
 class GamepadCommandTeleop:
@@ -336,53 +357,22 @@ class GamepadCommandTeleop:
 
 
 def install_manual_command(env, get_command):
-    """接管统一指令项 ``task_command``，把人工指令写入指令缓冲。
-
-    覆盖 ``SquatWalkCommand`` 实例的 ``_resample_command`` 与 ``_update_command`` 钩子：
-    命令管理器每步 ``compute`` 及 episode reset 重采样时都会调用它们，因此指令缓冲始终
-    等于当前人工目标，随机采样被完全旁路。返回一个 ``apply()`` 闭包，主循环每帧调用以
-    保证即使 ``compute`` 时序不同也能即时反映输入。
+    """提交人工原始目标，不覆盖指令更新钩子。
 
     Args:
-        env: 已包装的向量化环境（``RslRlVecEnvWrapper``）。
-        get_command: 零参可调用对象，返回当前合并后的 ``(h, vx, vy, wz)`` 指令。
+        env: 单环境的 RslRlVecEnvWrapper。
+        get_command: 返回 (h, vx, vy, wz, com_dx, com_dy) 的零参可调用对象。
 
     Returns:
-        Callable[[], None]: 将当前指令写入指令缓冲的函数。
+        每帧提交输入的闭包；COM 平滑仍由 CommandManager 每步推进一次。
     """
-    command_manager = env.unwrapped.command_manager
-    term = command_manager.get_term("task_command")
-    robot = term.robot
+    term = env.unwrapped.command_manager.get_term("task_command")
 
-    # 世界系髋高目标 = 环境原点 z + 默认髋高 + 偏移；这两项为静态量，仅取一次。
-    env_origin_z = float(env.unwrapped.scene.env_origins[0, 2].item())
-    default_pelvis_h = float(robot.data.default_root_pose.torch[0, 2].item())
+    def apply() -> None:
+        command = torch.tensor([get_command()], device=term.device, dtype=term.task_command.dtype)
+        term.set_manual_command(command)
 
-    def apply(_env_ids=None) -> None:
-        h, vx, vy, wz = get_command()
-        # 统一 4 维指令缓冲（观测经切片消费其 [h] 与 [vx, vy, wz]）
-        term.task_command[0, 0] = h
-        term.task_command[0, 1] = vx
-        term.task_command[0, 2] = vy
-        term.task_command[0, 3] = wz
-        # 高度门控奖励/可视化使用的世界系绝对目标
-        term.height_command_world[0, 0] = env_origin_z + default_pelvis_h + h
-        # 保持 mode 缓冲与指令语义一致（供调试/任何模式门控逻辑读取）
-        has_vel = abs(vx) > 1e-3 or abs(vy) > 1e-3 or abs(wz) > 1e-3
-        has_squat = abs(h) > 1e-3
-        if has_vel and has_squat:
-            term.mode[0] = term.MODE_SQUAT_WALK
-        elif has_vel:
-            term.mode[0] = term.MODE_WALK
-        elif has_squat:
-            term.mode[0] = term.MODE_SQUAT
-        else:
-            term.mode[0] = term.MODE_STAND
-
-    # 旁路随机重采样与更新钩子（instance 属性会遮蔽类方法，调用时不再传 self）
-    term._resample_command = apply  # 基类以 self._resample_command(env_ids) 调用
-    term._update_command = apply  # 基类以 self._update_command() 调用
-    apply()  # 立即写入，使首帧观测即为零指令而非随机采样
+    apply()
     return apply
 
 
@@ -395,7 +385,8 @@ class ComVisualizer:
 
     支撑多边形取双脚足底 8 个角点 ``(±foot_length/2, ±foot_width/2)`` 投影到地面后的
     2D 凸包，足底角点定义与 :func:`mdp.rewards.feet_ground_parallel_var` 一致。CoM 地面
-    投影(红球)落在凸包(绿线)内表示静态平衡裕度为正，越靠边裕度越小。
+    投影红球为实际 COM，紫球为有效目标，青球为双踝中点。
+    绿线只是双脚几何投影包络，未按接触筛选，不能直接视为实际支撑域或稳定性保证。
 
     绘制分两层，保证在不同 Isaac Sim 版本下都能工作：
 
@@ -410,6 +401,7 @@ class ComVisualizer:
 
         self._quat_apply = quat_apply
         self.robot = env.unwrapped.scene["robot"]
+        self._command_term = env.unwrapped.command_manager.get_term("task_command")
         device = env.unwrapped.device
         # 世界系投影平面高度：取单环境原点 z(平地假设)
         self._ground_z = float(env.unwrapped.scene.env_origins[0, 2].item())
@@ -425,14 +417,22 @@ class ComVisualizer:
             [[half_l, half_w, 0.0], [half_l, -half_w, 0.0], [-half_l, half_w, 0.0], [-half_l, -half_w, 0.0]],
             device=device,
         )
-        # 单位四元数(w,x,y,z)：球体旋转不变，仅作 visualize 占位
-        self._identity_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)
+        # 框架四元数为 (x,y,z,w)；球体旋转不变，仅作 visualize 占位。
+        self._identity_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=device)
 
         # --- markers：CoM 投影(红) + 足底角点(黄) ---
         com_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/projection")
         com_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
-        com_cfg.markers["sphere"].radius = 0.03
+        com_cfg.markers["sphere"].radius = 0.006
         self._com_marker = VisualizationMarkers(com_cfg)
+        target_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/target")
+        target_cfg.markers["sphere"].visual_material.diffuse_color = (0.7, 0.1, 1.0)
+        target_cfg.markers["sphere"].radius = 0.008
+        self._target_marker = VisualizationMarkers(target_cfg)
+        origin_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/origin")
+        origin_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 0.8, 1.0)
+        origin_cfg.markers["sphere"].radius = 0.004
+        self._origin_marker = VisualizationMarkers(origin_cfg)
 
         corner_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/foot_corners")
         corner_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.8, 0.0)
@@ -455,16 +455,15 @@ class ComVisualizer:
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] debug_draw 不可用({e})，支撑多边形仅显示 8 个顶点(不连边)。")
 
+        # 标记创建时默认可见；在首次按 C 前显式隐藏，避免原点出现占位球。
+        for marker in (self._com_marker, self._corner_marker, self._target_marker, self._origin_marker):
+            marker.set_visibility(False)
         self._visible = False
         self._line_warned = False
 
     def _whole_body_com(self) -> torch.Tensor:
-        """质量加权整机重心(世界系)，shape (1, 3)。"""
-        data = self.robot.data
-        mass = data.body_mass.torch  # (1, nb)
-        com_pos = data.body_com_pose_w.torch[..., :3]  # (1, nb, 3)
-        weighted = (mass.unsqueeze(-1) * com_pos).sum(dim=1)  # (1, 3)
-        return weighted / mass.sum(dim=1, keepdim=True)  # (1, 3) / (1, 1)
+        """复用任务侧全身 COM 计算，避免训练与显示采用不同定义。"""
+        return self._command_term.whole_body_com_w()
 
     def _foot_corners_world(self) -> torch.Tensor:
         """双脚足底 8 角点世界坐标，shape (8, 3)。"""
@@ -528,7 +527,7 @@ class ComVisualizer:
     def update(self) -> None:
         """重算并绘制 CoM 投影与支撑多边形(每帧调用)。"""
         com_proj = self._whole_body_com().clone()  # (1, 3)
-        com_proj[:, 2] = self._ground_z  # 投影到地面
+        com_proj[:, 2] = self._ground_z + 0.01  # 稍抬升以免标记被地面遮挡
         corners_proj = self._foot_corners_world().clone()  # (8, 3)
         corners_proj[:, 2] = self._ground_z
         # 画点(首次显示时打开可见性；hidden 状态下 visualize 会被后端跳过)
@@ -538,6 +537,15 @@ class ComVisualizer:
             self._visible = True
         self._com_marker.visualize(com_proj, self._identity_quat)
         self._corner_marker.visualize(corners_proj, self._identity_quat.expand(8, -1))
+        active = bool(self._command_term.com_tracking_mask[0])
+        self._target_marker.set_visibility(active)
+        self._origin_marker.set_visibility(active)
+        if active:
+            target = self._command_term.com_target_pos_w()
+            origin, _ = self._command_term.com_support_frame_w()
+            target[:, 2] = origin[:, 2] = self._ground_z + 0.01
+            self._target_marker.visualize(target, self._identity_quat)
+            self._origin_marker.visualize(origin, self._identity_quat)
         # 凸包边线
         self._draw_hull_edges(self._convex_hull_2d(corners_proj[:, :2].tolist()))
 
@@ -546,6 +554,8 @@ class ComVisualizer:
         if self._visible:
             self._com_marker.set_visibility(False)
             self._corner_marker.set_visibility(False)
+            self._target_marker.set_visibility(False)
+            self._origin_marker.set_visibility(False)
             self._visible = False
         if self._draw is not None:
             with contextlib.suppress(Exception):
@@ -607,8 +617,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.terminations.time_out = None
         # 关闭观测噪声，确定性推理
         env_cfg.observations.policy.enable_corruption = False
-        # 关闭指令随机重采样的语义影响（钩子会在运行时被接管，这里保留 debug 可视化）
+        # 运行时由人工接口接管重采样目标，保留内部更新钩子及高度/速度可视化。
         env_cfg.commands.task_command.debug_vis = True
+        # COM 由 C 键控制的本地可视化显示，避免与指令项标记重复。
+        env_cfg.commands.task_command.com_debug_vis = False
         # 摔倒后原地无扰动恢复：清零 reset 事件的位姿/速度随机化
         if getattr(env_cfg.events, "reset_base", None) is not None:
             env_cfg.events.reset_base.params["pose_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)}
@@ -654,7 +666,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        runner.load(resume_path)
+        try:
+            runner.load(resume_path)
+        except RuntimeError as exc:
+            if "size mismatch" in str(exc):
+                raise RuntimeError(
+                    "策略参数尺寸不匹配：当前观测末尾增加 COM 两维（默认共 102 维）。"
+                    "旧 100 维 checkpoint 不能直接加载，请使用重训或显式迁移后的模型。"
+                ) from exc
+            raise
 
         # obtain the trained policy for inference
         policy = runner.get_inference_policy(device=env.unwrapped.device)
@@ -669,19 +689,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         dt = env.unwrapped.step_dt
 
         # --- 键盘 / 手柄 teleop + 指令接管 ---
-        kb_teleop = KeyboardCommandTeleop()
+        com_ranges = env.unwrapped.command_manager.get_term("task_command").cfg.ranges
+        kb_teleop = KeyboardCommandTeleop(com_ranges.com_offset_x, com_ranges.com_offset_y)
         gp_teleop = GamepadCommandTeleop()
         com_visualizer = ComVisualizer(env)
 
-        def merged_command() -> tuple[float, float, float, float]:
-            """叠加键盘与手柄指令并钳制（仅用其一时另一方贡献零）。"""
-            kh, kvx, kvy, kwz = kb_teleop.as_tuple()
+        def merged_command() -> tuple[float, float, float, float, float, float]:
+            """高度/速度维度叠加；COM 使用键盘目标，行走时清零以防停步后重放旧偏置。"""
+            kh, kvx, kvy, kwz, cx, cy = kb_teleop.as_tuple()
             gh, gvx, gvy, gwz = gp_teleop.as_tuple()
+            if any(abs(v) > 1e-3 for v in (kvx + gvx, kvy + gvy, kwz + gwz)):
+                kb_teleop.com_dx = kb_teleop.com_dy = 0.0
+                cx = cy = 0.0
             return (
                 _clamp(kh + gh, *HEIGHT_OFFSET_LIMIT),
                 _clamp(kvx + gvx, *LIN_VEL_X_LIMIT),
                 _clamp(kvy + gvy, *LIN_VEL_Y_LIMIT),
                 _clamp(kwz + gwz, *ANG_VEL_Z_LIMIT),
+                _clamp(cx, *com_ranges.com_offset_x),
+                _clamp(cy, *com_ranges.com_offset_y),
             )
 
         apply_command = install_manual_command(env, merged_command)
@@ -699,6 +725,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 gp_teleop.update(dt)
                 apply_command()
                 with torch.inference_mode():
+                    # 人工输入更新后重算观测，不推进历史/COM 平滑时钟，避免旧观测对新目标动作。
+                    obs = env.get_observations()
                     actions = policy(obs)
                     obs, _, dones, _ = env.step(actions)
                     if version.parse(installed_version) >= version.parse("4.0.0"):
@@ -717,7 +745,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if cmd != last_print:
                     print(
                         f"\r[CMD] h={cmd[0]:+.2f} m | vx={cmd[1]:+.2f} vy={cmd[2]:+.2f} m/s "
-                        f"| wz={cmd[3]:+.2f} rad/s   ",
+                        f"| wz={cmd[3]:+.2f} rad/s | COM目标=({cmd[4]:+.3f}, {cmd[5]:+.3f}) m   ",
                         end="",
                         flush=True,
                     )

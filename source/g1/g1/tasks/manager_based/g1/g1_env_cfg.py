@@ -97,14 +97,14 @@ class G1SceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command specifications for the MDP."""
 
-    # 统一任务指令项（SquatWalkCommand）：4 维 [h_offset, vx, vy, ωz]，髋高偏移（相对
+    # 统一任务指令项（SquatWalkCommand）：6 维 [h_offset, vx, vy, ωz, com_dx, com_dy]，髋高偏移（相对
     # 默认站立髋高）与机体系速度目标联合采样。每 episode 先抽一次四模式互斥：
     #   STAND(0.4) 原髋高站立 | SQUAT(0.4) 变髋高蹲起（零速） | WALK(0.2) 速度跟随行走（默认髋高）
     #   SQUAT_WALK(0.0) 指定髋高下行走（混合模式预留槽位，纯配置即可启用）
     # 单时钟双节奏：髋高每 (2,4) s 重采样都重抽（保留中途调髋高技能），速度仅在
     # episode 首抽一次（步态不中途切换）；奖励的模式门控见主目录 TODO P2。
-    # 观测经切片消费（velocity_commands 3 维 + pelvis_height_cmd 1 维，见 PolicyCfg），
-    # 观测总维 83，旧 checkpoint 不兼容。
+    # 观测经切片消费：速度 3 维、髋高 1 维，末尾追加 COM 2 维；不加入实际 COM 或启用标志。
+    # COM 仅 STAND/SQUAT 生效，双踝中点为零点，偏置各 ±1 cm；102 维观测不兼容旧 checkpoint。
     task_command = mdp.SquatWalkCommandCfg(
         asset_name="robot",
         resampling_time_range=(2.0, 4.0),
@@ -114,7 +114,12 @@ class CommandsCfg:
             lin_vel_x=(-0.3, 0.6),
             lin_vel_y=(-0.15, 0.15),
             ang_vel_z=(-0.8, 0.8),
+            com_offset_x=(-0.01, 0.01),
+            com_offset_y=(-0.01, 0.01),
         ),
+        com_target_speed=0.02,
+        com_zero_probability=0.2,
+        com_success_threshold=0.005,
         height_success_threshold=0.03,
         debug_vis=True,
     )
@@ -138,10 +143,10 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Policy observations, concatenated into a flat 100-D vector.
+        """102 维策略观测：保留原 100 维顺序，在末尾追加 COM 有效目标两维。
 
-        Order: base state (9) -> task command (4) -> joint state (58) -> last action (12)
-        -> upper-body PD target (17).
+        原顺序为基座状态(9)、高度/速度指令(4)、全身关节状态(58)、上一步动作(12)、
+        上肢 PD 目标(17)；COM 输入只含目标偏置，不含实际 COM、模式或启用标志。
         """
 
         # 基座本体状态（IMU 可获取量）：线速度 ±0.1、角速度 ±0.2（陀螺仪噪声更大）、
@@ -174,6 +179,9 @@ class ObservationsCfg:
             },
             noise=Unoise(n_min=-0.02, n_max=0.02),
         )
+
+        # 末尾追加而不移动原有特征索引；行走模式输入为零，奖励独立按 mode 门控。
+        com_offset_cmd = ObsTerm(func=mdp.task_command_com, params={"command_name": "task_command"})
 
         def __post_init__(self):
             # 训练时启用噪声注入（_PLAY 配置关闭）；所有观测项拼接为扁平向量
@@ -317,6 +325,14 @@ class RewardsCfg:
         func=mdp.track_velocity_exp,
         weight=1.0,
         params={"command_name": "task_command", "std": 0.25},
+    )
+
+    # COM 跟踪（Own）：exp(-||e_xy||²/std²)，双踝中点水平系；仅 STAND/SQUAT，核宽非安全边界。
+    # 首版保留其他奖励权重；需实测零速/默认关节位/协同约束是否抵抗厘米级调整。
+    track_com = RewTerm(
+        func=mdp.track_com_xy_exp,
+        weight=1.0,
+        params={"command_name": "task_command", "std": 0.02},
     )
 
     # =====================================================================
