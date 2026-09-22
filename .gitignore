@@ -65,9 +65,7 @@ _build
 /datasets/
 
 # Tests
-/tests/*
-!/tests/test_com_command.py
-
+/tests/
 # Docker history
 .isaac-lab-docker-history
 
