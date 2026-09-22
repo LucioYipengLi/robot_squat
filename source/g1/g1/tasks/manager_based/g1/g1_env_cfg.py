@@ -121,7 +121,7 @@ class CommandsCfg:
         com_zero_probability=0.2,
         com_success_threshold=0.005,
         height_success_threshold=0.03,
-        debug_vis=True,
+        debug_vis=False,
     )
 
 
@@ -331,7 +331,7 @@ class RewardsCfg:
     # 首版保留其他奖励权重；需实测零速/默认关节位/协同约束是否抵抗厘米级调整。
     track_com = RewTerm(
         func=mdp.track_com_xy_exp,
-        weight=1.0,
+        weight=0.0,
         params={"command_name": "task_command", "std": 0.02},
     )
 
