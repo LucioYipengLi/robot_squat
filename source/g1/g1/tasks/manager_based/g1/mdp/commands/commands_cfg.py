@@ -77,7 +77,7 @@ class UniformHeightCommandCfg(CommandTermCfg):
 
 @configclass
 class SquatWalkCommandCfg(CommandTermCfg):
-    """统一髋高、速度及静止模式全身 COM 偏置指令配置。"""
+    """统一髋高、速度及静止模式骨盆 X-Y 偏置指令配置。"""
 
     class_type: type["SquatWalkCommand"] | str = "{DIR}.commands:SquatWalkCommand"
 
@@ -124,29 +124,30 @@ class SquatWalkCommandCfg(CommandTermCfg):
         ang_vel_z: tuple[float, float] = (0.0, 0.0)
         """Range for the angular-z (yaw) velocity command in the base frame (in rad/s)."""
 
-        com_offset_x: tuple[float, float] = (-0.01, 0.01)
-        """双足水平参考系前后 COM 偏置范围 [m]；仅 STAND/SQUAT 采样。"""
+        pelvis_offset_x: tuple[float, float] = (-0.03, 0.03)
+        """双足水平参考系前后骨盆偏置范围 [m]；仅 STAND/SQUAT 采样。"""
 
-        com_offset_y: tuple[float, float] = (-0.01, 0.01)
-        """双足水平参考系左右 COM 偏置范围 [m]；±1 cm 为待仿真验证的保守起点。"""
+        pelvis_offset_y: tuple[float, float] = (-0.03, 0.03)
+        """双足水平参考系左右骨盆偏置范围 [m]；骨盆口径不受上肢扰动污染，
+        范围可比旧 COM 口径放宽，仍为待仿真验证的保守起点。"""
 
     ranges: Ranges = MISSING
     """Distribution ranges for the height and velocity command dimensions."""
 
-    com_foot_body_names: tuple[str, str] = ("left_ankle_roll_link", "right_ankle_roll_link")
+    support_foot_body_names: tuple[str, str] = ("left_ankle_roll_link", "right_ankle_roll_link")
     """参考点使用双踝 link 原点；不假定它们等于真实足底几何中心。"""
 
-    com_debug_vis: bool = True
-    """总 debug_vis 开启时是否显示 COM 标记；遥操作可改用 C 键控制的独立标记。"""
+    pelvis_debug_vis: bool = True
+    """总 debug_vis 开启时是否显示骨盆偏置标记；遥操作可改用 C 键控制的独立标记。"""
 
-    com_target_speed: float = 0.02
-    """COM 偏置目标的二维最大变化速率 [m/s]，不限制机器人实际 COM 速度。"""
+    pelvis_target_speed: float = 0.02
+    """骨盆偏置目标的二维最大变化速率 [m/s]，不限制机器人实际骨盆速度。"""
 
-    com_zero_probability: float = 0.2
-    """静止模式采样零偏置的概率；零偏置仍要求 COM 跟踪双踝中点。"""
+    pelvis_zero_probability: float = 0.2
+    """静止模式采样零偏置的概率；零偏置仍要求骨盆跟踪双踝中点。"""
 
-    com_success_threshold: float = 0.005
-    """静止模式 COM 二维误差的成功阈值 [m]，用于统计而非安全保证。"""
+    pelvis_success_threshold: float = 0.005
+    """静止模式骨盆二维误差的成功阈值 [m]，用于统计而非安全保证。"""
 
     envelope_depth_frac: float = 0.8
     """Knee point of the height--velocity trapezoid, as a fraction of the deepest squat [0, 1].
@@ -225,20 +226,20 @@ class SquatWalkCommandCfg(CommandTermCfg):
     current_height_visualizer_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 0.0, 1.0)
     goal_height_visualizer_cfg.markers["sphere"].radius = 0.1
     current_height_visualizer_cfg.markers["sphere"].radius = 0.1
-    goal_com_visualizer_cfg: VisualizationMarkersCfg = SPHERE_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/task_com_goal"
+    goal_pelvis_xy_visualizer_cfg: VisualizationMarkersCfg = SPHERE_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/task_pelvis_xy_goal"
     )
-    """COM 有效目标地面投影（紫色），仅静止模式显示。"""
+    """骨盆偏置有效目标地面投影（紫色），仅静止模式显示。"""
 
-    current_com_visualizer_cfg: VisualizationMarkersCfg = SPHERE_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/task_com_current"
+    current_pelvis_xy_visualizer_cfg: VisualizationMarkersCfg = SPHERE_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/task_pelvis_xy_current"
     )
-    """整机 COM 地面投影（红色）；不是根刚体的 COM。"""
+    """骨盆（根刚体）地面投影（红色）；不是整机质量加权 COM。"""
 
-    goal_com_visualizer_cfg.markers["sphere"].visual_material.diffuse_color = (0.7, 0.1, 1.0)
-    current_com_visualizer_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.1, 0.1)
-    goal_com_visualizer_cfg.markers["sphere"].radius = 0.008
-    current_com_visualizer_cfg.markers["sphere"].radius = 0.006
+    goal_pelvis_xy_visualizer_cfg.markers["sphere"].visual_material.diffuse_color = (0.7, 0.1, 1.0)
+    current_pelvis_xy_visualizer_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.1, 0.1)
+    goal_pelvis_xy_visualizer_cfg.markers["sphere"].radius = 0.010
+    current_pelvis_xy_visualizer_cfg.markers["sphere"].radius = 0.008
 
     # Scale of the velocity arrow markers, matching the built-in velocity command style.
     goal_vel_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)

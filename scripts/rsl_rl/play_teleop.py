@@ -13,8 +13,8 @@
   ``base_height_below_minimum`` 保留；触发后 ``ManagerBasedRLEnv`` 自动 reset，机器人
   在原地（无随机姿态/速度扰动）重新站起。
 * **键盘 / 手柄实时控制目标指令**：通过 ``set_manual_command`` 提交六维
-  ``[h_offset, vx, vy, wz, com_dx, com_dy]``，保留指令项的模式约束和 COM 目标限速。
-  高度/速度键盘与手柄叠加；COM 通过 I/K、J/L 调整，V 清零，仅 STAND/SQUAT 生效。
+  ``[h_offset, vx, vy, wz, pelvis_dx, pelvis_dy]``，保留指令项的模式约束和骨盆目标限速。
+  高度/速度键盘与手柄叠加；骨盆偏置通过 I/K、J/L 调整，V 清零，仅 STAND/SQUAT 生效。
   当前策略输入为 102 维，旧 100 维 checkpoint 需要重训或显式迁移。
 
 控制映射（Isaac Sim 窗口需处于焦点）::
@@ -25,9 +25,9 @@
     Q / ←        wz +（左转）        E / →        wz -（右转）
     Z            h  +（升高/站直）   X            h  -（降低/下蹲）
     SPACE        归零（回到默认站立） H            打印按键帮助
-    C            切换 COM 实际/目标投影及双脚几何包络
-    I / K        COM 前 / 后        J / L        COM 左 / 右
-    V            仅 COM 偏置归零（仍跟踪双踝中点）
+    C            切换骨盆实际/目标投影及双脚几何包络
+    I / K        骨盆前 / 后        J / L        骨盆左 / 右
+    V            仅骨盆偏置归零（仍跟踪双踝中点）
 
     [手柄 · Xbox 布局]
     左摇杆 上/下   vx 前进/后退（比例，松杆归零）
@@ -93,7 +93,7 @@ HEIGHT_OFFSET_LIMIT = (-0.45, 0.05)
 LIN_VEL_STEP = 0.1  # m/s，每按一次键 / 方向键的线速度增量
 ANG_VEL_STEP = 0.2  # rad/s，每按一次键的偏航角速度增量
 HEIGHT_STEP = 0.05  # m，每按一次键的髋高偏移增量
-COM_OFFSET_STEP = 0.002  # m，每次按键 2 mm；上下限从当前任务配置读取
+PELVIS_OFFSET_STEP = 0.005  # m，每次按键 5 mm；上下限从当前任务配置读取
 
 # 手柄（Xbox 布局）参数
 GAMEPAD_DEADZONE = 0.08  # 摇杆死区，抑制中位漂移
@@ -107,9 +107,9 @@ HELP_TEXT = (
     "  Q / ← : wz +  左转          E / → : wz -  右转\n"
     "  Z     : h  +  升高/站直     X     : h  -  降低/下蹲\n"
     "  SPACE : 归零 (默认站立)     H     : 打印本帮助\n"
-    "  C     : 切换 COM 实际/目标投影及双脚几何包络\n"
-    "  I / K : COM 前 / 后       J / L : COM 左 / 右（每次 2 mm）\n"
-    "  V     : 仅 COM 偏置归零（仍跟踪中点）；行走时 COM 指令屏蔽\n"
+    "  C     : 切换骨盆实际/目标投影及双脚几何包络\n"
+    "  I / K : 骨盆前 / 后       J / L : 骨盆左 / 右（每次 5 mm）\n"
+    "  V     : 仅骨盆偏置归零（仍跟踪中点）；行走时偏置指令屏蔽\n"
     "[手柄 · Xbox 布局]\n"
     "  左摇杆 上/下 : vx  前进/后退 (比例，松杆归零)\n"
     "  左摇杆 左/右 : wz  左转/右转 (比例，松杆归零)\n"
@@ -131,22 +131,22 @@ class KeyboardCommandTeleop:
     """Read keyboard events from the Isaac Sim window and maintain a manual task command.
 
     通过 ``carb.input`` 订阅键盘事件（Isaac Sim 原生输入，无需 tkinter/pynput 等 GUI 依赖）。
-    维护 6 维指令状态 ``[h, vx, vy, wz, com_dx, com_dy]``，COM 范围从任务配置读取。
+    维护 6 维指令状态 ``[h, vx, vy, wz, pelvis_dx, pelvis_dy]``，骨盆偏置范围从任务配置读取。
     若在无窗口（headless）模式下无法获取键盘，则退化为保持零指令并打印警告。
     """
 
-    def __init__(self, com_x_limits=(-0.01, 0.01), com_y_limits=(-0.01, 0.01)) -> None:
-        # 保留高度/速度输入语义，追加 COM 原始目标；限速由指令项执行。
+    def __init__(self, pelvis_x_limits=(-0.03, 0.03), pelvis_y_limits=(-0.03, 0.03)) -> None:
+        # 保留高度/速度输入语义，追加骨盆原始目标；限速由指令项执行。
         self.h = 0.0
         self.vx = 0.0
         self.vy = 0.0
         self.wz = 0.0
-        self.com_dx = 0.0
-        self.com_dy = 0.0
-        self.com_x_limits = com_x_limits
-        self.com_y_limits = com_y_limits
+        self.pelvis_dx = 0.0
+        self.pelvis_dy = 0.0
+        self.pelvis_x_limits = pelvis_x_limits
+        self.pelvis_y_limits = pelvis_y_limits
         self.enabled = False
-        self.show_com = False  # C 键切换：整机重心投影 + 双脚支撑多边形可视化
+        self.show_pelvis = False  # C 键切换：骨盆投影 + 双脚支撑多边形可视化
         self._subscription = None
 
         try:
@@ -197,25 +197,25 @@ class KeyboardCommandTeleop:
         elif key == kb.X:
             self.h = _clamp(self.h - HEIGHT_STEP, *HEIGHT_OFFSET_LIMIT)
         elif key == kb.I:
-            self.com_dx = _clamp(self.com_dx + COM_OFFSET_STEP, *self.com_x_limits)
+            self.pelvis_dx = _clamp(self.pelvis_dx + PELVIS_OFFSET_STEP, *self.pelvis_x_limits)
         elif key == kb.K:
-            self.com_dx = _clamp(self.com_dx - COM_OFFSET_STEP, *self.com_x_limits)
+            self.pelvis_dx = _clamp(self.pelvis_dx - PELVIS_OFFSET_STEP, *self.pelvis_x_limits)
         elif key == kb.J:
-            self.com_dy = _clamp(self.com_dy + COM_OFFSET_STEP, *self.com_y_limits)
+            self.pelvis_dy = _clamp(self.pelvis_dy + PELVIS_OFFSET_STEP, *self.pelvis_y_limits)
         elif key == kb.L:
-            self.com_dy = _clamp(self.com_dy - COM_OFFSET_STEP, *self.com_y_limits)
+            self.pelvis_dy = _clamp(self.pelvis_dy - PELVIS_OFFSET_STEP, *self.pelvis_y_limits)
         elif key == kb.V:
-            self.com_dx = self.com_dy = 0.0
+            self.pelvis_dx = self.pelvis_dy = 0.0
         # 归零
         elif key == kb.SPACE:
             self.reset()
         # 帮助
         elif key == kb.H:
             print(HELP_TEXT)
-        # 重心 / 支撑多边形可视化开关
+        # 骨盆 / 支撑多边形可视化开关
         elif key == kb.C:
-            self.show_com = not self.show_com
-            print(f"\n[VIS] 重心可视化：{'ON' if self.show_com else 'OFF'}")
+            self.show_pelvis = not self.show_pelvis
+            print(f"\n[VIS] 骨盆可视化：{'ON' if self.show_pelvis else 'OFF'}")
 
     def reset(self) -> None:
         """Zero the command (回到默认站立)。"""
@@ -223,12 +223,12 @@ class KeyboardCommandTeleop:
         self.vx = 0.0
         self.vy = 0.0
         self.wz = 0.0
-        self.com_dx = 0.0
-        self.com_dy = 0.0
+        self.pelvis_dx = 0.0
+        self.pelvis_dy = 0.0
 
     def as_tuple(self) -> tuple[float, float, float, float, float, float]:
-        """返回人工原始目标 (h, vx, vy, wz, com_dx, com_dy)。"""
-        return (self.h, self.vx, self.vy, self.wz, self.com_dx, self.com_dy)
+        """返回人工原始目标 (h, vx, vy, wz, pelvis_dx, pelvis_dy)。"""
+        return (self.h, self.vx, self.vy, self.wz, self.pelvis_dx, self.pelvis_dy)
 
 
 class GamepadCommandTeleop:
@@ -361,10 +361,10 @@ def install_manual_command(env, get_command):
 
     Args:
         env: 单环境的 RslRlVecEnvWrapper。
-        get_command: 返回 (h, vx, vy, wz, com_dx, com_dy) 的零参可调用对象。
+        get_command: 返回 (h, vx, vy, wz, pelvis_dx, pelvis_dy) 的零参可调用对象。
 
     Returns:
-        每帧提交输入的闭包；COM 平滑仍由 CommandManager 每步推进一次。
+        每帧提交输入的闭包；骨盆偏置平滑仍由 CommandManager 每步推进一次。
     """
     term = env.unwrapped.command_manager.get_term("task_command")
 
@@ -376,21 +376,20 @@ def install_manual_command(env, get_command):
     return apply
 
 
-class ComVisualizer:
-    """按键触发的整机重心(CoM)地面投影 + 双脚支撑多边形可视化。
+class PelvisVisualizer:
+    """按键触发的骨盆地面投影 + 双脚支撑多边形可视化。
 
-    整机 CoM 由所有 body 的质量加权质心求得::
-
-        com = sum(body_mass * body_com_pose_w[:, :3]) / sum(body_mass)
+    骨盆位置直接读取根刚体 ``root_pos_w``，与任务侧 ``pelvis_error_xy`` 同源，
+    不含质量加权，不受上肢扰动事件影响。
 
     支撑多边形取双脚足底 8 个角点 ``(±foot_length/2, ±foot_width/2)`` 投影到地面后的
-    2D 凸包，足底角点定义与 :func:`mdp.rewards.feet_ground_parallel_var` 一致。CoM 地面
-    投影红球为实际 COM，紫球为有效目标，青球为双踝中点。
+    2D 凸包，足底角点定义与 :func:`mdp.rewards.feet_ground_parallel_var` 一致。骨盆地面
+    投影红球为实际骨盆位置，紫球为有效目标，青球为双踝中点。
     绿线只是双脚几何投影包络，未按接触筛选，不能直接视为实际支撑域或稳定性保证。
 
     绘制分两层，保证在不同 Isaac Sim 版本下都能工作：
 
-    * ``VisualizationMarkers`` 画点(CoM 投影红球 + 8 个足底角点黄球)——始终可用；
+    * ``VisualizationMarkers`` 画点(骨盆投影红球 + 8 个足底角点黄球)——始终可用；
     * Isaac Sim ``debug_draw`` 画凸包边线——可选，import 失败时自动退化为只显示顶点。
     """
 
@@ -409,7 +408,7 @@ class ComVisualizer:
         # 双脚 ankle_roll body 索引(左右顺序无关，凸包统一处理)
         foot_ids, foot_names = self.robot.find_bodies(".*_ankle_roll_link")
         self._foot_body_ids = foot_ids
-        print(f"[INFO] CoM 可视化就绪，支撑足 body: {foot_names}")
+        print(f"[INFO] 骨盆可视化就绪，支撑足 body: {foot_names}")
 
         # 足底四角点偏移(脚坐标系)，与 rewards.feet_ground_parallel_var 一致
         half_l, half_w = foot_length / 2.0, foot_width / 2.0
@@ -420,21 +419,21 @@ class ComVisualizer:
         # 框架四元数为 (x,y,z,w)；球体旋转不变，仅作 visualize 占位。
         self._identity_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=device)
 
-        # --- markers：CoM 投影(红) + 足底角点(黄) ---
-        com_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/projection")
-        com_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
-        com_cfg.markers["sphere"].radius = 0.006
-        self._com_marker = VisualizationMarkers(com_cfg)
-        target_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/target")
+        # --- markers：骨盆投影(红) + 足底角点(黄) ---
+        pelvis_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/Pelvis/projection")
+        pelvis_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
+        pelvis_cfg.markers["sphere"].radius = 0.008
+        self._pelvis_marker = VisualizationMarkers(pelvis_cfg)
+        target_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/Pelvis/target")
         target_cfg.markers["sphere"].visual_material.diffuse_color = (0.7, 0.1, 1.0)
-        target_cfg.markers["sphere"].radius = 0.008
+        target_cfg.markers["sphere"].radius = 0.010
         self._target_marker = VisualizationMarkers(target_cfg)
-        origin_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/origin")
+        origin_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/Pelvis/origin")
         origin_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 0.8, 1.0)
         origin_cfg.markers["sphere"].radius = 0.004
         self._origin_marker = VisualizationMarkers(origin_cfg)
 
-        corner_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/CoM/foot_corners")
+        corner_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/Pelvis/foot_corners")
         corner_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.8, 0.0)
         corner_cfg.markers["sphere"].radius = 0.015
         self._corner_marker = VisualizationMarkers(corner_cfg)
@@ -445,25 +444,21 @@ class ComVisualizer:
             from isaacsim.util.debug_draw import _debug_draw
 
             self._draw = _debug_draw.acquire_debug_draw_interface()
-            print("[INFO] CoM 可视化：debug_draw(isaacsim.util) 就绪，绘制支撑多边形边线。")
+            print("[INFO] 骨盆可视化：debug_draw(isaacsim.util) 就绪，绘制支撑多边形边线。")
         except Exception:  # noqa: BLE001
             try:
                 from omni.isaac.debug_draw import _debug_draw
 
                 self._draw = _debug_draw.acquire_debug_draw_interface()
-                print("[INFO] CoM 可视化：debug_draw(omni.isaac) 就绪，绘制支撑多边形边线。")
+                print("[INFO] 骨盆可视化：debug_draw(omni.isaac) 就绪，绘制支撑多边形边线。")
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] debug_draw 不可用({e})，支撑多边形仅显示 8 个顶点(不连边)。")
 
         # 标记创建时默认可见；在首次按 C 前显式隐藏，避免原点出现占位球。
-        for marker in (self._com_marker, self._corner_marker, self._target_marker, self._origin_marker):
+        for marker in (self._pelvis_marker, self._corner_marker, self._target_marker, self._origin_marker):
             marker.set_visibility(False)
         self._visible = False
         self._line_warned = False
-
-    def _whole_body_com(self) -> torch.Tensor:
-        """复用任务侧全身 COM 计算，避免训练与显示采用不同定义。"""
-        return self._command_term.whole_body_com_w()
 
     def _foot_corners_world(self) -> torch.Tensor:
         """双脚足底 8 角点世界坐标，shape (8, 3)。"""
@@ -525,24 +520,24 @@ class ComVisualizer:
                 self._line_warned = True
 
     def update(self) -> None:
-        """重算并绘制 CoM 投影与支撑多边形(每帧调用)。"""
-        com_proj = self._whole_body_com().clone()  # (1, 3)
-        com_proj[:, 2] = self._ground_z + 0.01  # 稍抬升以免标记被地面遮挡
+        """重算并绘制骨盆投影与支撑多边形(每帧调用)。"""
+        pelvis_proj = self.robot.data.root_pos_w.torch.clone()  # (1, 3)
+        pelvis_proj[:, 2] = self._ground_z + 0.01  # 稍抬升以免标记被地面遮挡
         corners_proj = self._foot_corners_world().clone()  # (8, 3)
         corners_proj[:, 2] = self._ground_z
         # 画点(首次显示时打开可见性；hidden 状态下 visualize 会被后端跳过)
         if not self._visible:
-            self._com_marker.set_visibility(True)
+            self._pelvis_marker.set_visibility(True)
             self._corner_marker.set_visibility(True)
             self._visible = True
-        self._com_marker.visualize(com_proj, self._identity_quat)
+        self._pelvis_marker.visualize(pelvis_proj, self._identity_quat)
         self._corner_marker.visualize(corners_proj, self._identity_quat.expand(8, -1))
-        active = bool(self._command_term.com_tracking_mask[0])
+        active = bool(self._command_term.pelvis_tracking_mask[0])
         self._target_marker.set_visibility(active)
         self._origin_marker.set_visibility(active)
         if active:
-            target = self._command_term.com_target_pos_w()
-            origin, _ = self._command_term.com_support_frame_w()
+            target = self._command_term.pelvis_target_pos_w()
+            origin, _ = self._command_term.pelvis_support_frame_w()
             target[:, 2] = origin[:, 2] = self._ground_z + 0.01
             self._target_marker.visualize(target, self._identity_quat)
             self._origin_marker.visualize(origin, self._identity_quat)
@@ -552,7 +547,7 @@ class ComVisualizer:
     def clear(self) -> None:
         """隐藏 markers 并清除边线(不可见时为 no-op)。"""
         if self._visible:
-            self._com_marker.set_visibility(False)
+            self._pelvis_marker.set_visibility(False)
             self._corner_marker.set_visibility(False)
             self._target_marker.set_visibility(False)
             self._origin_marker.set_visibility(False)
@@ -619,8 +614,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.observations.policy.enable_corruption = False
         # 运行时由人工接口接管重采样目标，保留内部更新钩子及高度/速度可视化。
         env_cfg.commands.task_command.debug_vis = True
-        # COM 由 C 键控制的本地可视化显示，避免与指令项标记重复。
-        env_cfg.commands.task_command.com_debug_vis = False
+        # 骨盆偏置由 C 键控制的本地可视化显示，避免与指令项标记重复。
+        env_cfg.commands.task_command.pelvis_debug_vis = False
         # 摔倒后原地无扰动恢复：清零 reset 事件的位姿/速度随机化
         if getattr(env_cfg.events, "reset_base", None) is not None:
             env_cfg.events.reset_base.params["pose_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)}
@@ -671,7 +666,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         except RuntimeError as exc:
             if "size mismatch" in str(exc):
                 raise RuntimeError(
-                    "策略参数尺寸不匹配：当前观测末尾增加 COM 两维（默认共 102 维）。"
+                    "策略参数尺寸不匹配：当前观测末尾增加骨盆偏置两维（默认共 102 维）。"
                     "旧 100 维 checkpoint 不能直接加载，请使用重训或显式迁移后的模型。"
                 ) from exc
             raise
@@ -689,25 +684,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         dt = env.unwrapped.step_dt
 
         # --- 键盘 / 手柄 teleop + 指令接管 ---
-        com_ranges = env.unwrapped.command_manager.get_term("task_command").cfg.ranges
-        kb_teleop = KeyboardCommandTeleop(com_ranges.com_offset_x, com_ranges.com_offset_y)
+        pelvis_ranges = env.unwrapped.command_manager.get_term("task_command").cfg.ranges
+        kb_teleop = KeyboardCommandTeleop(pelvis_ranges.pelvis_offset_x, pelvis_ranges.pelvis_offset_y)
         gp_teleop = GamepadCommandTeleop()
-        com_visualizer = ComVisualizer(env)
+        pelvis_visualizer = PelvisVisualizer(env)
 
         def merged_command() -> tuple[float, float, float, float, float, float]:
-            """高度/速度维度叠加；COM 使用键盘目标，行走时清零以防停步后重放旧偏置。"""
+            """高度/速度维度叠加；骨盆偏置使用键盘目标，行走时清零以防停步后重放旧偏置。"""
             kh, kvx, kvy, kwz, cx, cy = kb_teleop.as_tuple()
             gh, gvx, gvy, gwz = gp_teleop.as_tuple()
             if any(abs(v) > 1e-3 for v in (kvx + gvx, kvy + gvy, kwz + gwz)):
-                kb_teleop.com_dx = kb_teleop.com_dy = 0.0
+                kb_teleop.pelvis_dx = kb_teleop.pelvis_dy = 0.0
                 cx = cy = 0.0
             return (
                 _clamp(kh + gh, *HEIGHT_OFFSET_LIMIT),
                 _clamp(kvx + gvx, *LIN_VEL_X_LIMIT),
                 _clamp(kvy + gvy, *LIN_VEL_Y_LIMIT),
                 _clamp(kwz + gwz, *ANG_VEL_Z_LIMIT),
-                _clamp(cx, *com_ranges.com_offset_x),
-                _clamp(cy, *com_ranges.com_offset_y),
+                _clamp(cx, *pelvis_ranges.pelvis_offset_x),
+                _clamp(cy, *pelvis_ranges.pelvis_offset_y),
             )
 
         apply_command = install_manual_command(env, merged_command)
@@ -725,7 +720,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 gp_teleop.update(dt)
                 apply_command()
                 with torch.inference_mode():
-                    # 人工输入更新后重算观测，不推进历史/COM 平滑时钟，避免旧观测对新目标动作。
+                    # 人工输入更新后重算观测，不推进历史/骨盆平滑时钟，避免旧观测对新目标动作。
                     obs = env.get_observations()
                     actions = policy(obs)
                     obs, _, dones, _ = env.step(actions)
@@ -734,18 +729,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     else:
                         policy_nn.reset(dones)
 
-                # 重心 / 支撑多边形可视化：C 键切换
-                if kb_teleop.show_com:
-                    com_visualizer.update()
+                # 骨盆 / 支撑多边形可视化：C 键切换
+                if kb_teleop.show_pelvis:
+                    pelvis_visualizer.update()
                 else:
-                    com_visualizer.clear()
+                    pelvis_visualizer.clear()
 
                 # 指令反馈：仅在目标变化时刷新终端显示
                 cmd = merged_command()
                 if cmd != last_print:
                     print(
                         f"\r[CMD] h={cmd[0]:+.2f} m | vx={cmd[1]:+.2f} vy={cmd[2]:+.2f} m/s "
-                        f"| wz={cmd[3]:+.2f} rad/s | COM目标=({cmd[4]:+.3f}, {cmd[5]:+.3f}) m   ",
+                        f"| wz={cmd[3]:+.2f} rad/s | 骨盆目标=({cmd[4]:+.3f}, {cmd[5]:+.3f}) m   ",
                         end="",
                         flush=True,
                     )

@@ -578,29 +578,30 @@ def track_pelvis_height_exp(env, command_name: str) -> torch.Tensor:
     error = torch.abs(env.scene["robot"].data.root_pos_w.torch[:, 2] - height_command_w[:, 0])
     return torch.exp(-error * 4.0)
 
-def track_com_xy_exp(
+def track_pelvis_xy_exp(
     env: ManagerBasedRLEnv,
     command_name: str = "task_command",
-    std: float = 0.02,
+    std: float = 0.05,
 ) -> torch.Tensor:
-    """全身 COM 水平偏置跟踪奖励，仅 STAND/SQUAT 生效 [0, 1]。
+    """骨盆 X-Y 水平偏置跟踪奖励，仅 STAND/SQUAT 生效 [0, 1]。
 
-    来源：Own。e 为双踝中点、双脚平均水平朝向参考系中的二维位置误差 [m]，
-    r = exp(-||e||²/std²)。std 是核宽度 [m]，不是安全偏置上限。
-    原点不随载荷转移或上肢姿态重标定；奖励不证明接触/力矩可行，也不阻止整机滑移。
-    现读物理 COM，避免 CommandManager 在奖励之后更新造成一帧缓存误差。
+    来源：Own。e 为双踝中点、双脚平均水平朝向参考系中的骨盆二维位置误差 [m]，
+    r = exp(-||e||²/(2·std²))。std 是核宽度 [m]，不是安全偏置上限；分母用 2σ²，
+    与 track_velocity_exp 口径一致。骨盆口径不含质量加权，天然免疫上肢扰动
+    事件引起的整机重心漂移。只惩罚跟踪误差，不约束躯干姿态，下肢仍可自由
+    权衡。现读物理状态，避免 CommandManager 在奖励之后更新造成一帧缓存误差。
 
     Args:
         env: 向量化强化学习环境。
-        command_name: 提供 COM 目标与参考系的统一指令项。
-        std: 有限正核宽度 [m]；默认 2 cm，兼顾初始偏差与厘米级调整信号。
+        command_name: 提供骨盆目标与参考系的统一指令项。
+        std: 有限正核宽度 [m]；默认 5 cm，覆盖 ±3 cm 目标范围并避免尖核压倒主任务。
     """
     if not 0.0 < std < float("inf"):
-        raise ValueError("COM 跟踪奖励 std 必须为有限正数 [m]。")
+        raise ValueError("骨盆偏置跟踪奖励 std 必须为有限正数 [m]。")
     term = env.command_manager.get_term(command_name)
-    error = term.com_error_xy()
-    reward = torch.exp(-torch.square(error).sum(dim=-1) / std**2)
-    return torch.where(term.com_tracking_mask, reward, torch.zeros_like(reward))
+    error = term.pelvis_error_xy()
+    reward = torch.exp(-torch.square(error).sum(dim=-1) / (2.0 * std**2))
+    return torch.where(term.pelvis_tracking_mask, reward, torch.zeros_like(reward))
 
 
 def track_velocity_exp(
@@ -634,7 +635,7 @@ def track_velocity_exp(
         gravity-aligned yaw frame coincide to first order.
     """
     asset: Articulation = env.scene[asset_cfg.name]
-    # 机体系速度仍读取统一指令的 [1:4]，末尾新增 COM 两维不改变索引。
+    # 机体系速度仍读取统一指令的 [1:4]，末尾新增骨盆偏置两维不改变索引。
     vel_command_b = env.command_manager.get_command(command_name)[:, 1:4]
     denom = 2.0 * std**2
     vx_err = asset.data.root_lin_vel_b.torch[:, 0] - vel_command_b[:, 0]

@@ -19,8 +19,8 @@ if TYPE_CHECKING:
 def task_command_height(env: ManagerBasedRLEnv, command_name: str = "task_command") -> torch.Tensor:
     """Pelvis height offset slice (1-D) of the unified task command.
 
-    Returns the first element of ``[h_offset, vx, vy, wz, com_dx, com_dy]``: the commanded
-    pelvis height offset relative to the default standing height [m].
+    Returns the first element of ``[h_offset, vx, vy, wz, pelvis_dx, pelvis_dy]``: the
+    commanded pelvis height offset relative to the default standing height [m].
     """
     return env.command_manager.get_command(command_name)[:, :1]
 
@@ -28,16 +28,16 @@ def task_command_height(env: ManagerBasedRLEnv, command_name: str = "task_comman
 def task_command_velocity(env: ManagerBasedRLEnv, command_name: str = "task_command") -> torch.Tensor:
     """Base-frame velocity slice (3-D) of the unified task command.
 
-    Returns elements 1-3 of ``[h_offset, vx, vy, wz, com_dx, com_dy]``: the commanded
+    Returns elements 1-3 of ``[h_offset, vx, vy, wz, pelvis_dx, pelvis_dy]``: the commanded
     base-frame linear velocities (x, y) [m/s] and yaw angular velocity [rad/s].
     """
     return env.command_manager.get_command(command_name)[:, 1:4]
 
 
-def task_command_com(env: ManagerBasedRLEnv, command_name: str = "task_command") -> torch.Tensor:
-    """双足水平系内的 COM 有效目标偏置，shape (N, 2) [m]。
+def task_command_pelvis_xy(env: ManagerBasedRLEnv, command_name: str = "task_command") -> torch.Tensor:
+    """双足水平系内的骨盆 X-Y 有效目标偏置，shape (N, 2) [m]。
 
-    仅暴露限速后的目标，不暴露实际 COM、接触状态或模式/启用标志。
+    仅暴露限速后的目标，不暴露实际骨盆位置、接触状态或模式/启用标志。
     行走时指令项将该切片清零，奖励另按 STAND/SQUAT 门控。
     """
     return env.command_manager.get_command(command_name)[:, 4:6]
