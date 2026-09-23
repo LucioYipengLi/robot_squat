@@ -395,6 +395,21 @@ class RewardsCfg:
             "velocity_command_name": "task_command",
         },
     )
+    # 髋偏航软死区约束（蹲姿也生效）：hip_yaw 是 G1 唯一能转动脚朝向的自由度（无 ankle_yaw）。
+    # 上面 hip_default_deviation 被高度门控在深蹲（命令髋高<0.735）关闭，导致蹲姿下双脚可自由外八
+    # （脚趾转向体侧），既不利 sim2real 又削弱行进方向支撑。本项去掉高度门控、仅保留零速模式门控
+    # （STAND/SQUAT），采用死区软惩罚：|Δ|≤margin 内不罚（留自然平衡调整空间），超出部分平方罚
+    # Σ relu(|Δ|-margin)²。margin=0.15 rad≈8.6°；weight=-0.5 与现有 deviation 同量级，90° 外八时
+    # excess²≈2.0/腿形成强威慑、近死区边缘则平缓。行走模式（WALK/SQUAT_WALK）不受约束，转向可自由偏航。
+    hip_yaw_soft_deviation = RewTerm(
+        func=mdp.hip_yaw_soft_deviation_l2,
+        weight=-0.5,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw_joint"]),
+            "margin": 0.15,
+            "velocity_command_name": "task_command",
+        },
+    )
 
     # =====================================================================
     # 躯干姿态与速度稳定性约束（使用 Isaac Lab 内置函数）

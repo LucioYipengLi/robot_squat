@@ -165,6 +165,53 @@ def standing_joint_default_deviation_l2(
         gate = gate * zero_gate
     return deviation * gate
 
+def hip_yaw_soft_deviation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    margin: float = 0.15,
+    velocity_command_name: str | None = None,
+    zero_modes: tuple[int, ...] = (0, 1),
+) -> torch.Tensor:
+    """Soft deadband penalty on hip_yaw deviation, active in static modes at ALL commanded heights.
+
+    hip_yaw is the only G1 degree of freedom that yaws the foot (there is no ankle_yaw), so it alone
+    sets the foot heading. :func:`standing_joint_default_deviation_l2` already penalizes it, but that
+    term is height-gated OFF below 0.735 m; during a squat the feet are therefore free to splay outward
+    (toes pointing to the body side), which is unnatural for sim2real and narrows the useful support
+    along the travel direction. This term removes the height gate and keeps only the zero-velocity-mode
+    gate (STAND/SQUAT), so the foot heading stays constrained while squatting, yet walking gaits (which
+    legitimately yaw the feet when turning) are untouched.
+
+    The penalty is a SOFT deadband rather than a plain quadratic: deviations within ±``margin`` of the
+    default are free, giving the policy room for natural balance adjustment, and only the excess beyond
+    the margin is penalized quadratically:
+
+    .. math::
+        \\sum_j \\operatorname{relu}(|q_j - q_{\\text{default},j}| - \\text{margin})^2
+
+    Args:
+        env: The environment instance.
+        asset_cfg: Entity configuration selecting the hip_yaw joints; default positions are read
+            dynamically from the asset (hip_yaw default is 0 for the G1).
+        margin: Deadband half-width [rad]; deviations within ±margin of default incur no penalty.
+            Default 0.15 rad ≈ 8.6°, generous for small balance corrections while a 90° splay
+            (excess ≈1.42 rad) is strongly deterred.
+        velocity_command_name: Unified task command name; when given the term is gated to zero-velocity
+            modes (see :func:`_zero_command_gate`), otherwise it is always active.
+        zero_modes: Command modes treated as zero-velocity (defaults to STAND=0 / SQUAT=1).
+    """
+    if margin < 0.0:
+        raise ValueError("hip_yaw 软死区 margin 必须为非负数 [rad]。")
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = wrap_to_pi(asset.data.joint_pos[:, asset_cfg.joint_ids])
+    default_pos = wrap_to_pi(asset.data.default_joint_pos[:, asset_cfg.joint_ids])
+    excess = torch.clamp((joint_pos - default_pos).abs() - margin, min=0.0)
+    penalty = torch.sum(torch.square(excess), dim=1)
+    zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
+    if zero_gate is not None:
+        penalty = penalty * zero_gate
+    return penalty
+
 def track_lin_vel_xy_yaw_frame_exp(
     env, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
