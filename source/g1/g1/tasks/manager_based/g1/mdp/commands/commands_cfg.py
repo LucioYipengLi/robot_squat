@@ -146,8 +146,11 @@ class SquatWalkCommandCfg(CommandTermCfg):
     pelvis_zero_probability: float = 0.2
     """静止模式采样零偏置的概率；零偏置仍要求骨盆跟踪双踝中点。"""
 
-    pelvis_success_threshold: float = 0.005
-    """静止模式骨盆二维误差的成功阈值 [m]，用于统计而非安全保证。"""
+    pelvis_success_threshold: float = 0.02
+    """静止模式骨盆二维误差（每 episode 均值）的成功阈值 [m]，仅用于统计日志、不参与奖励。
+
+    默认 2 cm 约为 ±3 cm 目标带的 RMS 忽略误差（≈2.45 cm）的判别线，将“跟随（均值<2 cm）”
+    与“忽略（≈RMS 及以上）”分开；旧值 0.005 低于自然站立晃动底噪，物理上不可达，会使成功率假性贴零。"""
 
     envelope_depth_frac: float = 0.8
     """Knee point of the height--velocity trapezoid, as a fraction of the deepest squat [0, 1].

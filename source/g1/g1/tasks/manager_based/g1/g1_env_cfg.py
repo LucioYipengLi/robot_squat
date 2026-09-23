@@ -120,7 +120,7 @@ class CommandsCfg:
         ),
         pelvis_target_speed=0.02,
         pelvis_zero_probability=0.2,
-        pelvis_success_threshold=0.005,
+        pelvis_success_threshold=0.02,
         height_success_threshold=0.03,
         debug_vis=False,
     )
@@ -329,12 +329,14 @@ class RewardsCfg:
     )
 
     # 骨盆 X-Y 跟踪（Own）：exp(-||e_xy||²/(2σ²))，双踝中点水平系；仅 STAND/SQUAT。
-    # 核宽 std=0.05 覆盖 ±3 cm 目标范围，避免尖核饱和；权重低于主任务项，防止辅助
-    # 目标压倒髋高/速度跟踪；骨盆口径不受上肢扰动污染，核宽非安全边界。
+    # std=0.03 使峰值梯度点（||e||=σ）落入 ±3 cm 目标带内：满偏置 r≈0.61、角点 r≈0.38，
+    # 有区分度且不饱和；weight=0.4 令峰值加权梯度≈8/m，与主任务 track_pelvis_height 同量级、不
+    # 压倒之（峰值加权梯度 w·0.6065/σ）。旧 std=0.05/weight=0.2 时峰值落在带外、满偏置信号差仅
+    # 0.033/步（≈预算 0.5%）致该项近惰性、策略忽略骨盆指令（实测成功率<0.03）。骨盆口径不受上肢扰动污染。
     track_pelvis_xy = RewTerm(
         func=mdp.track_pelvis_xy_exp,
-        weight=0.2,
-        params={"command_name": "task_command", "std": 0.05},
+        weight=0.4,
+        params={"command_name": "task_command", "std": 0.03},
     )
 
     # =====================================================================

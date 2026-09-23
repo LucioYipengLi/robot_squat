@@ -581,7 +581,7 @@ def track_pelvis_height_exp(env, command_name: str) -> torch.Tensor:
 def track_pelvis_xy_exp(
     env: ManagerBasedRLEnv,
     command_name: str = "task_command",
-    std: float = 0.05,
+    std: float = 0.03,
 ) -> torch.Tensor:
     """骨盆 X-Y 水平偏置跟踪奖励，仅 STAND/SQUAT 生效 [0, 1]。
 
@@ -594,7 +594,10 @@ def track_pelvis_xy_exp(
     Args:
         env: 向量化强化学习环境。
         command_name: 提供骨盆目标与参考系的统一指令项。
-        std: 有限正核宽度 [m]；默认 5 cm，覆盖 ±3 cm 目标范围并避免尖核压倒主任务。
+        std: 有限正核宽度 [m]；默认 3 cm，使峰值梯度点（||e||=σ）落入 ±3 cm 目标带内：
+            满偏置 ||e||=3 cm 处 r≈0.61、角点 ||e||≈4.2 cm 处 r≈0.38，既有区分度又不饱和
+            成尖核。std=0.05 时峰值落在带外（||e||=0.05>最大误差 0.042），带内奖励近常数、
+            信号惰性，策略学会忽略骨盆指令（实测成功率<0.03）。
     """
     if not 0.0 < std < float("inf"):
         raise ValueError("骨盆偏置跟踪奖励 std 必须为有限正数 [m]。")
