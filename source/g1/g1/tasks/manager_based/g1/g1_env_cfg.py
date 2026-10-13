@@ -144,10 +144,24 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """102 维策略观测：保留原 100 维顺序，在末尾追加骨盆 X-Y 有效目标两维。
+        """510 维策略观测：单帧 102 维 × 5 帧历史（含当前帧，oldest → newest 展平）。
 
-        原顺序为基座状态(9)、高度/速度指令(4)、全身关节状态(58)、上一步动作(12)、
-        上肢 PD 目标(17)；骨盆偏置输入只含目标，不含实际骨盆位置、模式或启用标志。
+        单帧 102 维组成（按声明顺序）：
+          - 基座本体状态 (9)：base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
+          - 任务指令 (4)：velocity_commands(3) + pelvis_height_cmd(1)
+          - 全身关节状态 (58)：joint_pos(29) + joint_vel(29)
+          - 上一步动作 (12)：actions（下肢 12 DOF）
+          - 上肢 PD 目标 (17)：upper_body_target（肩/肘/腕/腰）
+          - 骨盆 X-Y 目标 (2)：pelvis_offset_cmd（末尾追加，不移动原索引）
+
+        历史机制：由 ``history_length=5`` 在 ObservationGroupCfg 层统一开启，覆盖所有 term
+        的 per-term history_length；IsaacLab 的 ObservationManager 内部维护环形缓冲，
+        每 sim step 追加一帧，reset 后首帧以当前观测填满整个缓冲区（非零填充）。
+        flatten_history_dim=True（默认）将 (N, 5, 102) 展平为 (N, 510)。
+
+        ⚠️ Checkpoint 兼容性：网络第一层权重从 (hidden, 102) 变为 (hidden, 510)，
+        与旧的 102 维 checkpoint **size mismatch**，无法通过 runner.load() 复用；
+        启用历史后必须从头训练。
         """
 
         # 基座本体状态（IMU 可获取量）：线速度 ±0.1、角速度 ±0.2（陀螺仪噪声更大）、
@@ -188,6 +202,11 @@ class ObservationsCfg:
             # 训练时启用噪声注入（_PLAY 配置关闭）；所有观测项拼接为扁平向量
             self.enable_corruption = True
             self.concatenate_terms = True
+            # 组级统一历史长度：所有 ObsTerm 都保留最近 5 帧（含当前帧），
+            # 单帧 102 维 × 5 = 510 维。若需对个别 term 精细化控制，改回 None
+            # 并在对应 ObsTerm 上单独设置 history_length。
+            self.history_length = 5
+            # flatten_history_dim 默认 True，(N, H, D) → (N, H*D)，无需显式设置
 
 
     # 观测分组挂载：策略观测组，被 ObservationManager 收集
