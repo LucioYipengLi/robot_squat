@@ -14,6 +14,7 @@ from isaaclab.utils.math import quat_apply
 
 from g1.rl import __main__ as cli
 from g1.rl import teleop
+from g1.tasks.lower_limb_agent.config.g1.agents.rsl_rl_ppo_cfg import PPORunnerCfg
 from g1.tasks.lower_limb_agent.config.g1.env_cfg import LowerLimbAgentEnvCfg
 from g1.tasks.lower_limb_agent.config.g1.env_cfg_phase import LowerLimbAgentEnvCfg_Phase2, LowerLimbAgentEnvCfg_Phase3
 from g1.tasks.lower_limb_agent.visualization import PelvisVisualizer
@@ -194,7 +195,7 @@ def test_invalid_teleop_options_fail_before_launch(monkeypatch, extra):
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_teleop_entry_delegates_snapshot_and_restores_argv(monkeypatch, fail):
-    import isaaclab.app.logging_utils
+    import isaaclab.utils
 
     original = sys.argv
 
@@ -207,7 +208,7 @@ def test_teleop_entry_delegates_snapshot_and_restores_argv(monkeypatch, fail):
         return 0
 
     monkeypatch.setattr(teleop, "run", run)
-    monkeypatch.setattr(isaaclab.app.logging_utils, "configure_console_logging", lambda: None)
+    monkeypatch.setattr(isaaclab.utils, "configure_logging", lambda **kwargs: None)
     monkeypatch.setenv("WORLD_SIZE", "1")
     argv = ["teleop", "--task", "Template-G1-v0", "--checkpoint", "old.pt", "--curriculum-snapshot", "legacy.json"]
     if fail:
@@ -276,9 +277,10 @@ def test_complete_teleop_flow_loads_before_limits_and_cleans_up(monkeypatch, fai
     monkeypatch.setattr(teleop, "_parse_args", lambda argv: args)
     cfg = LowerLimbAgentEnvCfg()
     cfg.play_mode()
-    agent = SimpleNamespace(
-        class_name="OnPolicyRunner", clip_actions=None, seed=1, device="cpu", experiment_name="test"
-    )
+    agent = PPORunnerCfg()
+    agent.seed = 1
+    agent.device = "cpu"
+    agent.experiment_name = "test"
     monkeypatch.setattr(isaaclab_tasks.utils, "resolve_task_config", lambda *a, **kw: (cfg, agent))
     monkeypatch.setattr(isaaclab.app, "launch_simulation", lambda *a: nullcontext())
     monkeypatch.setattr(common, "pre_launch_video_config", lambda *a: None)

@@ -19,27 +19,20 @@ from functools import partial
 def _runner_adapter(backend, factory):
     """Scope the upstream constructor seam to one synchronous CLI invocation.
 
-    The local IsaacLab entrypoints construct a module-level OnPolicyRunner and expose no
+    The local IsaacLab entrypoints import create_rsl_rl_runner at module scope and expose no
     runner-factory argument. Replacing that reference for this call reuses their launch,
     video, logging and cleanup logic without editing or copying the upstream scripts.
     """
-    from rsl_rl.runners import OnPolicyRunner
+    from isaaclab_rl.rsl_rl import create_rsl_rl_runner
 
-    original = backend.OnPolicyRunner
-    if original is not OnPolicyRunner:
+    original = backend.create_rsl_rl_runner
+    if original is not create_rsl_rl_runner:
         raise RuntimeError("Unsupported IsaacLab runner constructor seam; review the project adapter")
-    original_distillation = backend.DistillationRunner
-
-    def unsupported_runner(*args, **kwargs):
-        raise ValueError("G1 curriculum checkpoints support OnPolicyRunner only")
-
-    backend.OnPolicyRunner = factory
-    backend.DistillationRunner = unsupported_runner
+    backend.create_rsl_rl_runner = factory
     try:
         yield
     finally:
-        backend.OnPolicyRunner = original
-        backend.DistillationRunner = original_distillation
+        backend.create_rsl_rl_runner = original
 
 
 def main(argv=None):
@@ -64,12 +57,13 @@ def main(argv=None):
     ):
         parser.error("--curriculum-snapshot requires --checkpoint")
 
-    from isaaclab.app.logging_utils import configure_console_logging
     from isaaclab.app.sim_launcher import fuse_kit_args
+    from isaaclab.utils import configure_logging
 
-    from .runner import CurriculumOnPolicyRunner
+    from .runner import create_curriculum_runner
 
-    configure_console_logging()
+    # The launcher applies --info/--verbose to the root logger and its handlers.
+    configure_logging(save_logs_to_file=False)
     if selected.action == "teleop":
         from .teleop import run
 
@@ -81,7 +75,7 @@ def main(argv=None):
             sys.argv = original_argv
     backend = importlib.import_module(f"isaaclab_rl.entrypoints.backends.{selected.action}_rsl_rl")
     factory = partial(
-        CurriculumOnPolicyRunner,
+        create_curriculum_runner,
         snapshot_path=selected.curriculum_snapshot,
         evaluation=selected.action == "play",
     )

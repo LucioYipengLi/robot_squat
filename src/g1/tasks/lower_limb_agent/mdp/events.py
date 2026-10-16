@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.managers import ManagerTermBase, SceneEntityCfg
+from isaaclab.managers import ManagerTermBase
 from isaaclab.utils.math import sample_uniform
 
 if TYPE_CHECKING:
@@ -147,3 +147,9 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
         self.robot.set_joint_position_target_index(
             target=q_target, joint_ids=self._joint_ids, env_ids=env_ids
         )
+        # Observe actual event firings without sampling additional randomness or changing targets.
+        for name in env.command_manager.active_terms:
+            term = env.command_manager.get_term(name)
+            monitor = getattr(term, "performance", None)
+            if monitor is not None:
+                monitor.disturbance(term.mode, env_ids, disturb_groups[0]["joint_noise_frac"])

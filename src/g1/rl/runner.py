@@ -15,12 +15,28 @@ from pathlib import Path
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
+from isaaclab.utils import to_dict
+
 from g1.tasks.lower_limb_agent.curriculum_state import (
     STATE_KEY,
     export_curriculum_state,
     import_curriculum_state,
     validate_curriculum_state,
 )
+
+
+def create_curriculum_runner(env, agent_cfg, log_dir=None, *, snapshot_path=None, evaluation=False):
+    """Match IsaacLab's runner factory while preserving G1 curriculum checkpoints."""
+    if agent_cfg.class_name != "OnPolicyRunner":
+        raise ValueError("G1 curriculum checkpoints support OnPolicyRunner only")
+    return CurriculumOnPolicyRunner(
+        env,
+        to_dict(agent_cfg),
+        log_dir=log_dir,
+        device=agent_cfg.device,
+        snapshot_path=snapshot_path,
+        evaluation=evaluation,
+    )
 
 
 class CurriculumOnPolicyRunner(OnPolicyRunner):
@@ -35,6 +51,9 @@ class CurriculumOnPolicyRunner(OnPolicyRunner):
         super().__init__(*args, **kwargs)
         if self.env.unwrapped.cfg.training_phase not in (1, 2, 3):
             raise ValueError("Curriculum runner requires a registered G1 lower-limb phase")
+        from .diagnostics import install_performance_logging
+
+        self._close_performance_logging = install_performance_logging(self.logger, self.env)
 
     def save(self, path, infos=None):
         metadata = {} if infos is None else copy.deepcopy(infos)
@@ -68,4 +87,9 @@ class CurriculumOnPolicyRunner(OnPolicyRunner):
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if self.env.unwrapped.cfg.training_phase > 1 and not self._curriculum_loaded:
             raise ValueError("Phase 2/3 training requires --checkpoint from the same or immediately preceding phase")
-        return super().learn(num_learning_iterations, init_at_random_ep_len=init_at_random_ep_len)
+        try:
+            return super().learn(num_learning_iterations, init_at_random_ep_len=init_at_random_ep_len)
+        finally:
+            close = getattr(self, "_close_performance_logging", None)
+            if close is not None:
+                close()

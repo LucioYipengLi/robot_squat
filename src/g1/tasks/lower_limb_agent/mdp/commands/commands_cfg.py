@@ -197,8 +197,8 @@ class SquatWalkCommandCfg(CommandTermCfg):
     """Threshold on the per-episode mean XY velocity tracking error norm [m/s]. Defaults to 0.5.
 
     Note: the velocity error is accumulated over all modes (zero-command modes trivially
-    succeed), so the logged mean is diluted by non-walking environments. Per-mode bucketed
-    metrics are a later refinement.
+    succeed), so the legacy logged mean is diluted by non-walking environments. The separate
+    Performance diagnostics report each mode without changing the curriculum gate.
     """
 
     vel_yaw_success_threshold: float = 0.4

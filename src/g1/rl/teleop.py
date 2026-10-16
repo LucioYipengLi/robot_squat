@@ -88,21 +88,21 @@ class ManualPolicyPlayback:
 
 def run(argv, *, snapshot_path=None):
     from isaaclab.app import launch_simulation
-    from isaaclab.utils import to_dict
     from isaaclab.utils.seed import configure_seed
 
     from isaaclab_rl.entrypoints import common
     from isaaclab_rl.entrypoints.backends import cli_args_rsl_rl, play_rsl_rl
-    from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+    from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, check_rsl_rl_version, handle_deprecated_rsl_rl_cfg
 
     from isaaclab_tasks.utils import resolve_task_config
 
     from g1.tasks.lower_limb_agent.visualization import PelvisVisualizer
     from g1.teleop.kit import KitInput
 
-    from .runner import CurriculumOnPolicyRunner
+    from .runner import create_curriculum_runner
 
     args = _parse_args(argv)
+    installed_version = check_rsl_rl_version()
     env_cfg, agent_cfg = resolve_task_config(args.task, args.agent, play_mode=True)
     common.apply_env_overrides(args, env_cfg)
     if not callable(getattr(env_cfg, "teleop_mode", None)):
@@ -111,6 +111,7 @@ def run(argv, *, snapshot_path=None):
     common.pre_launch_video_config(env_cfg, args)
     with launch_simulation(env_cfg, args), ExitStack() as cleanup:
         agent_cfg = cli_args_rsl_rl.update_rsl_rl_cfg(agent_cfg, args)
+        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
         if agent_cfg.class_name != "OnPolicyRunner":
             raise ValueError("Teleop supports OnPolicyRunner only")
         env_cfg.seed = agent_cfg.seed
@@ -124,11 +125,10 @@ def run(argv, *, snapshot_path=None):
         raw_env = common.create_isaaclab_env(args.task, env_cfg, args, convert_marl_to_single_agent=False)
         cleanup.callback(common.close_env, raw_env)
         env = RslRlVecEnvWrapper(raw_env, clip_actions=agent_cfg.clip_actions)
-        runner = CurriculumOnPolicyRunner(
+        runner = create_curriculum_runner(
             env,
-            to_dict(agent_cfg),
+            agent_cfg,
             log_dir=None,
-            device=agent_cfg.device,
             snapshot_path=snapshot_path,
             evaluation=True,
         )

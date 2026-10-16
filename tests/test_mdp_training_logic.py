@@ -51,6 +51,12 @@ def _command(kind, num_envs=2):
         extras={},
         common_step_counter=0,
         episode_length_buf=torch.zeros(num_envs, dtype=torch.long),
+        max_episode_length=360,
+        termination_manager=SimpleNamespace(
+            active_terms=["time_out", "bad_ori"],
+            get_term=lambda name: torch.zeros(num_envs, dtype=torch.bool),
+            get_term_cfg=lambda name: SimpleNamespace(time_out=name == "time_out"),
+        ),
         step_dt=1 / 60,
         sim=SimpleNamespace(vis_marker_registry=SimpleNamespace(clear_debug_vis_callback=lambda term: None)),
     )
@@ -161,12 +167,56 @@ def test_terminal_velocity_and_pelvis_errors_are_included():
     assert extras["success_rate_pelvis_xy"] == 0
 
 
+def test_performance_uses_old_mode_and_raw_failure_before_reset():
+    term, env = _command("squat_walk")
+    term.reset(slice(None))
+    term.mode[:] = torch.tensor([2, 3])
+    term.performance.reset(torch.arange(2), term.mode, 0)
+    env.common_step_counter = 1
+    env.episode_length_buf.fill_(1)
+    env.termination_manager.get_term = lambda name: (
+        torch.tensor([True, False]) if name == "bad_ori" else torch.zeros(2, dtype=torch.bool)
+    )
+    term.reset(torch.tensor([0]))
+    assert term.mode[0] == 0  # next episode is forced to STAND by the fixture
+    metrics = term.performance.drain(term._mode_probs)
+    assert metrics["Performance/walk/episode_count"] == 1
+    assert metrics["Performance/walk/failure_rate"] == 1
+    assert metrics["Performance/walk/joint_success_rate"] == 0
+    assert metrics["Performance/stand/episode_count"] == 0
+    assert term.last_mode[0] == 2
+    assert term.episode_success_rate[0] == 1  # legacy curriculum semantics are preserved
+
+
+def test_diagnostics_do_not_consume_rng_or_change_command_sampling(monkeypatch):
+    first, first_env = _command("squat_walk")
+    second, second_env = _command("squat_walk")
+    for env in (first_env, second_env):
+        env.common_step_counter = 1
+        env.episode_length_buf.fill_(1)
+    monkeypatch.setattr(second.performance, "sample", lambda *args: None)
+    monkeypatch.setattr(second.performance, "finish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(second.performance, "reset", lambda *args: None)
+    rng = torch.get_rng_state()
+    first.reset(slice(None))
+    after = torch.get_rng_state()
+    torch.set_rng_state(rng)
+    second.reset(slice(None))
+    torch.testing.assert_close(first.command, second.command)
+    torch.testing.assert_close(first.mode, second.mode)
+    assert torch.equal(torch.get_rng_state(), after)
+
+
 @pytest.mark.parametrize("kind", ["height", "squat_walk"])
 def test_environment_captures_terminal_state_before_physical_reset_events(kind, monkeypatch):
     term, env = _command(kind)
+    term.reset(slice(None))
     env.common_step_counter = 1
     env.episode_length_buf[0] = 1
     env.scene["robot"].data.root_pos_w.torch[0, 2] = 0.5
+    env.termination_manager.get_term = lambda name: (
+        torch.tensor([True, False]) if name == "bad_ori" else torch.zeros(2, dtype=torch.bool)
+    )
     project_env = LowerLimbAgentEnv.__new__(LowerLimbAgentEnv)
     project_env.command_manager = SimpleNamespace(active_terms=["task"], get_term=lambda name: term)
     logged = {}
@@ -180,6 +230,10 @@ def test_environment_captures_terminal_state_before_physical_reset_events(kind, 
     monkeypatch.setattr(ManagerBasedRLEnv, "_reset_idx", physical_reset_then_command_reset)
     project_env._reset_idx(torch.tensor([0]))
     torch.testing.assert_close(logged["error_height"], torch.tensor(0.25))
+    if kind == "squat_walk":
+        metrics = term.performance.drain(term._mode_probs)
+        assert metrics["Performance/stand/error_height_m"] == pytest.approx(0.25)
+        assert metrics["Performance/stand/failure_rate"] == 1
     term._update_metrics()
     torch.testing.assert_close(term._step_count, torch.zeros(2))
 

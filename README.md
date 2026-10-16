@@ -102,6 +102,8 @@ uv run --extra isaacsim python -m g1.rl play --task Template-G1-Phase3-v0 --chec
 标准 `uv run isaaclab train/play --task ...` 使用上游 Runner，不保存或恢复项目课程状态；上述流程请统一使用项目入口。
 缺少课程记录的旧检查点需显式提供 `--curriculum-snapshot "<curriculum.json>"`，详见 [课程检查点说明](docs/CURRICULUM_CHECKPOINTS.md)。
 
+项目训练入口额外记录逐模式性能和实际训练样本占比，自动接入 TensorBoard/W&B；指标含义、统计窗口及判读方法见 [训练性能指标](docs/TRAINING_METRICS.md)。
+
 ### 模型遥操作与可视化
 
 加载同阶段模型，通过键盘或 Xbox 布局手柄控制高度、速度和骨盆偏置，默认单环境、实时运行并打开 Kit 窗口：
