@@ -61,7 +61,14 @@ Iteration counts are examples; adjust them to your training plan.
 | `--task` | Target phase for this invocation, using one of the registered task IDs above. |
 | `--checkpoint` | Model to load: the same phase for resumption, or the immediately preceding phase for a transition. No additional `--resume` flag is needed. |
 | `--max_iterations` | Number of training iterations to execute in this invocation. After loading, this is the additional iteration count, not a cumulative limit. |
+| `--seed` | Draw a random run seed by default. Pass a nonnegative integer, e.g. `--seed 42`, for a fixed seed, or `--seed -1` to explicitly draw one. |
 | `--num_envs`, `--device` | Optional, for example `--num_envs 1024 --device cuda:0`. |
+
+Each new project agent configuration draws its default seed from system randomness, including training,
+resumption, playback and teleoperation. Training logs record the selected integer in both `params/agent.yaml`
+and `params/env.yaml`; pass that value to `--seed` to reuse it. An explicit `agent.seed=<integer>` also overrides
+the random default, with `--seed` taking precedence. `--deterministic` is a separate determinism option and
+does not fix the default random seed. Reusing a seed does not resume the original random-number sequence.
 
 ### Initial training: Phase 1
 

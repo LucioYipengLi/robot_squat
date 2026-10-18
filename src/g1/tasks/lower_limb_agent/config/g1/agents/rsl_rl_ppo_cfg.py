@@ -3,6 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from dataclasses import field
+from secrets import randbelow
+
 from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
@@ -10,6 +13,8 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    # Draw once per run config, independently of the training RNGs; --seed can override it.
+    seed: int = field(default_factory=lambda: randbelow(2**31))
     num_steps_per_env = 50
     max_iterations = 10000
     save_interval = 100

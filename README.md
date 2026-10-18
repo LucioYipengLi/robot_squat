@@ -55,7 +55,13 @@ uv run --extra isaacsim --extra rerun isaaclab random_agent --task <TASK_NAME> -
 | `--task` | 本次运行的目标阶段，使用上方注册的任务 ID。 |
 | `--checkpoint` | 加载的模型文件；同阶段续训选择本阶段模型，跨阶段续训选择相邻上一阶段模型。无需另加 `--resume`。 |
 | `--max_iterations` | 本次调用执行的训练迭代数；加载后表示继续训练多少次，不是累计迭代上限。 |
+| `--seed` | 默认随机抽取本次运行种子；传入非负整数（如 `--seed 42`）固定种子，`--seed -1` 显式随机抽取。 |
 | `--num_envs`、`--device` | 可选，例如 `--num_envs 1024 --device cuda:0`。 |
+
+项目智能体配置在每次创建时从系统随机源抽取种子，适用于训练、续训、回放和遥操作。
+训练日志的 `params/agent.yaml` 与 `params/env.yaml` 记录最终实际使用的整数种子；需要复用时，将该值传给 `--seed`。
+显式设置 `agent.seed=<整数>` 也会覆盖随机默认值，`--seed` 优先于该配置。
+`--deterministic` 是独立的确定性开关，不会将默认随机种子变成固定值；同种子也不代表续训会接续原随机序列。
 
 ### 首次训练：Phase 1
 
