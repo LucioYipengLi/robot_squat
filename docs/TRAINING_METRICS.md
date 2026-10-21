@@ -325,6 +325,10 @@ TensorBoard 的 [Custom Scalars](https://github.com/tensorflow/tensorboard/blob/
 
 这些是课程判定状态，不等同于当前窗口的逐模式性能。
 
+误差累计与回合结算统一由性能监控模块完成。命令模块只保留课程仍在使用的高度、速度成功快照；旧 `Metrics/success_rate` 和命令级误差副本已停止生成。采样边界、扰动幅度和模式比例统一查看 `TaskDistribution/` 与逐模式 `sampling_probability`，课程仅输出实际门控信号。
+
+这些性能指标由项目入口 `python -m g1.rl train` 的 Runner 写入；标准 `isaaclab train` 保留上游基础日志。
+
 | 完整指标路径 | 定义 | 当前默认判断 |
 | --- | --- | --- |
 | `Curriculum/command_range/height_success` | 各环境最近有效完成回合的高度成功标志均值，混合所有模式。 | > 0.99 时具备扩大高度范围的条件，还需等到检查时间。 |

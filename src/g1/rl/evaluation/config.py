@@ -176,7 +176,7 @@ def _benchmark(value):
     return {
         "episode_length_s": duration,
         "control_dt": control_dt,
-        "upper_body_motion": _motion(raw.get("upper_body_motion", {"profile": "step_v1"})),
+        "upper_body_motion": _motion(raw.get("upper_body_motion", {})),
         "upper_body_target_source": target_source,
         "episodes_per_seed": episodes,
         "mode_weights": weights,
@@ -260,15 +260,11 @@ def validate_suite(raw: Mapping) -> dict:
 
 def _motion(value):
     path = "benchmark.upper_body_motion"
-    raw = _mapping(value, path, ("profile",), ("max_velocity", "max_acceleration", "min_duration_s"))
-    if raw["profile"] not in ("step_v1", "quintic_v1"):
-        raise ValueError(f"Unsupported {path}.profile")
+    fields = ("max_velocity", "max_acceleration", "min_duration_s")
+    raw = _mapping(value, path, (), fields)
     return {
-        "profile": raw["profile"],
-        **{
-            name: _number(raw.get(name, default), f"{path}.{name}", positive=True)
-            for name, default in (("max_velocity", 2.0), ("max_acceleration", 8.0), ("min_duration_s", 0.5))
-        },
+        name: _number(raw.get(name, default), f"{path}.{name}", positive=True)
+        for name, default in (("max_velocity", 2.0), ("max_acceleration", 8.0), ("min_duration_s", 0.5))
     }
 
 

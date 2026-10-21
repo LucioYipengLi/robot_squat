@@ -115,7 +115,7 @@ uv run --extra isaacsim python -m g1.rl play --task Template-G1-Phase3-v0 --chec
 `eval` 在 headless 模式下，用同一套固定测试用例比较多个检查点。首批模块包括基础四模式任务跟踪与上肢扰动比例扫描，支持均值动作、随机动作对照，以及中断后继续执行：
 
 ```bash
-uv run --extra isaacsim python -m g1.rl eval --suite g1_robustness_v2 --checkpoints "early=<early_model.pt>" "late=<late_model.pt>" --policy-output both --num_envs 128 --headless
+uv run --extra isaacsim python -m g1.rl eval --suite g1_robustness --checkpoints "early=<early_model.pt>" "late=<late_model.pt>" --policy-output both --num_envs 128 --headless
 ```
 
 评估输出逐模式指标、汇总表与 TensorBoard 对比曲线；检查点提供策略，版本化测试套件统一控制指令、模式配额、回合长度和扰动条件。终端默认显示总体及回合进度、执行阶段和预计剩余时间，可用 `--progress plain` 或 `--progress off` 切换显示方式。内置基准采用固定初始姿态并关闭观测噪声，跨阶段比较会检查模型接口兼容性。
@@ -243,12 +243,6 @@ uv run isaaclab --editor --isaac_path <isaac-sim-path>
 # Windows
 uv run isaaclab --editor --isaac_path <isaac-sim-path>
 ```
-
-## Isaac Sim UI 扩展
-
-请将项目根目录添加到 Isaac Sim 扩展管理器（Extension Manager）的搜索路径中，刷新后在 `Third Party` 下启用该扩展。
-请通过项目的 `isaacsim` extra 启动 Isaac Sim，以便可用的 UI 依赖就位。Kit 会通过 `config/extension.toml` 加载
-`src/g1/ui_extension_example.py`。
 
 ## 故障排查
 

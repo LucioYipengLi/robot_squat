@@ -9,7 +9,7 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
-from .mdp.commands.commands import SquatWalkCommand, UniformHeightCommand
+from .mdp.commands.commands import SquatWalkCommand
 
 
 class LowerLimbAgentEnv(ManagerBasedRLEnv):
@@ -21,11 +21,11 @@ class LowerLimbAgentEnv(ManagerBasedRLEnv):
         # from counting reset states or ongoing environments for a second time.
         for name in self.command_manager.active_terms:
             term = self.command_manager.get_term(name)
-            if isinstance(term, (UniformHeightCommand, SquatWalkCommand)):
+            if isinstance(term, SquatWalkCommand):
                 term._update_metrics()
         super()._reset_idx(env_ids)
         motion = getattr(self, "upper_body_motion", None)
-        if motion is not None and motion.cfg.profile == "quintic_v1":
+        if motion is not None:
             # Preserve per-episode samples before trajectory.reset clears them.
             # RSL-RL concatenates these vectors, so differently sized reset
             # batches receive their actual episode weights.

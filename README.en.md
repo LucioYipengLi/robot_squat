@@ -127,7 +127,7 @@ Run compatible checkpoints against a versioned suite with fixed episode quotas a
 The initial modules cover four-mode tracking and upper-body disturbance sweeps; evaluation always runs headless.
 
 ```bash
-uv run --extra isaacsim python -m g1.rl eval --suite g1_robustness_v2 --checkpoints "early=<early_model.pt>" "late=<late_model.pt>" --policy-output both --num_envs 128
+uv run --extra isaacsim python -m g1.rl eval --suite g1_robustness --checkpoints "early=<early_model.pt>" "late=<late_model.pt>" --policy-output both --num_envs 128
 ```
 
 The terminal shows overall/episode progress, execution stages and estimated remaining time; use `--progress plain`
@@ -269,12 +269,6 @@ uv run isaaclab --editor --isaac_path <isaac-sim-path>
 # Windows
 uv run isaaclab --editor --isaac_path <isaac-sim-path>
 ```
-
-## Isaac Sim UI extension
-
-Add the project root to the Isaac Sim Extension Manager search paths, refresh, and enable the extension under
-`Third Party`. Launch Isaac Sim through the project's `isaacsim` extra so the UI dependencies are available. Kit loads
-`src/g1/ui_extension_example.py` through `config/extension.toml`.
 
 ## Troubleshooting
 

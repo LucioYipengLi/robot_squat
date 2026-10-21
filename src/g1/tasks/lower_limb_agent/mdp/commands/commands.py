@@ -1,10 +1,4 @@
-"""
-Sub-module containing command generators for the height-based balance and
-squat-walk locomotion tasks.
-
-Author:
-    Lucio.YipengLi@outlook.com
-"""
+"""Unified height, velocity and pelvis-offset commands for the lower-body policy."""
 
 from __future__ import annotations
 
@@ -25,7 +19,7 @@ from g1.tasks.lower_limb_agent.performance import ModePerformanceMonitor
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
-    from .commands_cfg import SquatWalkCommandCfg, UniformHeightCommandCfg
+    from .commands_cfg import SquatWalkCommandCfg
 
 # import logger
 logger = logging.getLogger(__name__)
@@ -48,231 +42,6 @@ def _metric_sample_mask(term: CommandTerm) -> torch.Tensor:
     valid = (term._env.episode_length_buf > 0) & (term._last_metric_step != step)
     term._last_metric_step.masked_fill_(valid, step)
     return valid
-
-
-def _episode_metrics_for_logging(term: CommandTerm, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Exclude resets without executed samples from episode averages."""
-    valid = term._step_count[env_ids] > 0
-    valid_ids = env_ids[valid]
-    if valid_ids.numel() == 0:
-        return {}
-    return {name: value[valid_ids].mean() for name, value in term.metrics.items()}
-
-
-class UniformHeightCommand(CommandTerm):
-    r"""Command generator that generates a pelvis height command in SE(1) from a uniform distribution.
-
-    The command comprises a pelvis height offset along the z direction, expressed relative to
-    the robot's default standing height. A fraction of environments (``cfg.rel_default_envs``)
-    is forced to stand at the default height (zero offset) to regularize training.
-
-    The offset form is exposed to the policy through the :attr:`command` property, while the
-    equivalent absolute target height in the world frame is maintained internally for
-    tracking-error metrics and debug visualization.
-    """
-
-    cfg: UniformHeightCommandCfg
-    """The configuration of the command generator."""
-
-    def __init__(self, cfg: UniformHeightCommandCfg, env: ManagerBasedEnv):
-        """Initialize the command generator.
-
-        Args:
-            cfg: The configuration of the command generator.
-            env: The environment.
-
-        Raises:
-            ValueError: If the lower bound of the pelvis height offset range is above the upper bound.
-        """
-
-        # Init the base class
-        super().__init__(cfg, env)
-
-        # check config
-        if self.cfg.ranges.height_offset[0] > self.cfg.ranges.height_offset[1]:
-            raise ValueError(
-                "The pelvis height command has an invalid offset range. The lower bound is above the upper bound."
-            )
-
-        # obtain the robot asset
-        # -- robot
-        self.robot: Articulation = env.scene[cfg.asset_name]
-
-        # create buffers to store the command
-        # -- command: pelvis height offset relative to the default standing height [m]
-        #    (exposed to the policy via the ``command`` property)
-        self.height_command_offset = torch.zeros(self.num_envs, 1, device=self.device)
-        # -- command: absolute target pelvis height in world frame [m]
-        #    (used for tracking-error metrics, reward, and vis)
-        self.height_command_world = torch.zeros(self.num_envs, 1, device=self.device)
-        # -- mask for env that must stand at default height
-        self.is_default_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        # -- metrics: finalized per-episode means/rates, written at ``reset`` and read by the base class
-        self.metrics["error_height"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
-        # -- per-episode running sums (cleared at episode reset)
-        self._error_height_sum = torch.zeros(self.num_envs, device=self.device)
-        self._step_count = torch.zeros(self.num_envs, device=self.device)
-        self._last_metric_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
-
-        # adds cmd kind and element names for leapp export
-        # during export, semantic data about this command will be used to annotate the command input
-        self.cfg.cmd_kind = self.cfg.cmd_kind or "command/body/height"
-        self.cfg.element_names = self.cfg.element_names or ["pelvis_height_offset"]
-
-    def __str__(self) -> str:
-        """Return a string representation of the command generator."""
-        msg = "UniformHeightCommand:\n"
-        msg += f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"
-        msg += f"\tResampling time range: {self.cfg.resampling_time_range} (s)\n"
-        msg += f"\tPelvis height offset range: {self.cfg.ranges.height_offset} (m)\n"
-        msg += f"\tHeight success threshold: {self.cfg.height_success_threshold} (m)\n"
-        msg += f"\tDefault standing probability: {self.cfg.rel_default_envs}"
-        return msg
-
-    @property
-    def command(self) -> torch.Tensor:
-        """The desired pelvis height offset relative to the default standing height [m]. Shape is (num_envs, 1)."""
-        return self.height_command_offset
-
-    def _update_metrics(self):
-        """Accumulate the per-step height tracking error sums and the step counter.
-
-        LowerLimbAgentEnv calls this before physical reset events. Step stamps exclude initial
-        reset states and ensure later reset()/compute() calls cannot count the frame twice.
-        """
-        valid = _metric_sample_mask(self)
-        error_height = torch.abs(self.robot.data.root_pos_w.torch[:, 2] - self.height_command_world[:, 0])
-        self._error_height_sum += torch.where(valid, error_height, 0.0)
-        self._step_count += valid.float()
-
-    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> dict[str, float]:
-        """Finalize per-episode height tracking metrics before the base class logs them.
-
-        The episode-mean tracking error and a binary success flag (mean error below the
-        configured threshold) are written to ``self.metrics`` prior to ``super().reset()``,
-        which reads, logs, and zeros them. The running accumulators are cleared afterwards
-        so the next episode starts clean.
-
-        Args:
-            env_ids: The environment indices whose episodes just ended. Defaults to None, in
-                which case all environments are considered.
-
-        Returns:
-            Per-episode metrics to be logged by the command manager under ``Metrics/<term_name>/``.
-        """
-
-        env_ids = _resolve_env_ids(env_ids, self.num_envs, self.device)
-        if env_ids.numel() == 0:
-            return {}
-
-        # The project environment captured terminal state before physical reset events.
-        # This hook also supports direct command resets; the step stamp prevents double counts.
-        self._update_metrics()
-        valid = self._step_count[env_ids] > 0
-        # -- stage 1: finalize the just_ended episode's metrics
-        denom = self._step_count[env_ids].clamp_min(1.0)
-        mean_error_height = self._error_height_sum[env_ids] / denom
-        self.metrics["error_height"][env_ids] = mean_error_height
-        self.metrics["success_rate"][env_ids] = (
-            valid & (mean_error_height < self.cfg.height_success_threshold)
-        ).float()
-
-        # --stage 2: let the base class log, zero metrics, and resample the command
-        extras = _episode_metrics_for_logging(self, env_ids)
-        super().reset(env_ids)
-        # route success_rate to the unified ``Metrics/success_rate`` path (shared
-        # TensorBoard/wandb card across tasks); pop it so CommandManager does not
-        # additionally log it under ``Metrics/<term_name>/success_rate``
-        if "success_rate" in extras:
-            self._env.extras.setdefault("log", {})["Metrics/success_rate"] = extras.pop("success_rate")
-
-        # -- stage 3: clear the running accumulators for the reset environments
-        self._error_height_sum[env_ids] = 0.0
-        self._step_count[env_ids] = 0.0
-        return extras
-
-    def _resample_command(self, env_ids: Sequence[int] | torch.Tensor | slice):
-        """Resample the pelvis height command for the specified environments.
-
-        The height offset is sampled uniformly from ``cfg.ranges.height_offset``. Environments
-        selected as default (with probability ``cfg.rel_default_envs``) are forced to a zero
-        offset. The absolute target height in the world frame is then composed from the env
-        origin, the default pelvis height, and the sampled offset.
-
-        Args:
-            env_ids: The environment indices to resample the command for.
-        """
-        env_ids = _resolve_env_ids(env_ids, self.num_envs, self.device)
-        # sample height commands
-        h = torch.empty(len(env_ids), device=self.device)
-        # -- pelvis height offset relative to the default standing height
-        self.height_command_offset[env_ids, 0] = h.uniform_(*self.cfg.ranges.height_offset)
-        # -- update default envs
-        self.is_default_env[env_ids] = h.uniform_(0.0, 1.0) <= self.cfg.rel_default_envs
-        default_env_ids = env_ids[self.is_default_env[env_ids]]
-        self.height_command_offset[default_env_ids, 0] = 0.0
-
-        # compose the absolute pelvis height target in world frame
-        default_pelvis_height = self.robot.data.default_root_pose.torch[env_ids, 2]
-        # -- world frame height, it will be 0.0 at flat plane.
-        env_origin_z = self._env.scene.env_origins[env_ids, 2]
-        self.height_command_world[env_ids, 0] = (
-            env_origin_z + default_pelvis_height + self.height_command_offset[env_ids, 0]
-        )
-
-    def _update_command(self):
-        """Post-processes the height command.
-
-        Nothing to do here: default environments are already enforced at resample time and the
-        height command stays constant between resamples.
-        """
-        pass
-
-    def _set_debug_vis_impl(self, debug_vis: bool):
-        """Set debug visualization into visualization objects.
-
-        This function is responsible for creating the visualization objects if they don't exist
-        and input ``debug_vis`` is True. If the visualization objects exist, the function should
-        set their visibility into the stage.
-        """
-        # set visibility of markers
-        # note: parent only deals with callbacks. not their visibility
-        if debug_vis:
-            # create markers if necessary for the first time
-            if not hasattr(self, "goal_height_visualizer"):
-                # -- goal pelvis height
-                self.goal_height_visualizer = VisualizationMarkers(self.cfg.goal_height_visualizer_cfg)
-                # -- current pelvis height
-                self.current_height_visualizer = VisualizationMarkers(self.cfg.current_height_visualizer_cfg)
-            # set their visibility to true
-            self.goal_height_visualizer.set_visibility(True)
-            self.current_height_visualizer.set_visibility(True)
-        else:
-            if hasattr(self, "goal_height_visualizer"):
-                self.goal_height_visualizer.set_visibility(False)
-                self.current_height_visualizer.set_visibility(False)
-
-    def _debug_vis_callback(self, event):
-        """Visualize the goal and current pelvis heights with sphere markers.
-
-        The goal marker is placed at the robot's xy position with z set to the commanded
-        absolute height; the current marker follows the actual pelvis position.
-        """
-        # check if robot is initialized
-        # note: this is needed in-case the robot is de-initialized. we can't access the data
-        if not self.robot.is_initialized:
-            return
-        # spheres are rotation-invariant; reuse the root orientation as a valid placeholder
-        root_quat_w = self.robot.data.root_quat_w.torch
-        # -- goal: at the robot's xy position, but z set to the commanded absolute height
-        goal_pos_w = self.robot.data.root_pos_w.torch.clone()
-        goal_pos_w[:, 2] = self.height_command_world[:, 0]
-        # -- current: the actual pelvis (root) position
-        current_pos_w = self.robot.data.root_pos_w.torch
-        # display markers
-        self.goal_height_visualizer.visualize(goal_pos_w, root_quat_w)
-        self.current_height_visualizer.visualize(current_pos_w, root_quat_w)
 
 
 class SquatWalkCommand(CommandTerm):
@@ -392,29 +161,11 @@ class SquatWalkCommand(CommandTerm):
         self.is_default_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # -- normalized mode sampling weights
         self._mode_probs = torch.tensor(self.cfg.rel_mode_envs, dtype=torch.float, device=self.device)
-        # -- metrics: finalized per-episode means/rates, written at ``reset`` and read by the base class
-        self.metrics["error_height"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["success_rate_vel"] = torch.zeros(self.num_envs, device=self.device)
-        # -- persisted per-episode success buffers for the command-range curriculum, kept OUTSIDE
-        #    ``self.metrics``: the base ``CommandTerm.reset`` zeroes every ``self.metrics`` entry right
-        #    after logging it, and ``CurriculumManager.compute`` runs *before* the next command reset
-        #    (see ``ManagerBasedRLEnv._reset_idx``), so a curriculum reading ``self.metrics`` would
-        #    always see zeros. These hold each env's last finalized episode success, never zeroed.
+        # Persist only the tracking flags used by the command-range curriculum.
         self.episode_success_rate = torch.zeros(self.num_envs, device=self.device)
         self.episode_success_rate_vel = torch.zeros(self.num_envs, device=self.device)
         self.episode_metrics_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        # -- per-episode running sums (cleared at episode reset)
-        self._error_height_sum = torch.zeros(self.num_envs, device=self.device)
-        self._error_xy_sum = torch.zeros(self.num_envs, device=self.device)
-        self._error_yaw_sum = torch.zeros(self.num_envs, device=self.device)
-        self._step_count = torch.zeros(self.num_envs, device=self.device)
         self._last_metric_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
-        self._pelvis_error_sum = torch.zeros(self.num_envs, device=self.device)
-        self._pelvis_success_sum = torch.zeros(self.num_envs, device=self.device)
-        self._pelvis_step_count = torch.zeros(self.num_envs, device=self.device)
         self.performance = ModePerformanceMonitor(
             self.num_envs,
             self.device,
@@ -537,11 +288,11 @@ class SquatWalkCommand(CommandTerm):
         self.pelvis_offset[walk_ids] = 0.0
 
     def _update_metrics(self):
-        """Accumulate the per-step height, velocity and pelvis-offset tracking error sums.
+        """Sample height, velocity and pelvis errors into the shared monitor.
 
         Executed steps are sampled once; the project environment captures terminal frames before
         physical reset events. Initial reset states are excluded. Pelvis sums use STAND/SQUAT steps only.
-        The per-episode means are finalized in :meth:`reset` so the values are independent of
+        The monitor finalizes episode means in :meth:`reset`, independent of
         episode length and ``resampling_time_range``.
         """
         valid = _metric_sample_mask(self)
@@ -549,60 +300,31 @@ class SquatWalkCommand(CommandTerm):
         # velocity command is in the base frame; compare against base-frame velocities
         error_xy = torch.linalg.norm(self.vel_command_b[:, :2] - self.robot.data.root_lin_vel_b.torch[:, :2], dim=-1)
         error_yaw = torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b.torch[:, 2])
-        self._error_height_sum += torch.where(valid, error_height, 0.0)
-        self._error_xy_sum += torch.where(valid, error_xy, 0.0)
-        self._error_yaw_sum += torch.where(valid, error_yaw, 0.0)
-        self._step_count += valid.float()
-        # reset 后第一帧没有执行新 episode 动作，不混入骨盆偏置统计。
-        active = self.pelvis_tracking_mask & valid
         pelvis_error = torch.linalg.vector_norm(self.pelvis_error_xy(), dim=-1)
-        self._pelvis_error_sum += torch.where(active, pelvis_error, 0.0)
-        self._pelvis_success_sum += (active & (pelvis_error < self.cfg.pelvis_success_threshold)).float()
-        self._pelvis_step_count += active.float()
         self.performance.sample(self.mode, valid, error_height, error_xy, error_yaw, pelvis_error, self.task_command)
 
     def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> dict[str, float]:
-        """Draw the new episode's task modes and finalize tracking metrics.
+        """Finalize one shared episode record, retain curriculum flags and draw new modes.
 
-        The episode-mean height/velocity errors and binary success flags are written to
-        ``self.metrics`` prior to ``super().reset()``, which reads, logs, and zeros them and
-        triggers the command resample. The per-episode mode is drawn *before* the base-class
-        resample chain so that :meth:`_resample_command` consumes the fresh modes. The running
-        accumulators are cleared afterwards so the next episode starts clean.
-
-        Empty episodes are omitted from logging and persisted success buffers. Height/velocity
-        success means tracking-error success, not survival to the episode time limit.
-        The pelvis-offset statistics are aggregated only over active STAND/SQUAT steps and
-        merged into the returned extras (``error_pelvis_xy`` / ``success_rate_pelvis_xy``)
-        rather than ``self.metrics``, so walking episodes do not dilute them with zero error.
-
-        Args:
-            env_ids: The environment indices whose episodes just ended. Defaults to None, in
-                which case all environments are considered.
-
-        Returns:
-            Per-episode metrics to be logged by the command manager under ``Metrics/<term_name>/``.
+        The monitor owns all error sums and logging reductions. Range-curriculum
+        flags keep their existing nonempty-episode eligibility; performance logs
+        and joint-success snapshots retain stricter natural/full-episode filtering.
         """
-        # Explicit resets pass slices; mode sampling and masks require concrete indices.
         env_ids = _resolve_env_ids(env_ids, self.num_envs, self.device)
         if env_ids.numel() == 0:
             return {}
-
         self._update_metrics()
-        # The project environment already captured the terminal physical frame. Termination
-        # manager buffers are still live here; attribute episodes before sampling new modes.
         if not getattr(self._env, "_g1_restoring_curriculum", False):
             manager = self._env.termination_manager
             reasons = {name: manager.get_term(name) for name in manager.active_terms}
             terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             time_outs = torch.zeros_like(terminated)
-            # Read raw terms: visualizer/manual resets can modify the aggregate done buffer.
             for name, active in reasons.items():
                 if manager.get_term_cfg(name).time_out:
                     time_outs |= active
                 else:
                     terminated |= active
-            self.performance.finish(
+            ids, height_ok, velocity_ok = self.performance.finish(
                 env_ids,
                 step=self._env.common_step_counter,
                 lengths=self._env.episode_length_buf,
@@ -611,75 +333,19 @@ class SquatWalkCommand(CommandTerm):
                 reasons=reasons,
                 max_steps=self._env.max_episode_length,
             )
-        valid = self._step_count[env_ids] > 0
-        valid_ids = env_ids[valid]
-        # -- stage 1: finalize the just-ended episode's metrics
-        denom = self._step_count[env_ids].clamp_min(1.0)
-        mean_error_height = self._error_height_sum[env_ids] / denom
-        self.metrics["error_height"][env_ids] = mean_error_height
-        self.metrics["success_rate"][env_ids] = (
-            valid & (mean_error_height < self.cfg.height_success_threshold)
-        ).float()
-        mean_error_xy = self._error_xy_sum[env_ids] / denom
-        mean_error_yaw = self._error_yaw_sum[env_ids] / denom
-        self.metrics["error_vel_xy"][env_ids] = mean_error_xy
-        self.metrics["error_vel_yaw"][env_ids] = mean_error_yaw
-        self.metrics["success_rate_vel"][env_ids] = (
-            valid
-            & (mean_error_xy < self.cfg.vel_xy_success_threshold)
-            & (mean_error_yaw < self.cfg.vel_yaw_success_threshold)
-        ).float()
-
-        # -- persist the finalized success for the command-range curriculum: ``super().reset()`` below
-        #    zeroes every ``self.metrics`` entry, and the curriculum's ``compute`` runs before the next
-        #    reset, so it must read a buffer that survives the zeroing (``episode_success_rate*``).
-        self.episode_success_rate[valid_ids] = self.metrics["success_rate"][valid_ids]
-        self.episode_success_rate_vel[valid_ids] = self.metrics["success_rate_vel"][valid_ids]
-        self.episode_metrics_valid[valid_ids] = True
-
-        # -- capture the ending episode's mode so it stays aligned with the metrics finalized above
-        #    (stage 2 below overwrites ``self.mode`` with the freshly drawn new-episode mode)
-        self.last_mode[valid_ids] = self.mode[valid_ids]
-
-        # 骨盆偏置统计只聚合实际生效步，行走 episode 不以零误差稀释结果。
-        pelvis_count = self._pelvis_step_count[env_ids].sum()
-        pelvis_stats = {}
-        if pelvis_count > 0:
-            pelvis_stats = {
-                "error_pelvis_xy": (self._pelvis_error_sum[env_ids].sum() / pelvis_count).item(),
-                "success_rate_pelvis_xy": (self._pelvis_success_sum[env_ids].sum() / pelvis_count).item(),
-            }
+            self.episode_success_rate[ids] = height_ok.float()
+            self.episode_success_rate_vel[ids] = velocity_ok.float()
+            self.episode_metrics_valid[ids] = True
+            self.last_mode[ids] = self.mode[ids]
         self.pelvis_offset[env_ids] = 0.0
         self.pelvis_target_offset[env_ids] = 0.0
-
-        # -- stage 2: draw the per-episode task modes before the resample chain consumes them
-        num = len(env_ids)
         evaluation = getattr(self, "_evaluation_controller", None)
         if evaluation is None:
-            self.mode[env_ids] = torch.multinomial(self._mode_probs.expand(num, -1), num_samples=1).squeeze(-1)
+            self.mode[env_ids] = torch.multinomial(self._mode_probs.expand(len(env_ids), -1), 1).squeeze(-1)
         else:
             evaluation.assign_modes(env_ids)
         self.performance.reset(env_ids, self.mode, self._env.common_step_counter)
-
-        # -- stage 3: let the base class log, zero metrics, and resample the command
-        extras = _episode_metrics_for_logging(self, env_ids)
-        super().reset(env_ids)
-        # route the height-based success_rate to the unified ``Metrics/success_rate`` path
-        # (shared TensorBoard/wandb card across tasks, comparable with the height-only task);
-        # pop it so CommandManager does not additionally log it under ``Metrics/<term_name>/``
-        if "success_rate" in extras:
-            self._env.extras.setdefault("log", {})["Metrics/success_rate"] = extras.pop("success_rate")
-
-        # -- stage 4: clear the running accumulators for the reset environments
-        self._error_height_sum[env_ids] = 0.0
-        self._error_xy_sum[env_ids] = 0.0
-        self._error_yaw_sum[env_ids] = 0.0
-        self._step_count[env_ids] = 0.0
-        self._pelvis_error_sum[env_ids] = 0.0
-        self._pelvis_success_sum[env_ids] = 0.0
-        self._pelvis_step_count[env_ids] = 0.0
-        extras.update(pelvis_stats)
-        return extras
+        return super().reset(env_ids)
 
     def _resample_command(self, env_ids: Sequence[int] | torch.Tensor | slice):
         """Resample the task command for the specified environments under the current modes.

@@ -19,7 +19,7 @@ from g1.tasks.lower_limb_agent.mdp.observations import upper_body_joint_pos_targ
 
 
 def main():
-    suite = load_suite("g1_core_v2")
+    suite = load_suite("g1_core")
     cfg, _ = resolve_task_config(suite["task"], "rsl_rl_cfg_entry_point", overrides=["physics=isaacsim_physx"])
     prepare_env_cfg(cfg, suite["benchmark"], {"arm_fraction": 0, "waist_fraction": 0}, 4, 17)
     # Isolate reference execution from policy falls and automatic terminations.
@@ -87,7 +87,7 @@ def main():
                 "steps": 90,
                 "peak_reference_velocity_radps": peak_speed,
                 "peak_reference_acceleration_radps2": peak_acceleration,
-                "profile": cfg.upper_body_motion.profile,
+                "motion": "quintic",
                 "upper_body_target_source": observation_params["target_source"],
                 "device": torch.cuda.get_device_name(),
             }

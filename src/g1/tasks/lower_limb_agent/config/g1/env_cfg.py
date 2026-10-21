@@ -410,8 +410,8 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
             ),
-            "stride_freq_intercept": 1.19,
-            "stride_freq_slope": 0.79,
+            "stride_freq_intercept": 0.595,
+            "stride_freq_slope": 0.395,
             "std": 0.3,
         },
     )

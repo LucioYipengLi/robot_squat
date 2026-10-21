@@ -114,20 +114,13 @@ def test_curriculum_runner_installs_diagnostic_adapter(monkeypatch):
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_legacy_pruning_preserves_source_data_unique_metrics_and_writer_method(fail):
+def test_upstream_duplicate_pruning_preserves_source_data_and_writer_method(fail):
     records = {}
     writer = SimpleNamespace(add_scalar=lambda tag, value, step: records.setdefault((tag, step), value))
     original_scalar = writer.add_scalar
     logger, _, base, _ = _fixture(writer)
     source = {
-        "Metrics/success_rate": torch.tensor(0.9),
-        "Metrics/task_command/error_height": torch.tensor(0.02),
-        "Metrics/task_command/success_rate_vel": torch.tensor(0.8),
         "Episode_Termination/bad_ori": torch.tensor(0.1),
-        "Curriculum/command_range/height_offset_lo": -0.3,
-        "Curriculum/command_range/lin_vel_x_span": 0.9,
-        "Curriculum/upper_body_disturbance_magnitude/joint_noise_frac": 0.3,
-        "Curriculum/squat_walk_mode_introduction/squat_walk_weight": 0.25,
         "Curriculum/command_range/height_success": torch.tensor(0.99),
         "Curriculum/command_range/vel_success": torch.tensor(0.95),
         "Curriculum/upper_body_disturbance_magnitude/survival_ema": torch.tensor(0.97),
@@ -164,9 +157,9 @@ def test_legacy_pruning_preserves_source_data_unique_metrics_and_writer_method(f
         logger.log(it=9)
     assert set(source) == original_keys  # environment dictionaries are not mutated
     assert writer.add_scalar is original_scalar
-    for key in list(source)[:8]:
+    for key in list(source)[:1]:
         assert (key, 9) not in records
-    for key in list(source)[8:]:
+    for key in list(source)[1:]:
         assert (key, 9) in records
     assert ("Train/mean_reward", 9) in records
     assert ("Train/mean_episode_length", 9) in records
@@ -195,7 +188,6 @@ def test_real_rsl_logger_keeps_training_signals_but_omits_superseded_series(tmp_
     logger.lenbuffer.append(360)
     logger.ep_extras.append(
         {
-            "Metrics/task_command/error_height": torch.tensor(0.2),
             "Episode_Termination/bad_ori": torch.tensor(1.0),
             "Episode_Reward/track_velocity": torch.tensor(1.2),
             "Curriculum/command_range/height_success": torch.tensor(0.95),

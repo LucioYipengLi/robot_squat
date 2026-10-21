@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .disturbance import joint_targets_from_uniform
+
 
 def prepare_env_cfg(env_cfg, benchmark: dict, condition: dict, num_envs: int, seed: int):
     """Apply a benchmark before environment construction, independent of play hooks.
@@ -33,8 +35,7 @@ def prepare_env_cfg(env_cfg, benchmark: dict, condition: dict, num_envs: int, se
     if not math.isclose(actual_dt, benchmark["control_dt"], rel_tol=0, abs_tol=1e-10):
         raise ValueError(f"Benchmark control_dt={benchmark['control_dt']} differs from task control_dt={actual_dt}")
     env_cfg.curriculum = None
-    # Suites predating trajectory support retain their explicit step baseline.
-    motion = benchmark.get("upper_body_motion", {"profile": "step_v1"})
+    motion = benchmark["upper_body_motion"]
     for name, value in motion.items():
         setattr(env_cfg.upper_body_motion, name, value)
     env_cfg.observations.policy.upper_body_target.params["target_source"] = benchmark.get(
@@ -208,11 +209,6 @@ class EvaluationScenarioController:
             self.plans[slot] = make_case_plan(
                 self.benchmark, self.seed, spec["mode"], spec["episode_id"], len(self._joint_ids)
             )
-        # Preclear the held position buffer only. run_rollouts next calls env.reset(),
-        # whose shared reset aligns all upper commands and clears trajectory state.
-        ids = torch.arange(self.env.num_envs, device=self.env.device)
-        default_q = self.robot.data.default_joint_pos.torch[:, self._joint_ids]
-        self.robot.set_joint_position_target_index(target=default_q, joint_ids=self._joint_ids, env_ids=ids)
 
     def assign_modes(self, env_ids: torch.Tensor) -> None:
         self.term.mode[env_ids] = self.modes[env_ids]
@@ -240,8 +236,7 @@ class EvaluationScenarioController:
     def update_commands(self) -> None:
         """Publish task commands and final goals on the deterministic case clock.
 
-        step_v1 publishes its held PD target here. quintic_v1 queues a goal in
-        the shared executor, which advances during action application. Policy
+        Goals queue in the shared executor, which advances during action application. Policy
         observations select final goals or PD references via target_source.
         """
         active_ids = self.active.nonzero().flatten()
@@ -283,12 +278,8 @@ class EvaluationScenarioController:
         ids = torch.tensor(event_slots, device=self.env.device)
         default_q = self.robot.data.default_joint_pos.torch[ids][:, self._joint_ids]
         limits = self.robot.data.joint_pos_limits.torch[ids][:, self._joint_ids]
-        lo, hi = limits[..., 0], limits[..., 1]
-        lower_margin = (default_q - lo).clamp_min(0)
-        upper_margin = (hi - default_q).clamp_min(0)
         u = torch.tensor(event_samples, device=self.env.device)
-        target = default_q + self._frac * (-lower_margin + u * (lower_margin + upper_margin))
-        target = torch.clamp(target, lo, hi)
+        target = joint_targets_from_uniform(default_q, limits, self._frac, u)
         self.env.upper_body_motion.set_goal(ids, target, self._joint_ids)
         self._pending_events[ids] += 1
 
@@ -305,7 +296,7 @@ class EvaluationScenarioController:
             )
         )
         motion = getattr(self.env, "upper_body_motion", None)
-        if motion is not None and motion.cfg.profile == "quintic_v1":
+        if motion is not None:
             result.update(
                 zip(
                     (

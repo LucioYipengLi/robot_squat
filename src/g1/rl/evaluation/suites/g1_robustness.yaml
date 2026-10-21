@@ -1,7 +1,11 @@
 schema_version: 1
-suite: g1_core_v1
+suite: g1_robustness
 task: Template-G1-v0
 benchmark:
+  upper_body_motion:
+    max_velocity: 2.0
+    max_acceleration: 8.0
+    min_duration_s: 0.5
   episode_length_s: 6.0
   control_dt: 0.016666666666666666
   episodes_per_seed: 800
@@ -34,3 +38,6 @@ modules:
   - name: tracking
     arm_fraction: 0.0
     waist_fraction: 0.0
+  - name: upper_body_sweep
+    arm_fractions: [0.2, 0.3, 0.4, 0.555]
+    waist_fraction: 0.1

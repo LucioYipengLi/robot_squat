@@ -13,7 +13,6 @@ from .trajectory import QuinticTrajectory
 class UpperBodyMotionCfg:
     """Reference limits, not physical actuator limits. Units: rad/s, rad/s², s."""
 
-    profile: str = "quintic_v1"
     max_velocity: float = 2.5
     max_acceleration: float = 8.0
     min_duration_s: float = 0.3
@@ -23,8 +22,6 @@ class UpperBodyMotion:
     """Own one articulation subset and publish references in its resolved order."""
 
     def __init__(self, robot, joint_ids, cfg: UpperBodyMotionCfg):
-        if cfg.profile not in ("quintic_v1", "step_v1"):
-            raise ValueError(f"Unsupported upper-body motion profile: {cfg.profile}")
         self.robot, self.joint_ids, self.cfg = robot, joint_ids, cfg
         host_ids = joint_ids.tolist() if isinstance(joint_ids, torch.Tensor) else list(joint_ids)
         if not host_ids or len(set(host_ids)) != len(host_ids):
@@ -50,8 +47,6 @@ class UpperBodyMotion:
         Columns follow the observation joint order resolved by the action term.
         Reading this target never starts a segment or consumes the pending goal.
         """
-        if self.cfg.profile == "step_v1":
-            return self.robot.data.joint_pos_target.torch[:, self.joint_ids]
         curve = self.trajectory
         return torch.where(~curve.active & curve.pending, curve.pending_goal, curve.goal)
 
@@ -65,16 +60,9 @@ class UpperBodyMotion:
                 [key.index(joint) for joint in self._columns], device=goal.device, dtype=torch.long
             )
         ordered = goal[:, self._input_orders[key]]
-        if self.cfg.profile == "step_v1":
-            self.robot.actuators.target_command.set_position_index(
-                value=ordered, joint_ids=self.joint_ids, env_ids=env_ids
-            )
-        else:
-            self.trajectory.set_goal(env_ids, ordered)
+        self.trajectory.set_goal(env_ids, ordered)
 
     def advance(self, dt: float) -> None:
-        if self.cfg.profile == "step_v1":
-            return
         self.trajectory.advance(dt)
         command = self.robot.actuators.target_command
         command.set_position_index(value=self.trajectory.position, joint_ids=self.joint_ids)

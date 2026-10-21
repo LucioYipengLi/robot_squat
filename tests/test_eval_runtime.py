@@ -39,7 +39,7 @@ def test_manifest_plan_resume_hashes_and_globs(tmp_path, monkeypatch):
     model.write_bytes(b"test checkpoint")
     records = jobs.checkpoint_records([str(model.parent / "*.pt"), str(model)])
     assert len(records) == 1
-    manifest = jobs.build_manifest(load_suite("g1_robustness_v1"), records, {"num_envs": 8})
+    manifest = jobs.build_manifest(load_suite("g1_robustness"), records, {"num_envs": 8})
     assert len(manifest["jobs"]) == 15
     assert len({job["job_id"] for job in manifest["jobs"]}) == 15
     jobs.validate_resume(manifest)
@@ -97,7 +97,7 @@ def test_checkpoint_paths_with_equals_and_portable_case_insensitive_labels(tmp_p
 
 
 def test_episode_specs_exact_quotas_and_stable_ids():
-    benchmark = load_suite("g1_core_v1")["benchmark"]
+    benchmark = load_suite("g1_core")["benchmark"]
     benchmark.update(episodes_per_seed=10, mode_weights=[4, 4, 2, 0])
     specs = episode_specs(benchmark)
     assert [sum(spec["mode"] == mode for spec in specs) for mode in range(4)] == [4, 4, 2, 0]
@@ -136,7 +136,7 @@ def test_collector_ignores_autoresets_and_unassigned_slots():
 
 
 def test_rollouts_wait_for_slow_episodes_without_recounting_early_failures():
-    benchmark = load_suite("g1_core_v1")["benchmark"]
+    benchmark = load_suite("g1_core")["benchmark"]
     benchmark.update(episodes_per_seed=4, mode_weights=[1, 1, 0, 0])
     monitor = SimpleNamespace(episode_callback=None)
     raw = SimpleNamespace(

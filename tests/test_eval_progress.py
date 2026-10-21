@@ -189,7 +189,7 @@ def test_stubborn_interrupted_worker_is_killed_and_reaped():
 
 
 def test_real_child_progress_then_resume_skips_without_a_new_process(tmp_path, monkeypatch):
-    config = load_suite("g1_core_v1")
+    config = load_suite("g1_core")
     config["benchmark"].update(episodes_per_seed=4, seeds=[17])
     job = _job()
     manifest = {"config": config, "runtime": {"num_envs": 2}, "jobs": [job]}
@@ -241,7 +241,7 @@ def test_real_child_progress_then_resume_skips_without_a_new_process(tmp_path, m
 
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_failed_or_interrupted_worker_keeps_completed_count_and_reaps_process(tmp_path, monkeypatch, interrupted):
-    config = load_suite("g1_core_v1")
+    config = load_suite("g1_core")
     config["benchmark"].update(episodes_per_seed=4, seeds=[17])
     manifest = {"config": config, "runtime": {"num_envs": 2}, "jobs": [_job()]}
     stopped = []

@@ -47,13 +47,6 @@ class _Environment:
             _last_metric_step=torch.full((num_envs,), -1, dtype=torch.long),
         )
         for name in (
-            "_error_height_sum",
-            "_error_xy_sum",
-            "_error_yaw_sum",
-            "_step_count",
-            "_pelvis_error_sum",
-            "_pelvis_success_sum",
-            "_pelvis_step_count",
             "episode_success_rate",
             "episode_success_rate_vel",
         ):
@@ -77,6 +70,9 @@ class _Environment:
                 "weights": self.term._mode_probs.clone(),
                 "modes": torch.multinomial(self.term._mode_probs.expand(self.num_envs, -1), 1),
             }
+        )
+        self.term.performance.reset(
+            torch.arange(self.num_envs), self.resets[-1]["modes"].flatten(), self.common_step_counter
         )
         self.episode_length_buf.zero_()
         return torch.zeros(self.num_envs, 3), {}
@@ -109,7 +105,7 @@ def test_same_phase_roundtrip_is_portable_and_starts_fresh_episodes():
     assert saved["upper_body_target_source"] == "final_goal"
     assert json.loads(json.dumps(saved)) == saved
     target = _Environment(num_envs=5)
-    target.term._error_height_sum.fill_(100)
+    target.term.performance.episode.fill_(100)
     import_curriculum_state(target, saved)
     assert curriculum_step(target) == 500_000
     assert target.common_step_counter == 0
@@ -117,7 +113,7 @@ def test_same_phase_roundtrip_is_portable_and_starts_fresh_episodes():
     assert (target.resets[-1]["modes"] == 3).all()
     assert target.event.params["disturb_groups"][0]["joint_noise_frac"] == 0.43
     assert not target.term.episode_metrics_valid.any()
-    assert not target.term._error_height_sum.any()
+    assert not target.term.performance.episode.any()
     survival = target._g1_curriculum_state[f"survival:{EVENT_NAME}:0"]
     assert survival["observed"].shape == (5,)
     assert survival["observed"].all()

@@ -9,12 +9,12 @@
 
 ### 1. 选择要回答的问题
 
-suite（评估套件）规定测试条件、回合预算、种子和测试模块。推荐使用以下两个 v2 套件；同名 v1 保留阶跃基线：
+suite（评估套件）规定测试条件、回合预算、种子和测试模块。内置套件统一为以下两个，均采用渐进上肢扰动：
 
 | 套件 | 评估内容 | 适合回答的问题 | 默认规模：每个检查点 |
 | --- | --- | --- | --- |
-| [`g1_core_v2`](../src/g1/rl/evaluation/suites/g1_core_v2.yaml) | 基础任务跟踪，双臂和腰部目标保持默认姿态；站立、下蹲、行走比例为 33% / 33% / 34%，跳过蹲行 | 模型的基础技能如何？后期检查点是否比早期退化？ | 3 个种子，2,400 回合，3 个评估单元 |
-| [`g1_robustness_v2`](../src/g1/rl/evaluation/suites/g1_robustness_v2.yaml) | 站立、下蹲、行走比例为 33% / 33% / 34%，跳过蹲行；先测无扰动跟踪，再扫描双臂比例 0.2、0.3、0.4、0.555，腰部固定为 0.1 | 上肢运动多大时开始影响下肢任务？哪个检查点更耐受扰动？ | 5 个条件 × 3 个种子，12,000 回合，15 个评估单元 |
+| [`g1_core`](../src/g1/rl/evaluation/suites/g1_core.yaml) | 基础任务跟踪，双臂和腰部目标保持默认姿态；站立、下蹲、行走比例为 33% / 33% / 34%，跳过蹲行 | 模型的基础技能如何？后期检查点是否比早期退化？ | 3 个种子，2,400 回合，3 个评估单元 |
+| [`g1_robustness`](../src/g1/rl/evaluation/suites/g1_robustness.yaml) | 站立、下蹲、行走比例为 33% / 33% / 34%，跳过蹲行；先测无扰动跟踪，再扫描双臂比例 0.2、0.3、0.4、0.555，腰部固定为 0.1 | 上肢运动多大时开始影响下肢任务？哪个检查点更耐受扰动？ | 5 个条件 × 3 个种子，12,000 回合，15 个评估单元 |
 
 两者默认都使用均值动作 `mean`，每回合上限 6 秒，每个种子、每个条件 800 回合，种子为 101、202、303。上肢比例表示关节默认姿态到限位余量的使用比例，例如 `0.555` 对应 55.5% 的目标范围。
 
@@ -29,13 +29,13 @@ suite（评估套件）规定测试条件、回合预算、种子和测试模块
 **评估一个模型的基础能力：**
 
 ```powershell
-uv run python -m g1.rl eval --suite g1_core_v2 --checkpoints "model=logs/rsl_rl/g1_flat/run_a/model_5500.pt" --output outputs/eval/core_quick
+uv run python -m g1.rl eval --suite g1_core --checkpoints "model=logs/rsl_rl/g1_flat/run_a/model_5500.pt" --output outputs/eval/core_quick
 ```
 
 **比较多个检查点的上肢扰动耐受能力：**
 
 ```powershell
-uv run python -m g1.rl eval --suite g1_robustness_v2 --checkpoints "early=logs/rsl_rl/g1_flat/run_a/model_5500.pt" "late=logs/rsl_rl/g1_flat/run_a/model_9999.pt" --num_envs 128 --device cuda:0 --output outputs/eval/robustness_compare
+uv run python -m g1.rl eval --suite g1_robustness --checkpoints "early=logs/rsl_rl/g1_flat/run_a/model_5500.pt" "late=logs/rsl_rl/g1_flat/run_a/model_9999.pt" --num_envs 128 --device cuda:0 --output outputs/eval/robustness_compare
 ```
 
 `--checkpoints` 接受任意数量的路径。`early=路径` 为检查点指定图例名称，建议使用简短英文名称。也可以传入带引号的通配符，例如 `"logs/rsl_rl/g1_flat/run_a/model_*.pt"`，由程序展开并去除重复文件。
@@ -51,7 +51,7 @@ uv run python -m g1.rl eval --suite g1_robustness_v2 --checkpoints "early=logs/r
 第一次运行时，可先检查链路：
 
 ```powershell
-uv run python -m g1.rl eval --suite g1_core_v2 --checkpoints "logs/rsl_rl/g1_flat/run_a/model_5500.pt" --episodes-per-seed 8 --seeds 101 --num_envs 4 --output outputs/eval/smoke
+uv run python -m g1.rl eval --suite g1_core --checkpoints "logs/rsl_rl/g1_flat/run_a/model_5500.pt" --episodes-per-seed 8 --seeds 101 --num_envs 4 --output outputs/eval/smoke
 ```
 
 这个小规模测试用于确认环境、模型加载和报告生成。正式性能比较使用套件的完整预算或另行约定的多种子预算。
@@ -61,7 +61,7 @@ uv run python -m g1.rl eval --suite g1_core_v2 --checkpoints "logs/rsl_rl/g1_fla
 在新建评估命令中增加 `--plan-only`，会生成计划并打印评估单元数，随后退出，适合先确认运行规模：
 
 ```powershell
-uv run python -m g1.rl eval --suite g1_core_v2 --checkpoints "logs/rsl_rl/g1_flat/run_a/model_5500.pt" --plan-only --output outputs/eval/core_plan_new
+uv run python -m g1.rl eval --suite g1_core --checkpoints "logs/rsl_rl/g1_flat/run_a/model_5500.pt" --plan-only --output outputs/eval/core_plan_new
 uv run python -m g1.rl eval --resume outputs/eval/core_plan_new
 ```
 
@@ -152,7 +152,6 @@ suite: g1_replay_0345_v2
 task: Template-G1-v0
 benchmark:
   upper_body_motion:
-    profile: quintic_v1
     max_velocity: 2.0
     max_acceleration: 8.0
     min_duration_s: 0.5
@@ -207,11 +206,11 @@ uv run python -m g1.rl eval --resume outputs/eval/deep_compare
 | `episodes_per_seed` | 每个检查点、测试条件、动作方式、种子的总回合数 |
 | `mode_weights` | 顺序为站立、下蹲、行走、蹲行；非负权重归一化后分配回合，零权重模式跳过 |
 | `seeds` | 非空、不重复的非负整数评估种子列表 |
-| `observation_noise` / `reset_mode` | v1 支持 `false` 与 `nominal`，即关闭观测噪声、使用标称重置 |
+| `observation_noise` / `reset_mode` | 当前支持 `false` 与 `nominal`，即关闭观测噪声、使用标称重置 |
 | `ranges` | 高度与骨盆偏移单位 m，平移速度 m/s，转向速度 rad/s；高度下界为负，骨盆区间包含零 |
 | `resampling_time_range` | 指令重采样间隔范围，单位秒 |
 | `disturbance_interval_s` | 上肢目标重采样间隔范围，单位秒 |
-| `upper_body_motion` | 上肢参考版本及运动上限；v2 使用 `quintic_v1`，省略该字段按历史 `step_v1` 解释 |
+| `upper_body_motion` | 渐进轨迹的速度、加速度和最短时长；省略时使用评估默认值 `2.0 / 8.0 / 0.5`，建议显式填写 |
 | `upper_body_target_source` | 策略的上肢目标观测来源，默认 `final_goal`；此前渐进参考观测模型使用 `reference`，此项参与配置哈希及兼容性检查 |
 | `pelvis_target_speed_mps` / `pelvis_zero_probability` | 有效骨盆目标的最大平滑速度（m/s）；静止模式采样零骨盆偏移的概率 |
 | `envelope` | 蹲行深度比例与最深可行走高度处的前进、转向上限锚点，沿用训练的梯形包络语义 |
@@ -259,7 +258,7 @@ uv run python -m g1.rl eval --resume outputs/eval/deep_compare
 
 **控制与统计时序。** 终止状态在物理重置前提取，每步使用实际执行的有效指令计算误差。测试控制器在策略观测前发布新指令和上肢最终目标；共享运动组件在动作应用时推进渐进参考。观测按 `upper_body_target_source` 选择最终目标或当前 PD 参考，段接续时的提示时机见 [观测与续训](UPPER_BODY_MOTION.md#观测与续训)。
 
-**固定场景。** v1/v2 关闭课程和训练随机化事件，包括 Phase 2 质量、摩擦、执行器增益随机化和 Phase 3 外部推扰。每个 batch 调用统一环境重置：根与关节恢复标称状态，上肢位置目标对齐重置姿态，实际速度、目标速度和目标力矩归零，运行段与待执行目标清空。增加观测噪声时，需要扩展逐用例噪声回放和配置版本。
+**固定场景。** 两套内置配置均关闭课程和训练随机化事件，包括 Phase 2 质量、摩擦、执行器增益随机化和 Phase 3 外部推扰。每个 batch 调用统一环境重置：根与关节恢复标称状态，上肢位置目标对齐重置姿态，实际速度、目标速度和目标力矩归零，运行段与待执行目标清空。增加观测噪声时，需要扩展逐用例噪声回放和配置版本。
 
 **动作随机性。** `mean` 使用策略均值；`sample` 使用已保存的动作分布及独立 Torch 随机流，避免消耗场景随机序列。动作随机种子按 batch 和步组织，随机动作对照需保持相同 `num_envs` 和回合编排。
 
@@ -386,18 +385,19 @@ $env:G1_EVAL_PHYSICS_SMOKE = '1'
 uv run --extra isaacsim pytest tests/test_eval_physics.py --basetemp outputs/pytest-eval-physx-local -q
 ```
 
-## 上肢运动版本
+## 上肢运动参数
 
-v2 套件使用五次渐进参考，运动速度、加速度和最短时长写入 `benchmark.upper_body_motion`。旧 v1 套件保留阶跃基线。配置和执行统计见 [上肢渐进扰动](UPPER_BODY_MOTION.md)。自定义 suite 若省略此字段，按历史 `step_v1` 解释；建议显式填写。
+所有套件统一使用五次渐进参考，运动速度、加速度和最短时长写入 `benchmark.upper_body_motion`。配置和执行统计见 [上肢渐进扰动](UPPER_BODY_MOTION.md)。自定义 suite 建议显式填写该字段。
 
 ```yaml
 benchmark:
   upper_body_target_source: final_goal
   upper_body_motion:
-    profile: quintic_v1
     max_velocity: 2.0
     max_acceleration: 8.0
     min_duration_s: 0.5
 ```
 
 `final_goal` 显示当前段的最终目标，空闲且存在待执行目标时提前显示该目标；执行器继续按既有时序追踪渐进参考。`reference` 显示当前 PD 位置参考，用于复测此前以参考位置作为观测的渐进模型。eval 会识别旧配置的观测来源，并检查它与 suite 的设置是否一致，详细规则见 [观测与续训](UPPER_BODY_MOTION.md#观测与续训)。
+
+此前带版本后缀的内置名称统一为 `g1_core`、`g1_robustness`。旧自定义 YAML 中的 `upper_body_motion.profile` 应删除；格式字段 `schema_version: 1` 继续保留。旧输出目录保留历史结果，新源码与配置需要新建评估目录。

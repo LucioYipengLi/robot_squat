@@ -18,6 +18,7 @@ from g1.tasks.lower_limb_agent.evaluation import (
 def benchmark():
     return {
         "control_dt": 1 / 60,
+        "upper_body_motion": {"max_velocity": 2.0, "max_acceleration": 8.0, "min_duration_s": 0.5},
         "episode_length_s": 6.0,
         "mode_weights": [0.25] * 4,
         "observation_noise": False,
@@ -147,7 +148,16 @@ class _Robot:
             joint_pos_limits=SimpleNamespace(torch=torch.tensor([[[-1.0, 2.0], [-0.5, 0.5]]]).repeat(n, 1, 1)),
             default_root_pose=SimpleNamespace(torch=root),
         )
+        self.data.joint_pos = SimpleNamespace(torch=self.data.default_joint_pos.torch.clone())
         self.writes = []
+        self.actuators = SimpleNamespace(
+            target_command=SimpleNamespace(
+                set_position_index=lambda *, value, joint_ids, env_ids=None: self.set_joint_position_target_index(
+                    target=value, joint_ids=joint_ids, env_ids=torch.arange(n) if env_ids is None else env_ids
+                ),
+                set_velocity_index=lambda **kwargs: None,
+            )
+        )
 
     def set_joint_position_target_index(self, *, target, joint_ids, env_ids):
         self.writes.append((target.clone(), list(joint_ids), env_ids.clone()))
@@ -178,12 +188,9 @@ def _controller(benchmark, arm_fraction=0.2, n=2):
         cfg=SimpleNamespace(_g1_eval_disturbance_groups=[{"asset_cfg": _Entity([0])}, {"asset_cfg": _Entity([1])}]),
     )
     controller = EvaluationScenarioController(env, benchmark, {"arm_fraction": arm_fraction, "waist_fraction": 0.1}, 42)
-    env.upper_body_motion = SimpleNamespace(
-        cfg=SimpleNamespace(profile="step_v1"),
-        set_goal=lambda ids, target, joints: env.scene["robot"].set_joint_position_target_index(
-            target=target, joint_ids=joints, env_ids=ids
-        ),
-    )
+    from g1.tasks.lower_limb_agent.motion import UpperBodyMotion, UpperBodyMotionCfg
+
+    env.upper_body_motion = UpperBodyMotion(env.scene["robot"], torch.tensor([0, 1]), UpperBodyMotionCfg())
     return controller, env, term
 
 
@@ -227,14 +234,43 @@ def test_amplitude_scan_reuses_normalized_targets_and_held_target_resets(benchma
         controller.update_commands()
         controller.before_step()
     assert low.plans == high.plans
-    low_target = low_env.scene["robot"].writes[-1][0][0]
-    high_target = high_env.scene["robot"].writes[-1][0][0]
+    low_target = low_env.upper_body_motion.get_observation_goal()[0]
+    high_target = high_env.upper_body_motion.get_observation_goal()[0]
     assert (high_target[0] - 0.25) / (low_target[0] - 0.25) == pytest.approx(0.555 / 0.2)
     assert high_target[1] == low_target[1]
     assert -1 <= high_target[0] <= 2
     low.start_batch(specs)
-    torch.testing.assert_close(low_env.scene["robot"].writes[-1][0], torch.tensor([[0.25, 0.1], [0.25, 0.1]]))
+    assert not low_env.scene["robot"].writes  # Batch assignment leaves reset/execution to the environment.
     assert low.context(0)["disturbance_count"] == 0
+
+
+@pytest.mark.parametrize("arm_fraction", [0.0, 0.2, 1.0])
+def test_training_and_eval_submit_identical_goals_for_identical_samples(benchmark, arm_fraction):
+    from g1.tasks.lower_limb_agent.mdp.events import UpperBodyDisturbanceEvent
+
+    controller, env, _ = _controller(benchmark, arm_fraction)
+    controller.start_batch([{"mode": 1, "episode_id": 9}, {"mode": 2, "episode_id": 17}])
+    groups = [
+        {"asset_cfg": SimpleNamespace(name="robot", joint_ids=[0]), "joint_noise_frac": arm_fraction},
+        {"asset_cfg": SimpleNamespace(name="robot", joint_ids=[1]), "joint_noise_frac": 0.1},
+    ]
+    env.command_manager.active_terms = []
+    event = UpperBodyDisturbanceEvent(SimpleNamespace(params={"disturb_groups": groups}), env)
+    with torch.random.fork_rng(devices=[]):
+        initial_rng = torch.get_rng_state()
+        samples = torch.rand(2, 2)
+        expected_rng = torch.get_rng_state()
+        # Reverse slot order to also check case/slot alignment.
+        for row, slot in enumerate((1, 0)):
+            controller.plans[slot].disturbances = {1: tuple(samples[row].tolist())}
+        torch.set_rng_state(initial_rng)
+        controller._publish_disturbances([(1, 1), (0, 1)])
+        assert torch.equal(torch.get_rng_state(), initial_rng)
+        expected_goals = env.upper_body_motion.get_observation_goal().clone()
+        env.upper_body_motion.reset(torch.arange(2))
+        event(env, torch.tensor([1, 0]), groups)
+        torch.testing.assert_close(env.upper_body_motion.get_observation_goal(), expected_goals, rtol=0, atol=0)
+        assert torch.equal(torch.get_rng_state(), expected_rng)
 
 
 def test_case_is_independent_of_slot_batch_and_other_env_failure(benchmark):
@@ -261,16 +297,16 @@ def test_upper_body_feedforward_target_is_published_before_policy_observation(be
     event_step = min(controller.plans[0].disturbances)
     env.episode_length_buf[0] = event_step - 1
     controller.update_commands()
-    default_target = env.scene["robot"].data.joint_pos_target.torch.clone()
+    default_target = env.upper_body_motion.get_observation_goal().clone()
     env.episode_length_buf[0] = event_step
     controller.update_commands()  # Command-manager compute precedes observation-manager compute.
-    observed_target = env.scene["robot"].data.joint_pos_target.torch.clone()
+    observed_target = env.upper_body_motion.get_observation_goal().clone()
     assert not torch.equal(default_target[0], observed_target[0])
     torch.testing.assert_close(default_target[1], observed_target[1])
     assert controller.context(0)["disturbance_count"] == 0
     controller.update_commands()  # Publishing the same observed state again is idempotent.
     controller.before_step()  # The policy now acts on the already-published cue.
-    torch.testing.assert_close(env.scene["robot"].data.joint_pos_target.torch, observed_target)
+    torch.testing.assert_close(env.upper_body_motion.get_observation_goal(), observed_target)
     assert controller.context(0)["disturbance_count"] == 1
     env.episode_length_buf[0] += 1
     controller.update_commands()

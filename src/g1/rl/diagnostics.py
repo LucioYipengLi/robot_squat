@@ -13,46 +13,14 @@ from g1.tasks.lower_limb_agent.mdp.curriculums import curriculum_step
 from .tensorboard_layout import ensure_performance_layout
 from .tensorboard_modes import ModeComparisonWriter
 
-_LEGACY_COMMAND_METRICS = (
-    "error_height",
-    "success_rate",
-    "error_vel_xy",
-    "error_vel_yaw",
-    "success_rate_vel",
-    "error_pelvis_xy",
-    "success_rate_pelvis_xy",
-)
-_LEGACY_RANGE_FIELDS = (
-    "height_offset_lo",
-    "height_offset_hi",
-    "height_offset_span",
-    "lin_vel_x_lo",
-    "lin_vel_x_hi",
-    "lin_vel_x_span",
-    "lin_vel_y_hi",
-    "lin_vel_y_span",
-)
 _TIME_AXIS_ALIASES = frozenset(("Train/mean_reward/time", "Train/mean_episode_length/time"))
 
 
-def _prune_legacy_extras(logger, command_names):
-    """Filter logger-owned copies, preserving environment extras and curriculum state."""
-    removed = {"Metrics/success_rate"}
-    removed.update(f"Metrics/{name}/{metric}" for name in command_names for metric in _LEGACY_COMMAND_METRICS)
-    removed.update(f"Curriculum/command_range/{field}" for field in _LEGACY_RANGE_FIELDS)
-    removed.update(
-        (
-            "Curriculum/upper_body_disturbance_magnitude/joint_noise_frac",
-            "Curriculum/squat_walk_mode_introduction/squat_walk_weight",
-        )
-    )
+def _prune_duplicate_extras(logger):
+    """Suppress upstream termination copies; mode-weighted diagnostics own these logs."""
     if hasattr(logger, "ep_extras"):
         logger.ep_extras[:] = [
-            {
-                key: value
-                for key, value in batch.items()
-                if key not in removed and not key.startswith("Episode_Termination/")
-            }
+            {key: value for key, value in batch.items() if not key.startswith("Episode_Termination/")}
             for batch in logger.ep_extras
         ]
 
@@ -86,8 +54,8 @@ def install_performance_logging(logger, env):
     """Use one sample-weighted diagnostic window per PPO log call, for any writer backend.
 
     RSL-RL averages reset-batch extras without their original sample counts. Writing our
-    already-reduced scalars directly avoids that bias. Superseded legacy outputs are removed
-    only from logging; their internal buffers and curriculum gate calculations remain intact.
+    already-reduced scalars directly avoids that bias. Command terms no longer
+    generate legacy metric copies; curriculum snapshots are retained separately.
     Only this runner's logger instance is adapted; upstream classes/modules stay untouched.
     """
     original = logger.log
@@ -156,7 +124,7 @@ def install_performance_logging(logger, env):
                 comparison_writer = ModeComparisonWriter(log_dir, monitored)
                 registered_log_dir = log_dir
             comparison_writer.add_scalars(published, iteration)
-        _prune_legacy_extras(logger, monitored)
+        _prune_duplicate_extras(logger)
         with _without_time_axis_aliases(logger.writer):
             return original(*args, **kwargs)
 

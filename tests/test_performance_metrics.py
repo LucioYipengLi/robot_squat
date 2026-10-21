@@ -200,7 +200,6 @@ def test_actual_disturbance_observer_preserves_targets_and_rng(monkeypatch, sele
     event = UpperBodyDisturbanceEvent.__new__(UpperBodyDisturbanceEvent)
     event._env = SimpleNamespace(device="cpu")
     event._joint_ids, event._num_joints, event._group_sizes = [0], 1, [1]
-    event.joint_target = torch.zeros(2, 1)
     event.robot = SimpleNamespace(
         data=SimpleNamespace(
             default_joint_pos=SimpleNamespace(torch=torch.zeros(2, 1)),
@@ -209,9 +208,11 @@ def test_actual_disturbance_observer_preserves_targets_and_rng(monkeypatch, sele
         set_joint_position_target_index=lambda **kwargs: None,
     )
     groups = [{"joint_noise_frac": 0.2}]
+    submitted = []
+    env.upper_body_motion.set_goal = lambda ids, goal, joints: submitted.append(goal.clone())
     rng = torch.get_rng_state()
     event(env, selection, groups)
-    targets, after = event.joint_target.clone(), torch.get_rng_state()
+    targets, after = submitted[-1], torch.get_rng_state()
     metrics = _drain(monitor)
     expected = 2 if selection is None or selection == slice(None) else 1
     assert (
@@ -220,5 +221,5 @@ def test_actual_disturbance_observer_preserves_targets_and_rng(monkeypatch, sele
     monkeypatch.setattr(monitor, "disturbance", lambda *args: None)
     torch.set_rng_state(rng)
     event(env, selection, groups)
-    torch.testing.assert_close(event.joint_target, targets)
+    torch.testing.assert_close(submitted[-1], targets)
     assert torch.equal(after, torch.get_rng_state())

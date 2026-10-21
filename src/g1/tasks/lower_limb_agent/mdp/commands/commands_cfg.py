@@ -7,72 +7,7 @@ from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKE
 from isaaclab.utils.configclass import configclass
 
 if TYPE_CHECKING:
-    from .commands import SquatWalkCommand, UniformHeightCommand
-
-@configclass
-class UniformHeightCommandCfg(CommandTermCfg):
-    """Configuration for the uniform pelvis height command generator."""
-
-    class_type: type["UniformHeightCommand"] | str = "{DIR}.commands:UniformHeightCommand"
-
-    asset_name: str = MISSING
-    """Name of the asset in the environment for which the commands are generated."""
-
-    resampling_time_range: tuple[float, float] = (5.0, 10.0)
-    """Time before commands are changed [s]. Defaults to (5.0, 10.0).
-
-    Mid-episode resampling forces the robot to adjust its pelvis height while standing,
-    which is itself part of the balance skill. Set to ``(math.inf, math.inf)`` to keep a
-    constant height per episode.
-    """
-
-    rel_default_envs: float = 0.0
-    """The sampled probability of environments that should stand at the nominal pelvis height. Defaults to 0.0.
-
-    For these environments, the height offset is forced to zero at resample time, so the
-    nominal standing pose is always covered in the training distribution.
-    """
-
-    @configclass
-    class Ranges:
-        """Uniform distribution ranges for the pelvis height command."""
-
-        height_offset: tuple[float, float] = MISSING
-        """Range for the pelvis height offset relative to the default standing pelvis height (in m).
-
-        Positive values command standing higher than the default pose, negative values
-        standing lower, e.g. ``(-0.1, 0.05)`` samples offsets between 10 cm below and
-        5 cm above the nominal pelvis height.
-        """
-
-    ranges: Ranges = MISSING
-    """Distribution ranges for the pelvis height command."""
-
-    height_success_threshold: float = 0.03
-    """Threshold on the per-episode mean pelvis height tracking error [m]. Defaults to 0.03.
-
-    An episode is flagged as successful if its mean tracking error stays below this value.
-    The episode success rate is logged under the unified ``Metrics/success_rate`` path.
-    """
-
-    goal_height_visualizer_cfg: VisualizationMarkersCfg = SPHERE_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/height_goal"
-    )
-    """The configuration for the goal pelvis height visualization marker. Defaults to a green
-    :obj:`SPHERE_MARKER_CFG` placed at the commanded height."""
-
-    current_height_visualizer_cfg: VisualizationMarkersCfg = SPHERE_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/height_current"
-    )
-    """The configuration for the current pelvis height visualization marker. Defaults to a blue
-    :obj:`SPHERE_MARKER_CFG` placed at the actual pelvis height."""
-
-    # Color and size of the visualization markers: green sphere for the commanded height,
-    # blue sphere for the actual pelvis height.
-    goal_height_visualizer_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 1.0, 0.0)
-    current_height_visualizer_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 0.0, 1.0)
-    goal_height_visualizer_cfg.markers["sphere"].radius = 0.1
-    current_height_visualizer_cfg.markers["sphere"].radius = 0.1
+    from .commands import SquatWalkCommand
 
 
 @configclass
@@ -189,16 +124,15 @@ class SquatWalkCommandCfg(CommandTermCfg):
     height_success_threshold: float = 0.03
     """Threshold on the per-episode mean pelvis height tracking error [m]. Defaults to 0.03.
 
-    The height-based episode success rate is logged under the unified ``Metrics/success_rate``
-    path, keeping comparability with the height-only task.
+    The shared monitor reports per-mode height success. The command-range
+    curriculum keeps a persisted success flag per environment.
     """
 
     vel_xy_success_threshold: float = 0.5
     """Threshold on the per-episode mean XY velocity tracking error norm [m/s]. Defaults to 0.5.
 
-    Note: the velocity error is accumulated over all modes (zero-command modes trivially
-    succeed), so the legacy logged mean is diluted by non-walking environments. The separate
-    Performance diagnostics report each mode without changing the curriculum gate.
+    Errors are sampled for every mode. Performance reports each mode separately;
+    the range curriculum masks persisted success flags to walking modes.
     """
 
     vel_yaw_success_threshold: float = 0.4

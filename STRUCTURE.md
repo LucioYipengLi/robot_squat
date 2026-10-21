@@ -10,7 +10,6 @@
 
 ```
 项目根/
-├── config/          # Isaac Sim 扩展清单（extension.toml）
 ├── src/             # 全部可导入代码（src-layout）
 ├── scripts/         # 命令行入口脚本
 ├── tests/           # 测试
@@ -22,27 +21,21 @@
 
 ---
 
-## 2. 两条装载通道
+## 2. 任务装载通道
 
-同一个包通过两套互不干扰的机制被加载，这是理解结构的关键前提：
+任务通过 `pyproject.toml` 的 `[project.entry-points."isaaclab.tasks"]` 注册，由训练、回放、遥操作和评估入口装载。示例 Kit UI 扩展已移除。
 
-| 通道 | 声明处 | 消费方 |
-|---|---|---|
-| **Kit 扩展** | `config/extension.toml` → `[[python.module]]` | Isaac Sim 编辑器（UI 扩展） |
-| **Python entry-point** | `pyproject.toml` → `[project.entry-points."isaaclab.tasks"]` | 训练 / 回放脚本（环境注册） |
-
-约定：**UI 扩展模块单独成文件，不与包根混写**。包根 `__init__.py` 保持"空"（只写 docstring、不做任何 import），从而让无图形环境下 `import <包名>` 不会拉入 `omni.*` 依赖。
+包根 `__init__.py` 保持为空，仅写 docstring，避免无图形环境下导入 `omni.*`。真实遥操作的 Kit 输入适配位于 `teleop/kit.py`，在仿真启动后加载。
 
 ---
 
 ## 3. 包内层级
 
-`src/<包名>/` 按职责分为资产、任务、运行适配、输入设备及 UI 入口：
+`src/<包名>/` 按职责分为资产、任务、运行适配及输入设备：
 
 ```
 src/<包名>/
 ├── __init__.py                  # 包根：只放 docstring，禁止 import
-├── <ui_module>.py               # Kit 扩展入口（omni.ext.IExt 子类）
 ├── rl/                          # 【运行适配层】训练/回放入口及 Runner 集成
 ├── teleop/                      # 【输入层】输入状态与设备适配，不加载模型或定义训练奖励
 │

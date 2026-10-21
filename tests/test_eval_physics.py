@@ -30,7 +30,7 @@ def test_real_headless_worker_and_tensorboard_artifact(tmp_path):
         check=False,
     )
     assert probe.returncode == 0, probe.stdout + probe.stderr
-    suite = load_suite("g1_robustness_v1")
+    suite = load_suite("g1_robustness")
     suite["suite"] = "g1_physics_smoke_v1"
     suite["benchmark"].update(
         episode_length_s=0.2, episodes_per_seed=4, seeds=[17], disturbance_interval_s=[0.033, 0.05]

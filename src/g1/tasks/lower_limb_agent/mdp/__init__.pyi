@@ -4,8 +4,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 __all__ = [
-    "UniformHeightCommandCfg",
-    "UniformHeightCommand",
     "SquatWalkCommandCfg",
     "SquatWalkCommand",
     "task_command_height",
@@ -51,8 +49,8 @@ __all__ = [
 # Forward stable MDP terms lazily, then override with environment-specific terms below.
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
-from .commands.commands import SquatWalkCommand, UniformHeightCommand
-from .commands.commands_cfg import SquatWalkCommandCfg, UniformHeightCommandCfg
+from .commands.commands import SquatWalkCommand
+from .commands.commands_cfg import SquatWalkCommandCfg
 from .curriculums import (
     command_range_curriculum,
     squat_walk_mode_introduction_curriculum,

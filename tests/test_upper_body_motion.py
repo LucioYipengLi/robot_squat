@@ -12,7 +12,7 @@ from g1.tasks.lower_limb_agent.mdp.observations import upper_body_joint_pos_targ
 from g1.tasks.lower_limb_agent.motion import UpperBodyMotion, UpperBodyMotionCfg
 
 
-def _motion(profile="quintic_v1", device="cpu"):
+def _motion(device="cpu"):
     positions, velocities = torch.full((3, 5), -9.0, device=device), torch.full((3, 5), -9.0, device=device)
 
     def write(buffer, value, joint_ids, env_ids=None):
@@ -31,7 +31,7 @@ def _motion(profile="quintic_v1", device="cpu"):
         ),
         actuators=SimpleNamespace(target_command=command),
     )
-    motion = UpperBodyMotion(robot, torch.tensor([3, 1], device=device), UpperBodyMotionCfg(profile=profile))
+    motion = UpperBodyMotion(robot, torch.tensor([3, 1], device=device), UpperBodyMotionCfg())
     return motion, positions, velocities
 
 
@@ -69,15 +69,6 @@ def test_reset_discards_pending_motion_and_keeps_other_slots_running():
     torch.testing.assert_close(motion.trajectory.position[1], torch.tensor([-0.03, 0.02]))
     assert not motion.trajectory.statistics[1].any()
     assert motion.trajectory.active[0]
-
-
-def test_step_profile_preserves_immediate_target_baseline():
-    motion, positions, _ = _motion("step_v1")
-    motion.set_goal(torch.tensor([0]), torch.tensor([[0.1, 0.2]]), [1, 3])
-    torch.testing.assert_close(positions[0, [1, 3]], torch.tensor([0.1, 0.2]))
-    snapshot = positions.clone()
-    motion.advance(0.1)
-    torch.testing.assert_close(positions, snapshot)
 
 
 @pytest.mark.parametrize("dt", [1 / 120, 1 / 60])
@@ -144,9 +135,8 @@ def test_goal_preview_tracks_executable_segment_without_changing_trajectory(devi
     read(c)
 
 
-@pytest.mark.parametrize("profile", ["quintic_v1", "step_v1"])
-def test_observation_keeps_joint_order_default_offsets_and_reference_option(profile):
-    motion, positions, _ = _motion(profile)
+def test_observation_keeps_joint_order_default_offsets_and_reference_option():
+    motion, positions, _ = _motion()
     motion.robot.data.default_joint_pos.torch[:] = torch.tensor([0.0, 0.1, 0.0, -0.2, 0.0])
     entity = SimpleNamespace(name="robot", joint_ids=motion.joint_ids)
     env = SimpleNamespace(scene={"robot": motion.robot}, upper_body_motion=motion)
@@ -157,7 +147,6 @@ def test_observation_keeps_joint_order_default_offsets_and_reference_option(prof
     torch.testing.assert_close(upper_body_joint_pos_target_rel(env, entity), expected)
     reference = positions[:, motion.joint_ids] - motion.robot.data.default_joint_pos.torch[:, motion.joint_ids]
     torch.testing.assert_close(upper_body_joint_pos_target_rel(env, entity, "reference"), reference)
-    if profile == "quintic_v1":
-        assert not torch.allclose(reference, expected)
+    assert not torch.allclose(reference, expected)
     with pytest.raises(ValueError, match="target source"):
         upper_body_joint_pos_target_rel(env, entity, "unknown")

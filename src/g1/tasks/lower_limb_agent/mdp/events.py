@@ -33,7 +33,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.managers import ManagerTermBase
-from isaaclab.utils.math import sample_uniform
+
+from ..disturbance import joint_targets_from_uniform
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
@@ -44,8 +45,8 @@ if TYPE_CHECKING:
 class UpperBodyDisturbanceEvent(ManagerTermBase):
     """上肢（双臂 + 腰部）随机干扰事件（interval 模式）。智能体无法控制这些关节。
 
-    在各组默认位姿附近随机采样最终关节目标，提交给共享运动组件。quintic_v1 生成渐进参考；
-    step_v1 保留历史阶跃基线。目标直接在关节空间采样。每个关节组（如手臂、腰部）的采样幅度
+    在各组默认位姿附近随机采样最终关节目标，提交给共享运动组件生成渐进参考。
+    目标直接在关节空间采样。每个关节组（如手臂、腰部）的采样幅度
     ``joint_noise_frac``（默认位姿→各方向限位余量的百分比，[0, 1]）可在 ``disturb_groups`` 中单独定义。
 
     该类继承 :class:`~isaaclab.managers.ManagerTermBase`（类式 EventTerm 的强制基类），由
@@ -53,10 +54,8 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
     ``cfg.params["disturb_groups"]`` 里每组的 :class:`SceneEntityCfg` 已被自动 resolve（``joint_ids``
     已填充）。
 
-    .. note::
-        缓存 :attr:`joint_target` 为全 env 尺寸（列序 = 各组 ``joint_ids`` 拼接序），在事件触发时
-        更新，回合重置时对齐真实关节位置。该缓存记录最新采样目标；策略观测按
-        ``target_source`` 从共享运动组件读取最终目标，或从机器人目标缓冲区读取执行参考。
+    事件仅采样和提交目标；轨迹状态及重置由共享运动组件和环境统一管理。
+    策略观测按 ``target_source`` 读取最终目标或执行参考。
     """
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
@@ -91,19 +90,6 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
             self._joint_ids.extend(joint_ids)
         self._num_joints = len(self._joint_ids)
 
-        # Keep the cache aligned with physical state before the first event too.
-        self.joint_target = self.robot.data.joint_pos.torch[:, self._joint_ids].clone()
-
-    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
-        """Discard cached targets from the ending episode after physical reset.
-
-        LowerLimbAgentEnv synchronizes actuator commands and velocities after all
-        manager resets, including paths without this interval event.
-        """
-        if env_ids is None:
-            env_ids = slice(None)
-        self.joint_target[env_ids] = self.robot.data.joint_pos.torch[env_ids][:, self._joint_ids]
-
     def __call__(
         self,
         env: ManagerBasedEnv,
@@ -134,23 +120,12 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
             frac[offset : offset + size] = group["joint_noise_frac"]
             offset += size
 
-        # 在「默认位姿 → 各方向关节限位」的余量内按 frac 采样：自动适配非对称限位（如 elbow）与组内
-        # ROM 差异（如 waist_yaw >> waist_roll），frac≤1 时目标恒落在限位内。
-        # -- default_joint_pos: (num_instances, num_joints) → 取触发 env 与上肢列 → (n, j)
-        # -- joint_pos_limits: (num_instances, num_joints, 2) [lower, upper] → (n, j, 2)
+        # 与 eval 共用非对称限位映射；Torch 随机样本数量和顺序沿用原 sample_uniform。
         limits = self.robot.data.joint_pos_limits.torch[env_ids][:, self._joint_ids]
-        lo, hi = limits[..., 0], limits[..., 1]
-        # -- 各方向余量（default→限位）；clamp_min(0) 防御 default 落在限位外导致负余量翻转采样区间
-        upper_margin = (hi - default_q).clamp_min(0.0)
-        lower_margin = (default_q - lo).clamp_min(0.0)
-        # -- sample_uniform 支持张量边界：逐关节**非对称**采样 [-frac·lower_margin, +frac·upper_margin]
-        noise = sample_uniform(-frac * lower_margin, frac * upper_margin, (n, self._num_joints), self.device)
-        q_target = default_q + noise
-        # -- frac≤1 时已在限位内；clamp 仅作数值安全网（兜住浮点误差与负余量退化情形）
-        q_target = torch.clamp(q_target, lo, hi)
+        samples = torch.rand(n, self._num_joints, device=self.device)
+        q_target = joint_targets_from_uniform(default_q, limits, frac, samples)
 
         # 仅更新触发的 env（遵守 env_ids 写入隔离，避免污染未触发 env）
-        self.joint_target[env_ids] = q_target
         # Sampling remains independent of execution; a running segment keeps its
         # endpoint and only its latest pending goal can be replaced.
         env.upper_body_motion.set_goal(env_ids, q_target, self._joint_ids)

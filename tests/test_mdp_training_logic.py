@@ -14,8 +14,8 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import RewardTermCfg
 
 from g1.tasks.lower_limb_agent.env import LowerLimbAgentEnv
-from g1.tasks.lower_limb_agent.mdp.commands.commands import SquatWalkCommand, UniformHeightCommand
-from g1.tasks.lower_limb_agent.mdp.commands.commands_cfg import SquatWalkCommandCfg, UniformHeightCommandCfg
+from g1.tasks.lower_limb_agent.mdp.commands.commands import SquatWalkCommand
+from g1.tasks.lower_limb_agent.mdp.commands.commands_cfg import SquatWalkCommandCfg
 from g1.tasks.lower_limb_agent.mdp.curriculums import (
     command_range_curriculum,
     upper_body_disturbance_magnitude_curriculum,
@@ -30,7 +30,7 @@ class _Scene(dict):
         self.env_origins = torch.zeros(num_envs, 3)
 
 
-def _command(kind, num_envs=2):
+def _command(num_envs=2):
     root_pos = torch.zeros(num_envs, 3)
     root_pos[:, 2] = 0.75
     root_pose = torch.zeros(num_envs, 7)
@@ -55,29 +55,22 @@ def _command(kind, num_envs=2):
         max_episode_length=360,
         termination_manager=SimpleNamespace(
             active_terms=["time_out", "bad_ori"],
-            get_term=lambda name: torch.zeros(num_envs, dtype=torch.bool),
+            get_term=lambda name: torch.full((num_envs,), name == "time_out", dtype=torch.bool),
             get_term_cfg=lambda name: SimpleNamespace(time_out=name == "time_out"),
         ),
         step_dt=1 / 60,
         sim=SimpleNamespace(vis_marker_registry=SimpleNamespace(clear_debug_vis_callback=lambda term: None)),
     )
-    if kind == "height":
-        cfg = UniformHeightCommandCfg(
-            asset_name="robot",
-            debug_vis=False,
-            ranges=UniformHeightCommandCfg.Ranges(height_offset=(0.0, 0.0)),
-        )
-        term = UniformHeightCommand(cfg, env)
-    else:
-        cfg = SquatWalkCommandCfg(
-            asset_name="robot",
-            debug_vis=False,
-            rel_mode_envs=(1.0, 0.0, 0.0, 0.0),
-            ranges=SquatWalkCommandCfg.Ranges(height_offset=(-0.15, 0.0)),
-        )
-        term = SquatWalkCommand(cfg, env)
-        term.pelvis_error_xy = lambda: torch.zeros(num_envs, 2)
+    cfg = SquatWalkCommandCfg(
+        asset_name="robot",
+        debug_vis=False,
+        rel_mode_envs=(1.0, 0.0, 0.0, 0.0),
+        ranges=SquatWalkCommandCfg.Ranges(height_offset=(-0.15, 0.0)),
+    )
+    term = SquatWalkCommand(cfg, env)
+    term.pelvis_error_xy = lambda: torch.zeros(num_envs, 2)
     term.height_command_world.fill_(0.75)
+    term.performance.reset(torch.arange(num_envs), term.mode, 0)
     return term, env
 
 
@@ -99,51 +92,47 @@ def test_action_acceleration_and_subset_resets():
     torch.testing.assert_close(reward(env), torch.tensor([4.0, 4.0]))
 
 
-@pytest.mark.parametrize("kind", ["height", "squat_walk"])
-def test_initial_reset_has_no_success_sample(kind):
-    term, env = _command(kind)
+def test_initial_reset_has_no_success_sample():
+    term, env = _command()
     assert term.reset(slice(None)) == {}
     assert "Metrics/success_rate" not in env.extras.get("log", {})
-    assert term._step_count.sum() == 0
-    if kind == "squat_walk":
-        assert not term.episode_metrics_valid.any()
+    assert term.performance.episode[:, 0].sum() == 0
+    assert not term.episode_metrics_valid.any()
 
 
-@pytest.mark.parametrize("kind", ["height", "squat_walk"])
-def test_terminal_frame_is_counted_once_and_survivors_are_not_double_counted(kind):
-    term, env = _command(kind)
+def test_terminal_frame_is_counted_once_and_survivors_are_not_double_counted():
+    term, env = _command()
     env.common_step_counter = 1
     env.episode_length_buf.fill_(1)
     env.scene["robot"].data.root_pos_w.torch[0, 2] = 0.5
     extras = term.reset(torch.tensor([0]))
-    torch.testing.assert_close(extras["error_height"], torch.tensor(0.25))
-    torch.testing.assert_close(env.extras["log"]["Metrics/success_rate"], torch.tensor(0.0))
-    if kind == "squat_walk":
-        assert term.episode_metrics_valid.tolist() == [True, False]
+    assert extras == {}
+    assert term.episode_success_rate[0] == 0
+    assert term.performance.drain(term._mode_probs)["Performance/stand/error_height_m"] == pytest.approx(0.25)
+    assert term.episode_metrics_valid.tolist() == [True, False]
     # Reproduce the manager's post-reset compute hook in this same control step.
     env.episode_length_buf[0] = 0
     term._update_metrics()
-    torch.testing.assert_close(term._step_count, torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(term.performance.episode[:, 0], torch.tensor([0.0, 1.0]))
     env.common_step_counter = 2
     env.episode_length_buf[:] = torch.tensor([1, 2])
     term._update_metrics()
-    torch.testing.assert_close(term._step_count, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(term.performance.episode[:, 0], torch.tensor([1.0, 2.0]))
 
 
-@pytest.mark.parametrize("kind", ["height", "squat_walk"])
-def test_empty_episodes_do_not_dilute_mixed_reset_statistics(kind):
-    term, env = _command(kind)
+def test_empty_episodes_do_not_dilute_mixed_reset_statistics():
+    term, env = _command()
     env.common_step_counter = 1
     env.episode_length_buf[0] = 1
     env.scene["robot"].data.root_pos_w.torch[0, 2] = 0.5
     extras = term.reset(slice(None))
-    torch.testing.assert_close(extras["error_height"], torch.tensor(0.25))
-    torch.testing.assert_close(env.extras["log"]["Metrics/success_rate"], torch.tensor(0.0))
+    assert extras == {}
+    assert term.episode_success_rate[0] == 0
+    assert term.performance.drain(term._mode_probs)["Performance/stand/error_height_m"] == pytest.approx(0.25)
 
 
-@pytest.mark.parametrize("kind", ["height", "squat_walk"])
-def test_episode_mean_includes_earlier_and_terminal_samples(kind):
-    term, env = _command(kind)
+def test_episode_mean_includes_earlier_and_terminal_samples():
+    term, env = _command()
     env.common_step_counter = 1
     env.episode_length_buf[0] = 1
     term._update_metrics()
@@ -151,25 +140,29 @@ def test_episode_mean_includes_earlier_and_terminal_samples(kind):
     env.episode_length_buf[0] = 2
     env.scene["robot"].data.root_pos_w.torch[0, 2] = 0.55
     extras = term.reset(torch.tensor([0]))
-    torch.testing.assert_close(extras["error_height"], torch.tensor(0.1))
+    assert extras == {}
+    assert term.episode_success_rate[0] == 0
+    assert term.performance.drain(term._mode_probs)["Performance/stand/error_height_m"] == pytest.approx(0.1)
 
 
 def test_terminal_velocity_and_pelvis_errors_are_included():
-    term, env = _command("squat_walk")
+    term, env = _command()
     env.common_step_counter = 1
     env.episode_length_buf[0] = 1
     term.vel_command_b[0] = torch.tensor([1.0, 0.0, 1.0])
     term.pelvis_error_xy = lambda: torch.tensor([[0.04, 0.0], [0.0, 0.0]])
     extras = term.reset(torch.tensor([0]))
-    torch.testing.assert_close(extras["error_vel_xy"], torch.tensor(1.0))
-    torch.testing.assert_close(extras["error_vel_yaw"], torch.tensor(1.0))
-    torch.testing.assert_close(term.episode_success_rate_vel[0], torch.tensor(0.0))
-    assert extras["error_pelvis_xy"] == pytest.approx(0.04)
-    assert extras["success_rate_pelvis_xy"] == 0
+    assert extras == {}
+    assert term.episode_success_rate_vel[0] == 0
+    assert not term.metrics  # No superseded command-metric producer remains.
+    values = term.performance.drain(term._mode_probs)
+    assert values["Performance/stand/error_velocity_xy_mps"] == 1
+    assert values["Performance/stand/error_yaw_radps"] == 1
+    assert values["Performance/stand/error_pelvis_xy_m"] == pytest.approx(0.04)
 
 
 def test_performance_uses_old_mode_and_raw_failure_before_reset():
-    term, env = _command("squat_walk")
+    term, env = _command()
     term.reset(slice(None))
     term.mode[:] = torch.tensor([2, 3])
     term.performance.reset(torch.arange(2), term.mode, 0)
@@ -190,14 +183,12 @@ def test_performance_uses_old_mode_and_raw_failure_before_reset():
 
 
 def test_diagnostics_do_not_consume_rng_or_change_command_sampling(monkeypatch):
-    first, first_env = _command("squat_walk")
-    second, second_env = _command("squat_walk")
+    first, first_env = _command()
+    second, second_env = _command()
     for env in (first_env, second_env):
         env.common_step_counter = 1
         env.episode_length_buf.fill_(1)
-    monkeypatch.setattr(second.performance, "sample", lambda *args: None)
-    monkeypatch.setattr(second.performance, "finish", lambda *args, **kwargs: None)
-    monkeypatch.setattr(second.performance, "reset", lambda *args: None)
+    second.performance.drain(second._mode_probs)
     rng = torch.get_rng_state()
     first.reset(slice(None))
     after = torch.get_rng_state()
@@ -208,9 +199,8 @@ def test_diagnostics_do_not_consume_rng_or_change_command_sampling(monkeypatch):
     assert torch.equal(torch.get_rng_state(), after)
 
 
-@pytest.mark.parametrize("kind", ["height", "squat_walk"])
-def test_environment_captures_terminal_state_before_physical_reset_events(kind, monkeypatch):
-    term, env = _command(kind)
+def test_environment_captures_terminal_state_before_physical_reset_events(monkeypatch):
+    term, env = _command()
     term.reset(slice(None))
     env.common_step_counter = 1
     env.episode_length_buf[0] = 1
@@ -234,13 +224,12 @@ def test_environment_captures_terminal_state_before_physical_reset_events(kind, 
     monkeypatch.setattr(LowerLimbAgentEnv, "_reset_upper_body_targets", lambda self, ids: reset_order.append("targets"))
     project_env._reset_idx(torch.tensor([0]))
     assert reset_order == ["physical", "targets"]
-    torch.testing.assert_close(logged["error_height"], torch.tensor(0.25))
-    if kind == "squat_walk":
-        metrics = term.performance.drain(term._mode_probs)
-        assert metrics["Performance/stand/error_height_m"] == pytest.approx(0.25)
-        assert metrics["Performance/stand/failure_rate"] == 1
+    assert logged == {}
+    metrics = term.performance.drain(term._mode_probs)
+    assert metrics["Performance/stand/error_height_m"] == pytest.approx(0.25)
+    assert metrics["Performance/stand/failure_rate"] == 1
     term._update_metrics()
-    torch.testing.assert_close(term._step_count, torch.zeros(2))
+    torch.testing.assert_close(term.performance.episode[:, 0], torch.zeros(2))
 
 
 def _range_env():
@@ -413,7 +402,7 @@ def test_disturbance_rejects_invalid_task_success_gate(gate):
 
 
 def test_curriculum_consumes_previous_finalized_quality_without_changing_reset_order():
-    term, env = _command("squat_walk")
+    term, env = _command()
     env.max_episode_length = 10
     group = {"joint_noise_frac": 0.2}
     env.event_manager = SimpleNamespace(get_term_cfg=lambda name: SimpleNamespace(params={"disturb_groups": [group]}))

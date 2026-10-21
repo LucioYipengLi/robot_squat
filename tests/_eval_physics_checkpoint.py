@@ -22,7 +22,7 @@ from g1.tasks.lower_limb_agent.evaluation import prepare_env_cfg
 def main():
     checkpoint = Path(sys.argv[1])
     checkpoint.parent.mkdir(parents=True)
-    suite = load_suite("g1_core_v1")
+    suite = load_suite("g1_core")
     env_cfg, agent = resolve_task_config(suite["task"], "rsl_rl_cfg_entry_point", overrides=["physics=isaacsim_physx"])
     dump_yaml(str(checkpoint.parent / "params/env.yaml"), env_cfg)
     agent.actor.hidden_dims = [16]

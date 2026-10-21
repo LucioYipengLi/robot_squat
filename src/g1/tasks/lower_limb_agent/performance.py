@@ -82,14 +82,18 @@ class ModePerformanceMonitor:
         context = torch.stack((command[:, 0], command[:, 1:3].norm(dim=1), command[:, 3].abs()), dim=1)
         self.steps.index_add_(0, mode, torch.cat((valid[:, None].float(), context * valid[:, None]), dim=1))
 
-    def finish(self, env_ids, *, step, lengths, terminated, time_outs, reasons, max_steps) -> None:
-        """Use accumulated terminal samples and capture raw terms before termination-manager reset."""
+    def finish(self, env_ids, *, step, lengths, terminated, time_outs, reasons, max_steps):
+        """Log eligible episodes and return nonempty tracking results for range gates."""
         ids = env_ids[~self.reported[env_ids]]
         count = self.episode[ids, 0]
         has_samples = count > 0
         natural = terminated[ids] | time_outs[ids]
         full = self.observed[ids] & (count == lengths[ids]) & (count == step - self.start_step[ids])
         mixed = self.mixed[ids]
+        means = self.episode[ids, 1:4] / count.clamp_min(1)[:, None]
+        height_ok = means[:, 0] < self.thresholds[0]
+        velocity_ok = (means[:, 1] < self.thresholds[1]) & (means[:, 2] < self.thresholds[2])
+        tracking = ids[has_samples], height_ok[has_samples], velocity_ok[has_samples]
         self.excluded.add_(
             torch.stack(
                 (
@@ -99,12 +103,11 @@ class ModePerformanceMonitor:
                 )
             )
         )
-        ids = ids[has_samples & natural & full & ~mixed]
+        eligible = has_samples & natural & full & ~mixed
+        ids = ids[eligible]
         sums = self.episode[ids]
         count = sums[:, 0]
-        means = sums[:, 1:4] / count[:, None]
-        height_ok = means[:, 0] < self.thresholds[0]
-        velocity_ok = (means[:, 1] < self.thresholds[1]) & (means[:, 2] < self.thresholds[2])
+        means, height_ok, velocity_ok = means[eligible], height_ok[eligible], velocity_ok[eligible]
         complete = time_outs[ids] & ~terminated[ids]
         pelvis_mean = sums[:, 4] / sums[:, 5].clamp_min(1)
         pelvis_ok = (sums[:, 5] == 0) | (pelvis_mean < self.thresholds[3])
@@ -154,6 +157,7 @@ class ModePerformanceMonitor:
                 },
             )
         self.reported[env_ids] = True
+        return tracking
 
     def task_success_rate(self) -> torch.Tensor:
         """Mean latest valid episode success per environment; zero before any result."""

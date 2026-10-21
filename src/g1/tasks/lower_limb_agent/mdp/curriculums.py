@@ -77,14 +77,10 @@ def command_range_curriculum(
     *upper bound* -- it is reached only if the agent can still track it above the gate.
 
     Note:
-        * The gates read the command term's ``episode_success_rate`` / ``episode_success_rate_vel``
-          buffers -- dedicated per-episode buffers holding each env's last finalized success. They are
-          kept separate from ``term.metrics`` because the base ``CommandTerm.reset`` zeroes ``metrics``
-          right after logging it, while this curriculum runs *before* the next reset and would otherwise
-          always read zeros. Only envs with a finalized, nonempty episode enter the mean. The velocity
-          gate masks by ``last_mode`` to match the episode that produced each stored metric. Due to
-          manager ordering, the batch ending now is finalized after this curriculum call; these are
-          the most recently finalized buffers, not statistics from the live unfinished episodes.
+        * Gates read the command term's persisted tracking flags, produced by the shared
+          performance monitor's episode reduction. Nonempty-episode eligibility remains
+          unchanged. This curriculum runs before command reset finalizes the current batch,
+          so it sees previously finalized results; the velocity mask uses their last_mode.
         * An update is checked on the first reset at least ``update_period`` control steps after the
           previous check. Duplicate calls in one step cannot update twice; missed intervals do not
           cause a catch-up burst. Each increment therefore has time for the gate to react.
@@ -104,14 +100,12 @@ def command_range_curriculum(
 
     Returns:
         Curriculum state logged under ``Curriculum/<term_name>/<key>``: the two gate signals plus each
-        expanding range's live bounds (``*_lo``/``*_hi``) and width (``*_span``).
+        signal. Live sampling bounds are recorded once under TaskDistribution.
     """
     term = env.command_manager.get_term(command_name)
     ranges = term.cfg.ranges
 
-    # -- gate signals: read the command term's *persisted* per-episode success buffers, NOT
-    #    ``term.metrics`` -- the base ``CommandTerm.reset`` zeroes ``metrics`` after logging, and this
-    #    curriculum runs before the next reset, so ``metrics`` would always read ~0 here (no GPU->CPU sync).
+    # Persisted flags survive episode reset; logging windows remain independent.
     valid = term.episode_metrics_valid.to(term.episode_success_rate.dtype)
     height_success = (term.episode_success_rate * valid).sum() / valid.sum().clamp_min(1.0)
     # WALK and SQUAT_WALK episodes; static modes cannot dilute the velocity gate.
@@ -137,18 +131,7 @@ def command_range_curriculum(
             flo, fhi = lin_vel_y_final
             ranges.lin_vel_y = (max(lo - vel_step, flo), min(hi + vel_step, fhi))
 
-    return {
-        "height_success": height_success,
-        "height_offset_lo": ranges.height_offset[0],
-        "height_offset_hi": ranges.height_offset[1],
-        "height_offset_span": ranges.height_offset[1] - ranges.height_offset[0],
-        "vel_success": vel_success,
-        "lin_vel_x_lo": ranges.lin_vel_x[0],
-        "lin_vel_x_hi": ranges.lin_vel_x[1],
-        "lin_vel_x_span": ranges.lin_vel_x[1] - ranges.lin_vel_x[0],
-        "lin_vel_y_hi": ranges.lin_vel_y[1],
-        "lin_vel_y_span": ranges.lin_vel_y[1] - ranges.lin_vel_y[0],
-    }
+    return {"height_success": height_success, "vel_success": vel_success}
 
 
 def upper_body_disturbance_magnitude_curriculum(
@@ -201,7 +184,7 @@ def upper_body_disturbance_magnitude_curriculum(
     Returns:
         Curriculum state logged under ``Curriculum/<term_name>/<key>``: the survival EMA gate signal
         (``survival_ema``), validity flag, completed-episode count, ``task_success_rate``
-        and disturbance magnitude.
+        signals. Amplitude is recorded once under TaskDistribution.
     """
     # live reference to the event term cfg (get_term_cfg returns the stored object, not a copy);
     # the target group's joint_noise_frac is a plain Python float re-read by the event on every fire.
@@ -264,7 +247,6 @@ def upper_body_disturbance_magnitude_curriculum(
         "survival_valid": float(state["initialized"]),
         "survival_episodes": state["total_episodes"],
         "task_success_rate": task_success,
-        "joint_noise_frac": frac,
     }
 
 
@@ -313,8 +295,7 @@ def squat_walk_mode_introduction_curriculum(
     Note:
         * One-shot: the weights are rewritten exactly once per env (latched in environment state); later
           calls only report state. ``target_mode_weights`` need not sum to 1 (``multinomial`` normalizes).
-        * No GPU->CPU sync on the hot path: the returned ``squat_walk_weight`` is a 0-dim tensor (like
-          :func:`command_range_curriculum`'s signals); the latch check is pure Python.
+
 
     Args:
         env: The environment instance.
@@ -326,9 +307,8 @@ def squat_walk_mode_introduction_curriculum(
             trigger; the SQUAT_WALK slot (index 3) must be positive to actually introduce the mode.
 
     Returns:
-        Curriculum state logged under ``Curriculum/<term_name>/<key>``: ``squat_walk_weight`` (the live
-        SQUAT_WALK weight, index 3 of ``_mode_probs``) and ``introduced`` (1.0 once switched, else 0.0), so the
-        switch moment is visible in TensorBoard.
+        ``introduced`` (1.0 once switched, otherwise 0.0). Actual mode weights
+        are logged once as sampling_probability by the performance monitor.
     """
     term = env.command_manager.get_term(command_name)
 
@@ -347,6 +327,5 @@ def squat_walk_mode_introduction_curriculum(
         introduced = True
 
     return {
-        "squat_walk_weight": term._mode_probs[3],
         "introduced": float(introduced),
     }

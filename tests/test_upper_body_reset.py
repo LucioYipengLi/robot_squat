@@ -78,8 +78,7 @@ def test_reset_discards_stale_commands_after_physical_reset(monkeypatch, env_ids
             {"asset_cfg": SimpleNamespace(name="robot", joint_ids=[4])},
         ]
         event = UpperBodyDisturbanceEvent(SimpleNamespace(params={"disturb_groups": groups}), project_env)
-        torch.testing.assert_close(event.joint_target, robot.data.joint_pos.torch[:, [1, 4]])
-        event.joint_target.fill_(-5)
+        assert not hasattr(event, "joint_target")
 
     # Deliberately different from both the old pose and authored defaults.
     reset_pose = robot.data.joint_pos.torch.clone() + 0.03
@@ -115,23 +114,6 @@ def test_reset_discards_stale_commands_after_physical_reset(monkeypatch, env_ids
     torch.testing.assert_close(command.velocity, expected_velocity_targets)
     torch.testing.assert_close(command.effort, expected_effort)
     assert torch.equal(torch.get_rng_state(), rng_state)
-    if event is not None:
-        expected_cache = torch.full_like(event.joint_target, -5)
-        expected_cache[env_ids] = reset_pose[env_ids][:, [1, 4]]
-        torch.testing.assert_close(event.joint_target, expected_cache)
-
-
-def test_event_reset_none_clears_every_cached_target():
-    robot = _Robot()
-    env = SimpleNamespace(scene={"robot": robot})
-    cfg = SimpleNamespace(params={"disturb_groups": [{"asset_cfg": SimpleNamespace(name="robot", joint_ids=[1, 4])}]})
-    event = UpperBodyDisturbanceEvent(cfg, env)
-    event.joint_target.fill_(-5)
-    robot.data.joint_pos.torch.add_(0.02)
-
-    event.reset()
-
-    torch.testing.assert_close(event.joint_target, robot.data.joint_pos.torch[:, [1, 4]])
 
 
 def test_reset_log_preserves_each_episode_sample_before_statistics_are_cleared(monkeypatch):

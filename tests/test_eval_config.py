@@ -17,8 +17,8 @@ from g1.rl.evaluation.modules import conditions
 
 
 def test_builtin_suites_use_same_schema_and_independent_exact_mode_quotas():
-    core = load_suite("g1_core_v1")
-    robustness = load_suite("g1_robustness_v1")
+    core = load_suite("g1_core")
+    robustness = load_suite("g1_robustness")
     assert set(core["benchmark"]) == set(robustness["benchmark"])
     assert core["benchmark"]["control_dt"] == 1 / 60
     assert core["benchmark"]["envelope"] == {"depth_frac": 0.8, "vx_floor": 0.2, "wz_floor": 0.3}
@@ -79,7 +79,7 @@ def test_invalid_or_insufficient_mode_budgets_fail_early(episodes, weights):
 
 
 def test_external_yaml_normalization_detaches_values_and_digest_is_order_independent(tmp_path):
-    source = load_suite("g1_robustness_v1")
+    source = load_suite("g1_robustness")
     source["policy_outputs"] = ["mean", "sample"]
     source["modules"][1]["arm_fractions"] = [0.555, 0.2, 0.4, 0.3]
     path = tmp_path / "custom.yaml"
@@ -140,7 +140,7 @@ def test_external_yaml_normalization_detaches_values_and_digest_is_order_indepen
     ],
 )
 def test_strict_schema_rejects_invalid_or_unknown_values(path, value):
-    source = load_suite("g1_core_v1")
+    source = load_suite("g1_core")
     target = source
     for key in path[:-1]:
         target = target[key]
@@ -162,18 +162,18 @@ def test_strict_schema_rejects_invalid_or_unknown_values(path, value):
     ],
 )
 def test_invalid_module_parameters_fail_before_expansion(module):
-    source = load_suite("g1_core_v1")
+    source = load_suite("g1_core")
     source["modules"] = [module]
     with pytest.raises(ValueError):
         conditions(source)
 
 
 def test_duplicate_modules_missing_fields_and_absent_files_are_actionable(tmp_path):
-    source = load_suite("g1_core_v1")
+    source = load_suite("g1_core")
     source["modules"] *= 2
     with pytest.raises(ValueError, match="Duplicate evaluation module"):
         validate_suite(source)
-    source = load_suite("g1_core_v1")
+    source = load_suite("g1_core")
     del source["benchmark"]["ranges"]["lin_vel_x"]
     with pytest.raises(ValueError, match="Missing fields"):
         validate_suite(source)
@@ -185,7 +185,7 @@ def test_fraction_axis_steps_are_exact_and_policy_output_default_is_explicit():
     assert fraction_axis_step(0) == 0
     assert fraction_axis_step(0.555) == 555
     assert fraction_axis_step(1) == 1000
-    source = load_suite("g1_core_v1")
+    source = load_suite("g1_core")
     del source["policy_outputs"]
     assert validate_suite(source)["policy_outputs"] == ["mean"]
     with pytest.raises(ValueError, match="0.001"):

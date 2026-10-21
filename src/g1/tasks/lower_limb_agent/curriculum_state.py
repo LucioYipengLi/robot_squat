@@ -224,13 +224,6 @@ def import_curriculum_state(env, state, *, evaluation=False):
         runtime[f"survival:{EVENT_NAME}:0"] = {"last_update_step": step}
     env._g1_curriculum_state = runtime
     for name in (
-        "_error_height_sum",
-        "_error_xy_sum",
-        "_error_yaw_sum",
-        "_step_count",
-        "_pelvis_error_sum",
-        "_pelvis_success_sum",
-        "_pelvis_step_count",
         "episode_success_rate",
         "episode_success_rate_vel",
         "episode_metrics_valid",

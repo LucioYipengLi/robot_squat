@@ -1,9 +1,8 @@
 schema_version: 1
-suite: g1_core_v2
+suite: g1_core
 task: Template-G1-v0
 benchmark:
   upper_body_motion:
-    profile: quintic_v1
     max_velocity: 2.0
     max_acceleration: 8.0
     min_duration_s: 0.5

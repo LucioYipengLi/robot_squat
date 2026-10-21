@@ -77,7 +77,7 @@ def run(argv: list[str]) -> int:
         else:
             from .config import load_suite, validate_suite
 
-            config = load_suite(args.suite or "g1_core_v2")
+            config = load_suite(args.suite or "g1_core")
             if args.task:
                 config["task"] = args.task
             if args.policy_output:
