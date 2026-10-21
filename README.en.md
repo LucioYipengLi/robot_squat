@@ -47,8 +47,8 @@ environment.
 
 ### Shared training entrypoint
 
-Use `python -m g1.rl train/play` for training, resumption and evaluation, and the same entrypoint's `teleop`
-subcommand for manual control.
+Use `python -m g1.rl train` for training/resumption, `play` for playback, `teleop` for manual control,
+and `eval` for fixed-condition checkpoint comparisons.
 The project entrypoint stores the model and live curriculum state in one checkpoint, so Phase 2/3 automatically
 inherit the preceding phase's task distribution. It currently supports the Torch environment frontend and
 single-process RSL-RL `OnPolicyRunner`; no additional RL library option is needed.
@@ -120,6 +120,20 @@ Checkpoints are saved under `logs/rsl_rl/<experiment_name>/<run>/model_*.pt` by 
 Standard `uv run isaaclab train/play --task ...` uses the upstream Runner and does not save or restore project
 curriculum state; use the project entrypoint throughout this workflow. Legacy checkpoints without curriculum
 metadata require an explicit `--curriculum-snapshot "<curriculum.json>"`; see [curriculum checkpoint details](docs/CURRICULUM_CHECKPOINTS.md) (Chinese).
+
+### Fixed-condition batch evaluation
+
+Run compatible checkpoints against a versioned suite with fixed episode quotas and replayable task inputs.
+The initial modules cover four-mode tracking and upper-body disturbance sweeps; evaluation always runs headless.
+
+```bash
+uv run --extra isaacsim python -m g1.rl eval --suite g1_robustness_v2 --checkpoints "early=<early_model.pt>" "late=<late_model.pt>" --policy-output both --num_envs 128
+```
+
+The terminal shows overall/episode progress, execution stages and estimated remaining time; use `--progress plain`
+or `--progress off` to change the display. Results include per-episode records, summary tables and TensorBoard checkpoint comparisons. The built-in suites
+use nominal resets and disable observation noise. See the [evaluation guide](docs/EVALUATION.md) (Chinese)
+for configuration, metrics, resume commands and module extension.
 
 ### Policy teleoperation and visualization
 
@@ -267,3 +281,5 @@ Add the project root to the Isaac Sim Extension Manager search paths, refresh, a
 If Pylance or basedpyright cannot resolve modules, confirm that the selected interpreter matches the one used to run the
 setup command, then reload the editor window. To add a missing extension or reduce indexing memory, edit the `extraPaths`
 array in the root `pyrightconfig.json`; remove simulator extension directories that the project does not use.
+
+Upper-body disturbances use progressive references by default. See [upper-body motion](docs/UPPER_BODY_MOTION.md) for configuration, exposure metrics, and checkpoint compatibility.

@@ -23,6 +23,7 @@ from g1.tasks.lower_limb_agent.curriculum_state import (
     import_curriculum_state,
 )
 from g1.tasks.lower_limb_agent.mdp.curriculums import curriculum_step, upper_body_disturbance_magnitude_curriculum
+from g1.tasks.lower_limb_agent.performance import ModePerformanceMonitor
 
 
 class _Environment:
@@ -58,6 +59,7 @@ class _Environment:
         ):
             setattr(self.term, name, torch.zeros(num_envs))
         self.term.episode_metrics_valid = torch.zeros(num_envs, dtype=torch.bool)
+        self.term.performance = ModePerformanceMonitor(num_envs, "cpu", self.step_dt, (0.03, 0.5, 0.4, 0.02))
         self.command_manager = SimpleNamespace(get_term=lambda name: self.term)
         self.event = copy.deepcopy(self.cfg.events.upper_body_disturbance)
         self.event_manager = SimpleNamespace(get_term_cfg=lambda name: self.event)
@@ -104,6 +106,7 @@ def _trained(phase=1):
 def test_same_phase_roundtrip_is_portable_and_starts_fresh_episodes():
     source = _trained()
     saved = export_curriculum_state(source)
+    assert saved["upper_body_target_source"] == "final_goal"
     assert json.loads(json.dumps(saved)) == saved
     target = _Environment(num_envs=5)
     target.term._error_height_sum.fill_(100)
@@ -123,6 +126,31 @@ def test_same_phase_roundtrip_is_portable_and_starts_fresh_episodes():
     assert export_curriculum_state(target) == saved
     source.term.cfg.ranges.height_offset = (-0.4, 0.05)
     assert saved["distribution"]["ranges"]["height_offset"] == [-0.31, 0.04]
+
+
+def test_finetuning_keeps_selected_observation_source_and_exports_new_semantics():
+    source = _trained()
+    source.cfg.observations.policy.upper_body_target.params["target_source"] = "reference"
+    saved = export_curriculum_state(source)
+    assert saved["upper_body_target_source"] == "reference"
+    target = _Environment()
+    import_curriculum_state(target, saved)
+    assert target.cfg.observations.policy.upper_body_target.params["target_source"] == "final_goal"
+    assert export_curriculum_state(target)["upper_body_target_source"] == "final_goal"
+
+
+@pytest.mark.parametrize("phase,evaluation", [(1, False), (2, False), (1, True)])
+def test_restore_rebuilds_task_success_without_extending_checkpoint_schema(phase, evaluation):
+    saved = export_curriculum_state(_trained())
+    assert "task_success_rate" not in saved["runtime"]["survival"]
+    target = _Environment(phase, evaluation=evaluation)
+    target.term.performance.latest_joint_success.fill_(True)
+    target.term.performance.latest_joint_success_valid.fill_(True)
+    import_curriculum_state(target, saved, evaluation=evaluation)
+    assert target.term.performance.task_success_rate() == 0
+    assert not target.term.performance.latest_joint_success_valid.any()
+    if phase == 1 and not evaluation:
+        assert target._g1_curriculum_state[f"survival:{EVENT_NAME}:0"]["ema"] == pytest.approx(0.91)
 
 
 @pytest.mark.parametrize("phase", [2, 3])

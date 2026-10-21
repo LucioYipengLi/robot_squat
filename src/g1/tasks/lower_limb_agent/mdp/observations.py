@@ -45,16 +45,17 @@ def task_command_pelvis_xy(env: ManagerBasedRLEnv, command_name: str = "task_com
 
 
 def upper_body_joint_pos_target_rel(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),  # noqa: B008
+    target_source: str = "final_goal",
 ) -> torch.Tensor:
-    """Upper-body joint PD targets relative to their default positions [rad].
+    """Upper-body goals relative to default joint positions [rad].
 
-    Returns the commanded PD position targets for the upper-body joints in ``asset_cfg``
-    (arms + waist) minus their default positions. These targets are written by
-    ``UpperBodyDisturbanceEvent`` and, per the manager-based step order (interval events fire
-    before observation computation), lead the actual limb motion by at least one step. Feeding
-    them to the policy gives the lower body a feed-forward cue to anticipate the momentum
-    disturbance produced by upper-limb motion.
+    ``final_goal`` reads the running segment endpoint, or the pending endpoint
+    while idle. A pending goal stays hidden until the current segment ends.
+    ``reference`` retains the earlier smooth-PD-reference observation. Both use
+    the same joint order, dimension and default-position offsets. The action
+    term resolves its upper-body joints from this term's asset configuration.
 
     Note:
         Only the *commanded* target enters this term. External pushes / contact act on the
@@ -62,6 +63,11 @@ def upper_body_joint_pos_target_rel(
         this reading, keeping target uncertainty and external disturbance decoupled.
     """
     asset = env.scene[asset_cfg.name]
-    target = asset.data.joint_pos_target.torch[:, asset_cfg.joint_ids]
+    if target_source == "final_goal":
+        target = env.upper_body_motion.get_observation_goal()
+    elif target_source == "reference":
+        target = asset.data.joint_pos_target.torch[:, asset_cfg.joint_ids]
+    else:
+        raise ValueError(f"Unsupported upper-body target source: {target_source}")
     default = asset.data.default_joint_pos.torch[:, asset_cfg.joint_ids]
     return target - default

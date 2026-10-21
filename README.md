@@ -44,7 +44,7 @@ uv run --extra isaacsim --extra rerun isaaclab random_agent --task <TASK_NAME> -
 
 ### 统一训练入口
 
-首次训练、同阶段续训和评估使用 `python -m g1.rl train/play`，人工控制使用同一入口的 `teleop` 子命令。
+训练与续训使用 `python -m g1.rl train`，模型回放使用 `play`，人工控制使用 `teleop`，固定条件批量评估使用 `eval`。
 项目入口将模型与实际课程状态保存在同一个检查点中，Phase 2/3 自动继承上一阶段的任务分布。
 目前支持 Torch 环境前端、单进程 RSL-RL `OnPolicyRunner`，无需额外指定 RL 库。
 
@@ -93,22 +93,35 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Phase3-v0 --che
 
 跨阶段继承实际任务分布和累计课程进度，重新积累新阶段条件下的门控统计。Phase 2/3 必须加载检查点，不能跳过阶段或逆向迁移。
 
-### 评估与回放
+### 模型回放
 
-使用与检查点相同阶段的任务 ID，例如评估 Phase 3：
+使用与检查点相同阶段的任务 ID，例如回放 Phase 3：
 
 ```bash
 uv run --extra isaacsim python -m g1.rl play --task Template-G1-Phase3-v0 --checkpoint "<phase3_model.pt>" physics=isaacsim_physx
 ```
 
-评估恢复指令范围与模式权重，由 `play_mode()` 关闭课程、观测噪声、物理随机化和扰动。
-续训和评估均从新回合开始，不接续原物理轨迹。
+回放恢复指令范围与模式权重，由 `play_mode()` 关闭课程、观测噪声、物理随机化和扰动。
+续训和回放均从新回合开始，不接续原物理轨迹。
 
 检查点默认位于 `logs/rsl_rl/<experiment_name>/<run>/model_*.pt`。
 标准 `uv run isaaclab train/play --task ...` 使用上游 Runner，不保存或恢复项目课程状态；上述流程请统一使用项目入口。
 缺少课程记录的旧检查点需显式提供 `--curriculum-snapshot "<curriculum.json>"`，详见 [课程检查点说明](docs/CURRICULUM_CHECKPOINTS.md)。
 
 项目训练入口额外记录逐模式性能和实际训练样本占比，自动接入 TensorBoard/W&B；指标含义、统计窗口及判读方法见 [训练性能指标](docs/TRAINING_METRICS.md)。
+
+### 批量固定条件评估
+
+`eval` 在 headless 模式下，用同一套固定测试用例比较多个检查点。首批模块包括基础四模式任务跟踪与上肢扰动比例扫描，支持均值动作、随机动作对照，以及中断后继续执行：
+
+```bash
+uv run --extra isaacsim python -m g1.rl eval --suite g1_robustness_v2 --checkpoints "early=<early_model.pt>" "late=<late_model.pt>" --policy-output both --num_envs 128 --headless
+```
+
+评估输出逐模式指标、汇总表与 TensorBoard 对比曲线；检查点提供策略，版本化测试套件统一控制指令、模式配额、回合长度和扰动条件。终端默认显示总体及回合进度、执行阶段和预计剩余时间，可用 `--progress plain` 或 `--progress off` 切换显示方式。内置基准采用固定初始姿态并关闭观测噪声，跨阶段比较会检查模型接口兼容性。
+
+套件配置、自定义实验、指标解释、日志查看和恢复执行见 [统一评估框架说明](docs/EVALUATION.md)。
+上肢扰动默认采用渐进参考，参数、执行统计与旧检查点说明见 [上肢渐进扰动](docs/UPPER_BODY_MOTION.md)。
 
 ### 模型遥操作与可视化
 
@@ -162,7 +175,7 @@ uv run --extra isaacsim isaaclab benchmark play --rl_library rsl_rl --task Templ
 
 `training/play` 基准必须显式指定 `--rl_library`，`startup/runtime` 不需要。`--output_path` 指定性能结果目录，默认格式为 `schema`；训练日志及模型仍写入 `logs/rsl_rl/`。
 
-这些基准使用上游 Runner，不保存或恢复项目课程状态。`training` 会更新模型，显式设置 `--max_iterations 10` 可避免按项目默认值训练 10000 次；正式三阶段续训仍使用项目入口。`play` 应选择与检查点同阶段的任务，用于测量运行性能；检查点任务分布的评估使用前文的 `python -m g1.rl play`。
+这些基准使用上游 Runner，不保存或恢复项目课程状态。`training` 会更新模型，显式设置 `--max_iterations 10` 可避免按项目默认值训练 10000 次；正式三阶段续训仍使用项目入口。`play` 应选择与检查点同阶段的任务，用于测量运行性能；交互回放使用项目 `play`，固定条件的模型能力比较使用项目 `eval`。
 
 使用 `physics=<PRESET>` 来选择 `isaaclab list_envs` 所展示的某个预设。
 

@@ -654,7 +654,11 @@ class SquatWalkCommand(CommandTerm):
 
         # -- stage 2: draw the per-episode task modes before the resample chain consumes them
         num = len(env_ids)
-        self.mode[env_ids] = torch.multinomial(self._mode_probs.expand(num, -1), num_samples=1).squeeze(-1)
+        evaluation = getattr(self, "_evaluation_controller", None)
+        if evaluation is None:
+            self.mode[env_ids] = torch.multinomial(self._mode_probs.expand(num, -1), num_samples=1).squeeze(-1)
+        else:
+            evaluation.assign_modes(env_ids)
         self.performance.reset(env_ids, self.mode, self._env.common_step_counter)
 
         # -- stage 3: let the base class log, zero metrics, and resample the command
@@ -701,6 +705,10 @@ class SquatWalkCommand(CommandTerm):
             env_ids: The environment indices to resample the command for.
         """
         env_ids = _resolve_env_ids(env_ids, self.num_envs, self.device)
+        evaluation = getattr(self, "_evaluation_controller", None)
+        if evaluation is not None:
+            evaluation.resample_command(env_ids)
+            return
         if self._manual_command is not None:
             self._apply_manual_command(env_ids)
             return
@@ -792,6 +800,9 @@ class SquatWalkCommand(CommandTerm):
 
     def _update_command(self):
         """每个控制步仅推进一次骨盆偏置目标；保持原高度和速度更新语义。"""
+        evaluation = getattr(self, "_evaluation_controller", None)
+        if evaluation is not None:
+            evaluation.update_commands()
         active = self.pelvis_tracking_mask
         self.pelvis_target_offset[~active] = 0.0
         delta = self.pelvis_target_offset - self.pelvis_offset

@@ -329,10 +329,15 @@ TensorBoard 的 [Custom Scalars](https://github.com/tensorflow/tensorboard/blob/
 | --- | --- | --- |
 | `Curriculum/command_range/height_success` | 各环境最近有效完成回合的高度成功标志均值，混合所有模式。 | > 0.99 时具备扩大高度范围的条件，还需等到检查时间。 |
 | `Curriculum/command_range/vel_success` | 最近有效行走、蹲走回合的速度成功标志均值。 | > 0.95 时具备扩大速度范围的条件，不保证下一帧立即扩大。 |
-| `Curriculum/upper_body_disturbance_magnitude/survival_ema` | 有效完成回合存活比例的指数移动平均。 | > 0.95 时具备增加双臂扰动的条件，变化慢于当前窗口均值。 |
+| `Curriculum/upper_body_disturbance_magnitude/survival_ema` | 有效完成回合存活比例的指数移动平均。 | > 0.95 且课程联合成功率 > 0.8 时具备增加双臂扰动的条件；EMA 变化慢于当前窗口均值。 |
+| `Curriculum/upper_body_disturbance_magnitude/task_success_rate` | 各环境最近一个有效已结束回合的联合成功标志均值；有效环境等权，复用正常超时、高度、平面速度、偏航及适用的骨盆误差判定。 | > 0.8 才允许推进扰动；0.8 是可调初值。存活 EMA 高而此项低，说明跟踪质量限制了推进。无有效结果时为 0。 |
 | `Curriculum/upper_body_disturbance_magnitude/survival_valid` | 生存 EMA 是否已经由有效窗口初始化，0/1。 | 为 0 时，不把 survival_ema=0 解释为全部失败。 |
 | `Curriculum/upper_body_disturbance_magnitude/survival_episodes` | 生存课程累计纳入的有效回合数，可包含恢复历史。 | 与 EMA 一起判断数据基础，不是当前窗口 episode_count。 |
 | `Curriculum/squat_walk_mode_introduction/introduced` | 蹲走是否已引入，0/1。 | 0→1 是任务变化点；当前约累计 400000 控制步触发，不代表已学会蹲走。 |
+
+扰动课程仍按原检查周期推进，只有两个信号都严格超过门槛才增加幅度。成功率缓存独立于日志窗口，普通回合重置和日志输出均保留，后续有效回合会替换该环境的旧结果。人工重置、部分回合与混合模式回合沿用已有排除规则。
+
+课程先于本次结束回合的结算运行，因此读取此前最近已结算结果。它与逐模式日志的联合成功率共用判定，但统计窗口和权重不同。恢复训练或跨阶段加载时重新收集成功率；存活 EMA 沿用既有恢复规则。
 
 表现下降会暂停部分课程推进，但不会自动降低已达到的难度。
 模式比例变化也会影响混合统计，课程成功率不宜单独用于比较模型性能。
@@ -407,3 +412,16 @@ TensorBoard 的 [Custom Scalars](https://github.com/tensorflow/tensorboard/blob/
 
 比较检查点时，优先统一模式、指令难度、扰动与评估条件。
 训练曲线用于定位问题，最终通过多回合回放或一致条件的评估确认。
+
+## 8. 渐进上肢运动：核对实际暴露
+
+`UpperBodyMotion/` 提供四项诊断，记录实际执行的运动段；原扰动次数仍表示目标采样事件。
+
+| 指标 | 定义与判断 |
+| --- | --- |
+| `started_per_episode` | 平均每回合开始的运动段数。与采样次数差距增大时，检查运动时长与等待情况。 |
+| `pending_replaced_per_episode` | 平均每回合被新采样替换的待执行目标数。持续偏高说明采样速度超过执行速度。 |
+| `reference_completion_rate` | 有运动回合内先算完成段数 / 开始段数，再按回合平均。偏低时结合回合长度和运动时长判断；它表示参考到达，与真实关节跟踪精度分开。 |
+| `mean_planned_duration_s` | 有运动回合内先算已开始段的平均计划时长，再按回合平均。较长意味着动作更慢，也会影响有限回合内的姿态覆盖。 |
+
+配置、评估的计数汇总口径与版本差异见 [上肢渐进扰动](UPPER_BODY_MOTION.md)。

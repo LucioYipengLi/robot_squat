@@ -124,13 +124,79 @@ def test_timeout_with_failure_is_not_a_success_and_disturbances_are_counted_at_a
     assert metrics["Performance/squat/disturbance_hz"] == pytest.approx(20)
 
 
+def test_latest_task_success_survives_log_drains_and_resets_then_replaces_each_environment():
+    monitor, mode = _monitor([0, 1, 2])
+    assert monitor.task_success_rate() == 0
+    assert not monitor.latest_joint_success_valid.any()
+    _sample(monitor, mode)
+    _finish(monitor, [0], 1, [1, 1, 1])
+    assert monitor.task_success_rate() == 1  # Unfinished environments are excluded.
+    _finish(monitor, [1], 1, [1, 1, 1], failures=[False, True, False])
+    assert monitor.task_success_rate() == 0.5
+    rng = torch.get_rng_state()
+    _drain(monitor)
+    monitor.reset(torch.tensor([0]), mode, 1)
+    _drain(monitor)
+    assert monitor.task_success_rate() == 0.5
+    assert torch.equal(rng, torch.get_rng_state())
+    _sample(monitor, mode, valid=torch.tensor([True, False, False]))
+    _finish(monitor, [0], 2, [1, 1, 1], failures=[True, False, False])
+    assert monitor.task_success_rate() == 0  # The latest failure replaces env 0's success.
+    _finish(monitor, [0], 2, [1, 1, 1])  # Duplicate finalization cannot replace it again.
+    assert monitor.task_success_rate() == 0
+    monitor.clear_task_success()
+    assert not monitor.latest_joint_success_valid.any()
+
+
+@pytest.mark.parametrize("failure", ["height", "velocity", "yaw", "pelvis", "termination"])
+def test_curriculum_snapshot_and_logged_joint_success_share_the_same_definition(failure):
+    monitor, mode = _monitor([0, 1, 2])
+    zeros = torch.zeros(3)
+    error = torch.tensor([0.0, 1.0, 0.0])
+    monitor.sample(
+        mode,
+        torch.ones(3, dtype=torch.bool),
+        error if failure == "height" else zeros,
+        error if failure == "velocity" else zeros,
+        error if failure == "yaw" else zeros,
+        error if failure == "pelvis" else zeros,
+        torch.zeros(3, 6),
+    )
+    _finish(monitor, [0, 1, 2], 1, [1, 1, 1], failures=[False, failure == "termination", False])
+    assert monitor.task_success_rate() == pytest.approx(2 / 3)
+    metrics = _drain(monitor)
+    assert metrics["Performance/stand/joint_success_rate"] == 1
+    assert metrics["Performance/squat/joint_success_rate"] == 0
+    assert metrics["Performance/walk/joint_success_rate"] == 1
+
+
+def test_ineligible_episodes_keep_the_previous_valid_snapshot():
+    monitor, mode = _monitor([0, 1, 2])
+    _sample(monitor, mode)
+    _finish(monitor, [0, 1, 2], 1, [1, 1, 1])
+    monitor.reset(torch.arange(3), mode, 1)
+    _sample(monitor, mode)
+    mode[2] = 3
+    _sample(monitor, mode)
+    _finish(monitor, [0, 1, 2], 3, [2, 6, 2], timeouts=[False, True, True])
+    assert monitor.latest_joint_success.all()
+    assert monitor.latest_joint_success_valid.all()
+    assert monitor.task_success_rate() == 1
+    monitor.clear_task_success()
+    assert not monitor.latest_joint_success_valid.any()
+    assert monitor.task_success_rate() == 0
+
+
 @pytest.mark.parametrize("selection", [None, slice(None), slice(1, 2), [1]])
 def test_actual_disturbance_observer_preserves_targets_and_rng(monkeypatch, selection):
     from g1.tasks.lower_limb_agent.mdp.events import UpperBodyDisturbanceEvent
 
     monitor, mode = _monitor([0, 3])
     term = SimpleNamespace(performance=monitor, mode=mode)
-    env = SimpleNamespace(command_manager=SimpleNamespace(active_terms=["task"], get_term=lambda name: term))
+    env = SimpleNamespace(
+        command_manager=SimpleNamespace(active_terms=["task"], get_term=lambda name: term),
+        upper_body_motion=SimpleNamespace(set_goal=lambda *args: None),
+    )
     event = UpperBodyDisturbanceEvent.__new__(UpperBodyDisturbanceEvent)
     event._env = SimpleNamespace(device="cpu")
     event._joint_ids, event._num_joints, event._group_sizes = [0], 1, [1]

@@ -6,8 +6,8 @@
 """上肢（双臂 + 腰部）随机干扰事件（loco-manipulation 鲁棒性训练）。
 
 本模块提供 interval 模式的事件项，把智能体**无法控制的上肢关节**（双臂 + 腰部）作为随机干扰源：
-周期性地在关节限位内采样各关节组的 PD 目标并写入目标缓冲区，由 implicit actuator 的 PD 每步逐步
-驱动这些关节运动，从而对浮动基下肢产生真实的 CoM 偏移与反作用力扰动。
+周期性地在关节限位内采样最终目标并提交给共享上肢运动组件。组件按物理步发布位置和速度参考，
+由 implicit actuator 的 PD 驱动关节运动，对浮动基下肢产生 CoM 偏移与反作用力扰动。
 
 每个关节组的采样幅度可**单独定义**（``disturb_groups`` 列表，每组含自己的 ``asset_cfg`` 与
 ``joint_noise_frac``）：幅度以「默认位姿到各方向关节限位的余量」的百分比 [0, 1] 表示，故同一 frac
@@ -44,8 +44,8 @@ if TYPE_CHECKING:
 class UpperBodyDisturbanceEvent(ManagerTermBase):
     """上肢（双臂 + 腰部）随机干扰事件（interval 模式）。智能体无法控制这些关节。
 
-    V1：在各组默认位姿附近随机采样关节目标（限制在关节限位内），写入 PD 目标缓冲区，由 PD 每步逐步
-    驱动关节运动。此版本**不依赖 IK**，目标直接在关节空间采样。每个关节组（如手臂、腰部）的采样幅度
+    在各组默认位姿附近随机采样最终关节目标，提交给共享运动组件。quintic_v1 生成渐进参考；
+    step_v1 保留历史阶跃基线。目标直接在关节空间采样。每个关节组（如手臂、腰部）的采样幅度
     ``joint_noise_frac``（默认位姿→各方向限位余量的百分比，[0, 1]）可在 ``disturb_groups`` 中单独定义。
 
     该类继承 :class:`~isaaclab.managers.ManagerTermBase`（类式 EventTerm 的强制基类），由
@@ -54,8 +54,9 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
     已填充）。
 
     .. note::
-        缓存 :attr:`joint_target` 为全 env 尺寸（列序 = 各组 ``joint_ids`` 拼接序），仅在触发 env 上
-        更新，供后续 V3 观测（上肢目标预告）读取。V1 阶段仅写入不使用。
+        缓存 :attr:`joint_target` 为全 env 尺寸（列序 = 各组 ``joint_ids`` 拼接序），在事件触发时
+        更新，回合重置时对齐真实关节位置。该缓存记录最新采样目标；策略观测按
+        ``target_source`` 从共享运动组件读取最终目标，或从机器人目标缓冲区读取执行参考。
     """
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
@@ -90,8 +91,18 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
             self._joint_ids.extend(joint_ids)
         self._num_joints = len(self._joint_ids)
 
-        # 缓存（供 V3 观测读取）—— 全 env 尺寸，仅触发 env 被更新；列序与 self._joint_ids 一致
-        self.joint_target = torch.zeros(self.num_envs, self._num_joints, device=self.device)
+        # Keep the cache aligned with physical state before the first event too.
+        self.joint_target = self.robot.data.joint_pos.torch[:, self._joint_ids].clone()
+
+    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
+        """Discard cached targets from the ending episode after physical reset.
+
+        LowerLimbAgentEnv synchronizes actuator commands and velocities after all
+        manager resets, including paths without this interval event.
+        """
+        if env_ids is None:
+            env_ids = slice(None)
+        self.joint_target[env_ids] = self.robot.data.joint_pos.torch[env_ids][:, self._joint_ids]
 
     def __call__(
         self,
@@ -99,7 +110,7 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
         env_ids: Sequence[int] | torch.Tensor | slice | None,
         disturb_groups: list[dict],
     ) -> None:
-        """Interval event 入口：为触发的 env 子集按组采样并写入上肢 PD 目标。
+        """Interval event 入口：为触发的 env 子集按组采样并提交最终目标。
 
         Args:
             env: 环境实例。
@@ -133,20 +144,16 @@ class UpperBodyDisturbanceEvent(ManagerTermBase):
         upper_margin = (hi - default_q).clamp_min(0.0)
         lower_margin = (default_q - lo).clamp_min(0.0)
         # -- sample_uniform 支持张量边界：逐关节**非对称**采样 [-frac·lower_margin, +frac·upper_margin]
-        noise = sample_uniform(
-            -frac * lower_margin, frac * upper_margin, (n, self._num_joints), self.device
-        )
+        noise = sample_uniform(-frac * lower_margin, frac * upper_margin, (n, self._num_joints), self.device)
         q_target = default_q + noise
         # -- frac≤1 时已在限位内；clamp 仅作数值安全网（兜住浮点误差与负余量退化情形）
         q_target = torch.clamp(q_target, lo, hi)
 
         # 仅更新触发的 env（遵守 env_ids 写入隔离，避免污染未触发 env）
         self.joint_target[env_ids] = q_target
-        # 写入上肢 PD 目标缓冲区（关键字-only；target 形状 (n, len(joint_ids))）；
-        # 与下肢 action 写入索引不相交，下一步 write_data_to_sim() 时生效
-        self.robot.set_joint_position_target_index(
-            target=q_target, joint_ids=self._joint_ids, env_ids=env_ids
-        )
+        # Sampling remains independent of execution; a running segment keeps its
+        # endpoint and only its latest pending goal can be replaced.
+        env.upper_body_motion.set_goal(env_ids, q_target, self._joint_ids)
         # Observe actual event firings without sampling additional randomness or changing targets.
         for name in env.command_manager.active_terms:
             term = env.command_manager.get_term(name)

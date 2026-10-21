@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
+from dataclasses import asdict
 
 import torch
 
@@ -144,6 +145,8 @@ def export_curriculum_state(env):
         "phase": env.cfg.training_phase,
         "control_dt": env.step_dt,
         "episode_length_s": env.cfg.episode_length_s,
+        "upper_body_motion": asdict(env.cfg.upper_body_motion),
+        "upper_body_target_source": env.cfg.observations.policy.upper_body_target.params["target_source"],
         "distribution": {
             "ranges": {name: list(getattr(term.cfg.ranges, name)) for name in RANGE_FIELDS},
             "mode_weights": weights,
@@ -176,7 +179,8 @@ def import_curriculum_state(env, state, *, evaluation=False):
     """Restore distribution/progress, preserve same-phase summaries, and reset all trajectories.
 
     Across phases, monitoring and clocks are restarted but global curriculum progress and the
-    mode-introduction latch continue. No per-environment trajectory buffers are transported.
+    mode-introduction latch continue. Latest task-success snapshots are always rebuilt
+    from new episodes. No per-environment trajectory buffers are transported.
     """
     validate_curriculum_state(env, state, evaluation=evaluation)
     state = copy.deepcopy(state)
@@ -232,6 +236,7 @@ def import_curriculum_state(env, state, *, evaluation=False):
         "episode_metrics_valid",
     ):
         getattr(term, name).zero_()
+    term.performance.clear_task_success()
     term._last_metric_step.fill_(env.common_step_counter)
     env.episode_length_buf.zero_()
     env._g1_restoring_curriculum = True

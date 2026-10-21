@@ -33,6 +33,8 @@ from isaaclab_physx.physics import PhysxCfg
 from isaaclab_tasks.utils import PresetCfg
 
 from ... import mdp
+from ...mdp.actions import LowerBodyPositionActionCfg
+from ...motion import UpperBodyMotionCfg
 
 ##
 # Pre-defined configs
@@ -137,7 +139,7 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(
+    joint_pos = LowerBodyPositionActionCfg(
         asset_name="robot",
         joint_names=[".*_hip_.*", ".*_knee_joint", ".*_ankle_.*"],
         scale=0.5,
@@ -171,13 +173,14 @@ class ObservationsCfg:
         # - last action (12) only lower-limb
         actions = ObsTerm(func=mdp.last_action)
 
-        # - upper-limb target (17)
+        # - upper-body final goal (17); actuator references remain progressive
         upper_body_target = ObsTerm(
             func=mdp.upper_body_joint_pos_target_rel,
             params={
                 "asset_cfg": SceneEntityCfg(
                     "robot", joint_names=[".*shoulder.*", ".*elbow.*", ".*wrist.*", "waist_.*_joint"]
-                )
+                ),
+                "target_source": "final_goal",
             },
             noise=Unoise(n_min=-0.02, n_max=0.02),
         )
@@ -230,6 +233,8 @@ class EventCfg:
         mode="reset",
         params={
             "position_range": (-0.05, 0.05),
+            # LowerLimbAgentEnv subsequently zeros upper-body velocities and
+            # aligns their held PD targets with the sampled reset positions.
             "velocity_range": (-0.5, 0.5),
         },
     )
@@ -530,13 +535,15 @@ class CurriculumCfg:
         },
     )
 
-    # upper-limb disturbance curriculum
+    # Upper-body amplitude: survival EMA plus latest-episode joint success.
     upper_body_disturbance_magnitude = CurrTerm(
         func=mdp.upper_body_disturbance_magnitude_curriculum,
         params={
             "event_term_name": "upper_body_disturbance",
             "target_group": 0,
             "survival_gate": 0.95,
+            "command_name": "task_command",
+            "task_success_gate": 0.8,
             "frac_final": 0.8,
             "frac_step": 0.005,
             "update_period": 2000,
@@ -565,6 +572,7 @@ class LowerLimbAgentEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the G1 lower-limb agent environment (stand / squat / walk / squat-walk)."""
     training_phase: int = 1
     # Simulation settings
+    upper_body_motion: UpperBodyMotionCfg = UpperBodyMotionCfg()
     sim: SimulationCfg = SimulationCfg(physics=LowerLimbAgentPhysicsCfg())
     # Scene settings
     scene: LowerLimbAgentSceneCfg = LowerLimbAgentSceneCfg(num_envs=4096, env_spacing=2.5)

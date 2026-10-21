@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Run with ``uv run python -m g1.rl train|play|teleop --task ...``."""
+"""Run with ``uv run python -m g1.rl train|play|teleop|eval --task ...``."""
 
 from __future__ import annotations
 
@@ -37,9 +37,9 @@ def _runner_adapter(backend, factory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="G1 training/playback/teleop with curriculum checkpoints", add_help=False
+        description="G1 training/playback/teleop and fixed-condition evaluation", add_help=False
     )
-    parser.add_argument("action", choices=("train", "play", "teleop"))
+    parser.add_argument("action", choices=("train", "play", "teleop", "eval"))
     parser.add_argument("--curriculum-snapshot", help="Explicit curriculum JSON for a legacy checkpoint only")
     parser.add_argument("--rl_library", choices=("rsl_rl",), default="rsl_rl")
     parser.add_argument("--frontend", choices=("torch",), default="torch")
@@ -50,6 +50,13 @@ def main(argv=None):
     selected, remaining = parser.parse_known_args(arguments)
     if "--distributed" in remaining or int(os.environ.get("WORLD_SIZE", "1")) > 1:
         parser.error("Curriculum checkpoints currently support single-process training only")
+    if selected.action == "eval":
+        if selected.curriculum_snapshot:
+            parser.error("eval uses its suite conditions; omit --curriculum-snapshot")
+        # Keep help, planning and report generation usable without importing a simulator.
+        from .evaluation.cli import run
+
+        return run(remaining)
     if selected.action in ("play", "teleop") and "--train_env_cfg" in remaining:
         parser.error("Curriculum playback requires play_mode(); omit --train_env_cfg")
     if selected.curriculum_snapshot and not any(

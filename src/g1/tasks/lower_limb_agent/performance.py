@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Read-only, sample-weighted diagnostics, independent of curriculum gate buffers."""
+"""Episode statistics with separate logging windows and curriculum snapshots."""
 
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ class ModePerformanceMonitor:
 
     Partial, manual and mixed-mode episodes are excluded from episode statistics, but their
     executed steps remain in the measured sample allocation. Draining never clears live
-    episode accumulators. This object does not sample randomness or change training state.
+    episode accumulators or latest-episode snapshots. The disturbance curriculum can
+    read those snapshots independently of logging. No randomness is sampled here.
     """
 
     def __init__(self, num_envs: int, device: str, step_dt: float, thresholds: tuple[float, float, float, float]):
@@ -42,12 +43,16 @@ class ModePerformanceMonitor:
         self.observed = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.mixed = torch.zeros_like(self.observed)
         self.reported = torch.zeros_like(self.observed)
+        self.latest_joint_success = torch.zeros_like(self.observed)
+        self.latest_joint_success_valid = torch.zeros_like(self.observed)
         self.steps = torch.zeros((4, 4), device=device)
         self.episodes = torch.zeros((4, 1 + len(EPISODE_FIELDS)), device=device)
         self.pelvis = torch.zeros((4, 3), device=device)
         self.events = torch.zeros((4, 2), device=device)
         self.terminations: dict[str, torch.Tensor] = {}
         self.excluded = torch.zeros(3, device=device)
+        # Evaluation can consume terminal records without changing training log columns.
+        self.episode_callback = None
 
     def reset(self, env_ids: torch.Tensor, mode: torch.Tensor, step: int) -> None:
         self.episode[env_ids] = 0
@@ -103,6 +108,9 @@ class ModePerformanceMonitor:
         complete = time_outs[ids] & ~terminated[ids]
         pelvis_mean = sums[:, 4] / sums[:, 5].clamp_min(1)
         pelvis_ok = (sums[:, 5] == 0) | (pelvis_mean < self.thresholds[3])
+        joint_success = complete & height_ok & velocity_ok & pelvis_ok
+        self.latest_joint_success[ids] = joint_success
+        self.latest_joint_success_valid[ids] = True
         values = torch.stack(
             (
                 torch.ones_like(count),
@@ -112,7 +120,7 @@ class ModePerformanceMonitor:
                 complete.float(),
                 height_ok.float(),
                 velocity_ok.float(),
-                (complete & height_ok & velocity_ok & pelvis_ok).float(),
+                joint_success.float(),
                 means[:, 0],
                 means[:, 1],
                 means[:, 2],
@@ -126,7 +134,36 @@ class ModePerformanceMonitor:
             if name not in self.terminations:
                 self.terminations[name] = torch.zeros_like(self.events[:, 0])
             self.terminations[name].index_add_(0, modes, active[ids].float())
+        if self.episode_callback is not None and ids.numel():
+            self.episode_callback(
+                ids,
+                {
+                    "mode": modes,
+                    "steps": count,
+                    "length_s": count * self.step_dt,
+                    "terminated": terminated[ids],
+                    "time_out": time_outs[ids],
+                    "error_height_m": means[:, 0],
+                    "error_velocity_xy_mps": means[:, 1],
+                    "error_yaw_radps": means[:, 2],
+                    "error_pelvis_xy_m": pelvis_mean,
+                    "pelvis_steps": sums[:, 5],
+                    "pelvis_error_sum": sums[:, 4],
+                    "pelvis_success_steps": sums[:, 6],
+                    "reasons": {name: active[ids] for name, active in reasons.items()},
+                },
+            )
         self.reported[env_ids] = True
+
+    def task_success_rate(self) -> torch.Tensor:
+        """Mean latest valid episode success per environment; zero before any result."""
+        successes = self.latest_joint_success & self.latest_joint_success_valid
+        return successes.sum().float() / self.latest_joint_success_valid.sum().clamp_min(1)
+
+    def clear_task_success(self) -> None:
+        """Rebuild curriculum snapshots from new episodes after checkpoint restoration."""
+        self.latest_joint_success.zero_()
+        self.latest_joint_success_valid.zero_()
 
     def disturbance(self, mode, env_ids, arm_fraction: float) -> None:
         """Count actual upper-body event firings, rather than inferred exposure from survival."""

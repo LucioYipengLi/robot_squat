@@ -161,48 +161,26 @@ def upper_body_disturbance_magnitude_curriculum(
     frac_step: float = 0.005,
     ema_beta: float = 0.02,
     update_period: int = 2000,
+    command_name: str = "task_command",
+    task_success_gate: float = 0.8,
 ) -> dict[str, float]:
-    """Ramp one disturbance group's magnitude (``joint_noise_frac``) up while the policy keeps surviving.
+    """Ramp one group's amplitude when survival EMA and global task success pass.
 
-    A performance-driven companion to the *implicit* interval curriculum. The interval event already
-    gates disturbance *frequency* on episode length (it can only fire once an episode outlives
-    ``interval_range_s[0]``), which naturally withholds the disturbance until the policy can stand. This
-    term adds the missing axis -- disturbance *magnitude* -- so the selected joint group can be pushed
-    beyond the fixed ``joint_noise_frac`` it was mounted with, instead of switching on at full strength.
+    Survival keeps its episode-weighted, normalized-duration EMA: fully observed,
+    naturally ended episodes enter an update window once. Initial, manual and
+    duplicate resets and artificially aged first episodes are excluded.
 
-    :class:`UpperBodyDisturbanceEvent` organizes its joints into ``disturb_groups`` (arms, waist, ...),
-    each with an independently mounted ``joint_noise_frac`` (a fraction in [0, 1] of each joint's
-    default-to-limit margin). This curriculum ramps only the group at ``target_group`` (default 0 =
-    arms); the other groups stay fixed at their mounted values.
+    Task success reuses the monitor's joint-success definition: normal timeout,
+    height/velocity/yaw tracking and applicable pelvis tracking must all pass.
+    Each environment contributes its latest valid finalized episode, independent
+    of log drains. Before any valid result, task success is zero. The curriculum
+    runs before command reset finalizes the current batch, so it reads previously
+    finalized results. Checkpoint restoration clears these snapshots for recollection.
 
-    It reads the live event cfg via :meth:`EventManager.get_term_cfg` (a reference, not a copy) and
-    mutates ``params["disturb_groups"][target_group]["joint_noise_frac"]`` in place; because
-    :class:`UpperBodyDisturbanceEvent.__call__` re-reads each group's ``joint_noise_frac`` from
-    ``**term_cfg.params`` on every fire, the new magnitude takes effect on the next disturbance without
-    touching the event code or re-instantiating the term.
-
-    Design mirrors :func:`command_range_curriculum`:
-
-    * **Gate** -- episode-average survival: each naturally completed, fully observed episode has
-      equal weight within an update window. Sum normalized lengths and episode counts across reset
-      batches, then update the EMA once per window. Initial resets, manual truncations, duplicate
-      resets and artificially aged first episodes are excluded. This is a duration fraction, not
-      a binary timeout-success rate or a lifetime arithmetic mean.
-    * **Monotonic + self-pacing** -- ``joint_noise_frac`` only creeps toward ``frac_final`` (never
-      decays), and only while the EMA survival holds above ``survival_gate``. Raising the magnitude makes
-      surviving harder, which pulls the EMA back below the gate and pauses the ramp, so it settles at the
-      largest magnitude the policy can survive -- the same negative feedback as the command curriculum.
-    * **Rate-limited** -- at most one increment per ``update_period`` control steps, so each bump is
-      followed by enough rollouts for the gate to react before the next (avoids runaway against the
-      feedback latency).
-
-    Note:
-        * Sample accumulation stays on the device. Checking the window count and gate synchronizes
-          only when an update is due. Windows with no completed episodes do not update or ramp.
-        * When enabling this term, set the target group's mounted ``joint_noise_frac`` to the desired
-          *floor* (e.g. 0.15): the ramp starts from that live value and climbs to ``frac_final``.
-        * Do **not** also curriculum ``interval_range_s`` -- frequency is already governed by the implicit
-          episode-length gate, and a second controller on the same axis would fight it.
+    Both signals must strictly exceed their gates. Only the selected group's
+    live ``joint_noise_frac`` changes, by at most one increment per update period;
+    low quality pauses the ramp. Survival EMA updates continue while quality is
+    low. Windows without completed survival episodes do not update or ramp.
 
     Args:
         env: The environment instance.
@@ -217,10 +195,13 @@ def upper_body_disturbance_magnitude_curriculum(
         ema_beta: EMA factor per nonempty update window (smaller = slower/steadier gate).
         update_period: Number of control steps between magnitude updates (same units as
             :func:`command_range_curriculum`, which is mounted at 5000).
+        command_name: Command term owning the performance monitor.
+        task_success_gate: Global latest-episode joint success threshold in [0, 1].
 
     Returns:
         Curriculum state logged under ``Curriculum/<term_name>/<key>``: the survival EMA gate signal
-        (``survival_ema``), its validity flag, completed-episode count and disturbance magnitude.
+        (``survival_ema``), validity flag, completed-episode count, ``task_success_rate``
+        and disturbance magnitude.
     """
     # live reference to the event term cfg (get_term_cfg returns the stored object, not a copy);
     # the target group's joint_noise_frac is a plain Python float re-read by the event on every fire.
@@ -230,6 +211,9 @@ def upper_body_disturbance_magnitude_curriculum(
 
     if not 0.0 < ema_beta <= 1.0:
         raise ValueError("ema_beta must be in (0, 1]")
+    if isinstance(task_success_gate, bool) or not 0.0 <= task_success_gate <= 1.0:
+        raise ValueError("task_success_gate must be in [0, 1]")
+    task_success = env.command_manager.get_term(command_name).performance.task_success_rate()
     state = _curriculum_state(env, f"survival:{event_term_name}:{target_group}")
     if "ema" not in state:
         state.update(
@@ -271,7 +255,7 @@ def upper_body_disturbance_magnitude_curriculum(
             state["initialized"] = True
         state["length_sum"].zero_()
         state["episode_count"].zero_()
-        if bool(ema > survival_gate) and frac < frac_final:
+        if bool((ema > survival_gate) & (task_success > task_success_gate)) and frac < frac_final:
             frac = min(frac + frac_step, frac_final)
             group["joint_noise_frac"] = frac
 
@@ -279,6 +263,7 @@ def upper_body_disturbance_magnitude_curriculum(
         "survival_ema": ema,
         "survival_valid": float(state["initialized"]),
         "survival_episodes": state["total_episodes"],
+        "task_success_rate": task_success,
         "joint_noise_frac": frac,
     }
 

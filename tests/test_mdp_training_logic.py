@@ -21,6 +21,7 @@ from g1.tasks.lower_limb_agent.mdp.curriculums import (
     upper_body_disturbance_magnitude_curriculum,
 )
 from g1.tasks.lower_limb_agent.mdp.rewards import action_acc_l2
+from g1.tasks.lower_limb_agent.performance import ModePerformanceMonitor
 
 
 class _Scene(dict):
@@ -220,15 +221,19 @@ def test_environment_captures_terminal_state_before_physical_reset_events(kind, 
     project_env = LowerLimbAgentEnv.__new__(LowerLimbAgentEnv)
     project_env.command_manager = SimpleNamespace(active_terms=["task"], get_term=lambda name: term)
     logged = {}
+    reset_order = []
 
     def physical_reset_then_command_reset(self, ids):
         # This is the important ordering in IsaacLab's base implementation.
         env.scene["robot"].data.root_pos_w.torch[ids, 2] = 0.75
         logged.update(term.reset(ids))
         env.episode_length_buf[ids] = 0
+        reset_order.append("physical")
 
     monkeypatch.setattr(ManagerBasedRLEnv, "_reset_idx", physical_reset_then_command_reset)
+    monkeypatch.setattr(LowerLimbAgentEnv, "_reset_upper_body_targets", lambda self, ids: reset_order.append("targets"))
     project_env._reset_idx(torch.tensor([0]))
+    assert reset_order == ["physical", "targets"]
     torch.testing.assert_close(logged["error_height"], torch.tensor(0.25))
     if kind == "squat_walk":
         metrics = term.performance.drain(term._mode_probs)
@@ -285,6 +290,10 @@ def test_range_gate_ignores_uninitialized_episode_buffers():
 
 def _survival_env(num_envs=3):
     group = {"joint_noise_frac": 0.2}
+    monitor = ModePerformanceMonitor(num_envs, "cpu", 0.1, (0.03, 0.5, 0.4, 0.02))
+    # Keep legacy tests focused on the unchanged survival weighting and EMA.
+    monitor.latest_joint_success.fill_(True)
+    monitor.latest_joint_success_valid.fill_(True)
     env = SimpleNamespace(
         num_envs=num_envs,
         device="cpu",
@@ -293,6 +302,7 @@ def _survival_env(num_envs=3):
         episode_length_buf=torch.zeros(num_envs, dtype=torch.long),
         termination_manager=SimpleNamespace(dones=torch.zeros(num_envs, dtype=torch.bool)),
         event_manager=SimpleNamespace(get_term_cfg=lambda name: SimpleNamespace(params={"disturb_groups": [group]})),
+        command_manager=SimpleNamespace(get_term=lambda name: SimpleNamespace(performance=monitor)),
     )
     return env, group
 
@@ -347,3 +357,78 @@ def test_survival_excludes_manual_resets_random_initial_lengths_and_empty_window
     torch.testing.assert_close(result["survival_ema"], torch.tensor(1.0))
     assert result["survival_episodes"] == 2
     assert group["joint_noise_frac"] == pytest.approx(0.205)
+
+
+@pytest.mark.parametrize(
+    "survival_passes,successful_envs,advances",
+    [
+        (True, 5, True),
+        (True, 4, False),
+        (True, 0, False),
+        (False, 5, False),
+    ],
+)
+def test_disturbance_requires_both_survival_and_strict_task_success_gates(survival_passes, successful_envs, advances):
+    env, group = _survival_env(5)
+    monitor = env.command_manager.get_term("task_command").performance
+    monitor.latest_joint_success[:] = torch.arange(5) < successful_envs
+    env.max_episode_length = 10 if survival_passes else 20
+    _survival(env)
+    env.common_step_counter = 10
+    env.episode_length_buf.fill_(10)
+    env.termination_manager.dones.fill_(True)
+    result = _survival(env)
+    assert result["task_success_rate"] == pytest.approx(successful_envs / 5)
+    assert result["survival_ema"] == (1.0 if survival_passes else 0.5)
+    assert group["joint_noise_frac"] == pytest.approx(0.205 if advances else 0.2)
+
+
+def test_missing_quality_pauses_ramp_without_freezing_survival_ema_and_can_recover():
+    env, group = _survival_env()
+    monitor = env.command_manager.get_term("task_command").performance
+    monitor.clear_task_success()
+    _survival(env)
+    env.common_step_counter = 10
+    env.episode_length_buf.fill_(10)
+    env.termination_manager.dones.fill_(True)
+    result = _survival(env)
+    assert result["survival_ema"] == 1
+    assert result["survival_valid"] == 1
+    assert result["task_success_rate"] == 0
+    assert group["joint_noise_frac"] == 0.2
+    monitor.latest_joint_success.fill_(True)
+    monitor.latest_joint_success_valid.fill_(True)
+    env.common_step_counter = 20
+    assert _survival(env)["task_success_rate"] == 1
+    assert group["joint_noise_frac"] == pytest.approx(0.205)
+    _survival(env)  # Duplicate reset in the same step must not advance again.
+    assert group["joint_noise_frac"] == pytest.approx(0.205)
+
+
+@pytest.mark.parametrize("gate", [-0.1, 1.1, float("nan"), True])
+def test_disturbance_rejects_invalid_task_success_gate(gate):
+    env, _ = _survival_env()
+    with pytest.raises(ValueError, match="task_success_gate"):
+        _survival(env, task_success_gate=gate)
+
+
+def test_curriculum_consumes_previous_finalized_quality_without_changing_reset_order():
+    term, env = _command("squat_walk")
+    env.max_episode_length = 10
+    group = {"joint_noise_frac": 0.2}
+    env.event_manager = SimpleNamespace(get_term_cfg=lambda name: SimpleNamespace(params={"disturb_groups": [group]}))
+    env.command_manager = SimpleNamespace(get_term=lambda name: term)
+    env.termination_manager.dones = torch.ones(2, dtype=torch.bool)
+    env.termination_manager.get_term = lambda name: torch.full((2,), name == "time_out", dtype=torch.bool)
+    term.reset(slice(None))
+    _survival(env)
+    for ending_step in (10, 20):
+        for step in range(ending_step - 9, ending_step + 1):
+            env.common_step_counter = step
+            env.episode_length_buf.fill_(step - ending_step + 10)
+            term._update_metrics()
+        result = _survival(env)
+        assert result["task_success_rate"] == (0 if ending_step == 10 else 1)
+        assert group["joint_noise_frac"] == pytest.approx(0.2 if ending_step == 10 else 0.205)
+        term.reset(slice(None))
+        assert term.performance.task_success_rate() == 1
