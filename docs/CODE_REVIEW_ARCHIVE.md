@@ -42,7 +42,7 @@
 
 **状态：已实现代码链路并完成 CPU 回归，待完整物理仿真验收。**
 
-新增 [状态协议](../src/g1/tasks/lower_limb_agent/curriculum_state.py)、[Runner](../src/g1/rl/runner.py) 和 [项目入口](../src/g1/rl/__main__.py)。范围、实际模式权重、各组实际扰动幅度、课程逻辑进度、检查间隔及生存 EMA/已完成回合汇总随模型写入同一 `.pt`，覆盖周期保存、最终保存和日志上传。
+新增 [状态协议](../src/g1/tasks/lower_limb_agent/curriculum_state.py)、[Runner](../src/g1/tasks/lower_limb_agent/runner.py) 和 [项目入口](../src/g1/rl/__main__.py)。范围、实际模式权重、各组实际扰动幅度、课程逻辑进度、检查间隔及生存 EMA/已完成回合汇总随模型写入同一 `.pt`，覆盖周期保存、最终保存和日志上传。
 
 同阶段恢复课程统计；Phase 1→2、2→3 继承真实分布并重建新 DR 条件下的门控统计；评估恢复分布后维持 `play_mode()` 的关闭项。所有加载都重置轨迹和历史，重取观测后开始 rollout。Phase 2/3 的手工课程快照已移除，模式引入课程持续保留，允许 Phase 1 提前结束后继续到达触发点。
 

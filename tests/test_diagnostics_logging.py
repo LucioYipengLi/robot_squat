@@ -95,7 +95,7 @@ def test_real_writer_records_diagnostics_at_training_iteration(tmp_path, monkeyp
 def test_curriculum_runner_installs_diagnostic_adapter(monkeypatch):
     from rsl_rl.runners import OnPolicyRunner
 
-    from g1.rl.runner import CurriculumOnPolicyRunner
+    from g1.tasks.lower_limb_agent.runner import CurriculumOnPolicyRunner
 
     records = {}
     logger, _, base, calls = _fixture(
@@ -246,7 +246,7 @@ def test_runner_closes_display_writers_when_learning_finishes_or_raises(tmp_path
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     from torch.utils.tensorboard import SummaryWriter
 
-    from g1.rl.runner import CurriculumOnPolicyRunner
+    from g1.tasks.lower_limb_agent.runner import CurriculumOnPolicyRunner
 
     writer = SummaryWriter(str(tmp_path))
     logger, _, base, _ = _fixture(writer)

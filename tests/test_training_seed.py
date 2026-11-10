@@ -9,10 +9,16 @@ from isaaclab.utils.io import load_yaml
 from isaaclab_rl.entrypoints import common
 from isaaclab_rl.entrypoints.backends import cli_args_rsl_rl
 
-from g1.tasks.lower_limb_agent.config.g1.agents import rsl_rl_ppo_cfg
+from g1.tasks.lower_limb_agent.config.g1.agents import rsl_rl_ppo_cfg as lower_cfg
+from g1.tasks.upper_limb_agent.config.g1.agents import rsl_rl_ppo_cfg as upper_cfg
 
 
-def test_each_new_config_draws_a_seed_but_copies_keep_the_selected_seed(monkeypatch):
+@pytest.fixture(params=[lower_cfg, upper_cfg], ids=["lower_limb", "upper_g1"])
+def rsl_rl_ppo_cfg(request):
+    return request.param
+
+
+def test_each_new_config_draws_a_seed_but_copies_keep_the_selected_seed(monkeypatch, rsl_rl_ppo_cfg):
     draws = iter((123, 456))
 
     def draw(limit):
@@ -29,7 +35,7 @@ def test_each_new_config_draws_a_seed_but_copies_keep_the_selected_seed(monkeypa
     assert first.to_dict()["seed"] == 123
 
 
-def test_explicit_config_seed_does_not_draw_a_random_default(monkeypatch):
+def test_explicit_config_seed_does_not_draw_a_random_default(monkeypatch, rsl_rl_ppo_cfg):
     def unexpected_draw(limit):
         pytest.fail("An explicit seed must bypass the default seed factory")
 
@@ -38,7 +44,9 @@ def test_explicit_config_seed_does_not_draw_a_random_default(monkeypatch):
 
 
 @pytest.mark.parametrize("requested,expected", [(None, 2**31 - 1), (0, 0), (123, 123), (-1, 789)])
-def test_native_seed_override_and_run_configs_store_the_selected_integer(tmp_path, monkeypatch, requested, expected):
+def test_native_seed_override_and_run_configs_store_the_selected_integer(
+    tmp_path, monkeypatch, requested, expected, rsl_rl_ppo_cfg
+):
     monkeypatch.setattr(rsl_rl_ppo_cfg, "randbelow", lambda limit: 2**31 - 1)
     calls = []
 

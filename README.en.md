@@ -9,6 +9,8 @@ The registered tasks are:
 - `Template-G1-v0`: Phase 1.
 - `Template-G1-Phase2-v0`: Phase 2, adding static physics randomization.
 - `Template-G1-Phase3-v0`: Phase 3, adding external pushes.
+- `Template-G1-Upper-v0`: fixed-base waist/arm control with left-only, right-only and dual-arm modes, tracking world-fixed wrist goals observed in the live pelvis frame.
+- `Template-G1-Upper-Mobile-v0`: free-base Upper training with a frozen Lower actor executing a fixed zero-velocity standing command. See [frozen Lower standing](docs/FROZEN_LOWER_STANDING.md).
 
 
 ## Installation
@@ -49,26 +51,62 @@ environment.
 
 Use `python -m g1.rl train` for training/resumption, `play` for playback, `teleop` for manual control,
 and `eval` for fixed-condition checkpoint comparisons.
-The project entrypoint stores the model and live curriculum state in one checkpoint, so Phase 2/3 automatically
+`train/play` infers the task family and its Runner from the registered `--task`. Optional `--task-family`
+checks that inferred ownership. The lower-limb Runner stores the model and live curriculum state in one checkpoint, so Phase 2/3 automatically
 inherit the preceding phase's task distribution. It currently supports the Torch environment frontend and
 single-process RSL-RL `OnPolicyRunner`; no additional RL library option is needed.
+
+`upper_limb_agent` provides fixed-base G1 dual wrist pose tracking and its own Runner with standard training logs under
+`logs/rsl_rl/g1_upper/`. It independently owns its robot configuration and MDP modules.
+`teleop/eval` remain lower-limb only. See the
+[task Runner guide](docs/TASK_RUNNERS.md) (Chinese) for selection and new-task integration.
 
 All commands below use Isaac Sim PhysX. Replace each quoted `<...>` placeholder with an actual checkpoint path.
 Iteration counts are examples; adjust them to your training plan.
 
 | Argument | Meaning |
 | --- | --- |
-| `--task` | Target phase for this invocation, using one of the registered task IDs above. |
-| `--checkpoint` | Model to load: the same phase for resumption, or the immediately preceding phase for a transition. No additional `--resume` flag is needed. |
+| `--task-family` | Optional ownership check: `lower_limb_agent` or `upper_limb_agent`; inferred from `--task` by default. |
+| `--task` | Task ID for this invocation; lower-limb tasks also distinguish training phases. |
+| `--checkpoint` | Model to load for resumption or playback; lower-limb phase transitions use the immediately preceding phase. No additional `--resume` flag is needed. |
 | `--max_iterations` | Number of training iterations to execute in this invocation. After loading, this is the additional iteration count, not a cumulative limit. |
 | `--seed` | Draw a random run seed by default. Pass a nonnegative integer, e.g. `--seed 42`, for a fixed seed, or `--seed -1` to explicitly draw one. |
 | `--num_envs`, `--device` | Optional, for example `--num_envs 1024 --device cuda:0`. |
 
 Each new project agent configuration draws its default seed from system randomness, including training,
-resumption, playback and teleoperation. Training logs record the selected integer in both `params/agent.yaml`
+resumption, playback and lower-limb teleoperation. Training logs record the selected integer in both `params/agent.yaml`
 and `params/env.yaml`; pass that value to `--seed` to reuse it. An explicit `agent.seed=<integer>` also overrides
 the random default, with `--seed` taking precedence. `--deterministic` is a separate determinism option and
 does not fix the default random seed. Reusing a seed does not resume the original random-number sequence.
+
+### G1 upper-body pose tracking
+
+Headless training and visual playback:
+
+```bash
+uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-v0 --viz none --max_iterations 1500 physics=isaacsim_physx
+
+uv run --extra isaacsim python -m g1.rl play --task Template-G1-Upper-v0 --checkpoint "<g1_upper_model.pt>" --num_envs 16 --real-time physics=isaacsim_physx
+```
+
+The default is 4096 environments; override it with `--num_envs`. Playback displays both current wrist frames and active targets.
+Goals are sampled as offsets from the default wrist poses, with hold times based on goal-to-pelvis distance.
+The policy now receives 93 observations, including wrist pose errors, and requires retraining. See the
+[task structure and pose command guide](docs/TASK_RUNNERS.md#g1-上肢位姿跟踪结构) (Chinese).
+
+Upper tasks also provide a 0 kg workspace Q prior, queried at pelvis-relative target positions after active wrists meet the position tolerance.
+Its reward weight defaults to zero while diagnostics remain active. See the [workspace Q guide](docs/WORKSPACE_QUALITY.md) (Chinese) for configuration, metrics and archived resources.
+
+`Template-G1-Upper-Mobile-v0` lets Upper choose base-frame `vx`, `vy`, yaw rate, and a target height offset for frozen Lower.
+It uses 21 actions (3 velocities, 1 height offset, then 17 Upper joints) and 107 observations. Velocity bounds are
+±0.3 m/s, ±0.1 m/s and ±0.3 rad/s; height offsets range from −0.15 to +0.02 m, with zero action preserving default height.
+The shared `lower_command_rate=-0.10` retains H2's penalty on changes in all four normalized velocity/height commands;
+holding any constant height has zero height-change cost. Magnitude and overflow costs still cover only velocities,
+with the R9C weights retained. Wrist target sampling is unchanged.
+`base_vertical_acc=-0.05` adds a soft penalty above 4 m/s² for pelvis-link world-Z acceleration, covering every physics substep.
+Set both `env.actions.lower_command.enabled=false` and `env.actions.height_offset.enabled=false` for a zero-command control.
+Older 20-action/106-observation Mobile checkpoints require retraining or explicit migration.
+See the [frozen Lower control guide](docs/FROZEN_LOWER_STANDING.md) (Chinese).
 
 ### Initial training: Phase 1
 

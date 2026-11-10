@@ -9,6 +9,8 @@
 - `Template-G1-v0`：Phase 1。
 - `Template-G1-Phase2-v0`：Phase 2，增加静态物理随机化。
 - `Template-G1-Phase3-v0`：Phase 3，增加外部推力。
+- `Template-G1-Upper-v0`：固定根节点，控制腰部与双臂，按左手、右手、双手三种模式跟踪世界固定目标，观测使用实时盆骨相对位姿。
+- `Template-G1-Upper-Mobile-v0`：自由底座，Upper 同时控制上肢关节与三维速度命令，冻结下肢负责执行。
 
 
 ## 安装
@@ -45,23 +47,60 @@ uv run --extra isaacsim --extra rerun isaaclab random_agent --task <TASK_NAME> -
 ### 统一训练入口
 
 训练与续训使用 `python -m g1.rl train`，模型回放使用 `play`，人工控制使用 `teleop`，固定条件批量评估使用 `eval`。
-项目入口将模型与实际课程状态保存在同一个检查点中，Phase 2/3 自动继承上一阶段的任务分布。
+`train/play` 根据 `--task` 自动识别任务族并选择 Runner；`--task-family` 可选，仅用于核对任务归属。
+每个任务族拥有自己的 Runner；下肢将模型与实际课程状态保存在同一个检查点中，Phase 2/3 自动继承上一阶段的任务分布。
 目前支持 Torch 环境前端、单进程 RSL-RL `OnPolicyRunner`，无需额外指定 RL 库。
+
+`upper_limb_agent` 提供固定根节点和冻结下肢站立两种 G1 双腕位姿跟踪环境，共用独立 Runner 和标准训练日志。
+固定底座输出到 `logs/rsl_rl/g1_upper/`，冻结下肢版本输出到 `logs/rsl_rl/g1_upper_mobile/`。
+机器人资产与 MDP 模块由上肢任务独立维护。
+`teleop/eval` 本阶段仍只支持下肢任务。任务选择及后续任务的接入方式见 [任务 Runner 说明](docs/TASK_RUNNERS.md)。
 
 以下命令统一使用 Isaac Sim PhysX；将引号内的 `<...>` 替换为实际检查点路径。迭代数仅为示例，可按训练计划调整。
 
 | 参数 | 说明 |
 | --- | --- |
-| `--task` | 本次运行的目标阶段，使用上方注册的任务 ID。 |
-| `--checkpoint` | 加载的模型文件；同阶段续训选择本阶段模型，跨阶段续训选择相邻上一阶段模型。无需另加 `--resume`。 |
+| `--task-family` | 可选的任务族校验：`lower_limb_agent` 或 `upper_limb_agent`；默认根据 `--task` 自动识别。 |
+| `--task` | 本次运行的任务 ID，下肢任务还区分训练阶段。 |
+| `--checkpoint` | 加载用于续训或回放的模型；下肢跨阶段续训选择相邻上一阶段模型。无需另加 `--resume`。 |
 | `--max_iterations` | 本次调用执行的训练迭代数；加载后表示继续训练多少次，不是累计迭代上限。 |
 | `--seed` | 默认随机抽取本次运行种子；传入非负整数（如 `--seed 42`）固定种子，`--seed -1` 显式随机抽取。 |
 | `--num_envs`、`--device` | 可选，例如 `--num_envs 1024 --device cuda:0`。 |
 
-项目智能体配置在每次创建时从系统随机源抽取种子，适用于训练、续训、回放和遥操作。
+项目智能体配置在每次创建时从系统随机源抽取种子，适用于训练、续训、回放及下肢遥操作。
 训练日志的 `params/agent.yaml` 与 `params/env.yaml` 记录最终实际使用的整数种子；需要复用时，将该值传给 `--seed`。
 显式设置 `agent.seed=<整数>` 也会覆盖随机默认值，`--seed` 优先于该配置。
 `--deterministic` 是独立的确定性开关，不会将默认随机种子变成固定值；同种子也不代表续训会接续原随机序列。
+
+### G1 上肢位姿跟踪
+
+无窗口训练与可视化回放：
+
+```bash
+uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-v0 --viz none --max_iterations 1500 physics=isaacsim_physx
+
+uv run --extra isaacsim python -m g1.rl play --task Template-G1-Upper-v0 --checkpoint "<g1_upper_model.pt>" --num_envs 16 --real-time physics=isaacsim_physx
+```
+
+默认使用 4096 个环境；可通过 `--num_envs` 调整。回放时显示双腕当前坐标架和有效侧目标。
+目标在默认双腕位姿附近附加偏移采样，刷新时间与目标到骨盆的距离相关。当前观测为 93 维，包含双腕位姿误差，需要重新训练策略；
+模式比例、目标范围、奖励和指标定义见 [任务 Runner 说明](docs/TASK_RUNNERS.md#g1-上肢位姿跟踪结构)。
+
+上肢任务已接入 0 kg 空间 Q 先验：位置达标后按目标相对骨盆的位置评分，左右臂共用镜像地图。
+默认奖励权重为零，诊断持续记录；配置、指标和资源归档见 [空间 Q 奖励说明](docs/WORKSPACE_QUALITY.md)。
+
+冻结下肢的移动任务使用21维 Upper 动作（速度命令3维、高度偏置1维、上肢关节17维）和107维观测，输出到 `logs/rsl_rl/g1_upper_mobile/`：
+
+```bash
+uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-Mobile-v0 --num_envs 512 --viz none physics=isaacsim_physx
+```
+
+默认下肢模型为 `2026-10-21_22-59-54/model_9999.pt`，权重冻结，腿脚参数跟随最新 Lower 配置。
+初始速度范围为 `vx ±0.3 m/s、vy ±0.1 m/s、ωz ±0.3 rad/s`，高度偏置范围为 `[-0.15, 0.02] m`，零动作保持默认站高。
+`lower_command_rate=-0.10` 保留H2的四维归一化命令变化约束；保持恒定高度时该分量为零。
+`base_vertical_acc=-0.05` 对骨盆世界Z加速度超过4 m/s²的部分施加软惩罚，覆盖全部物理子步。
+幅值与越界惩罚仍只约束速度，权重保留R9C配置；腕部目标采样范围保持原配置。
+旧 Mobile 的20动作/106观测模型（包括R9C系列）需重新训练或显式迁移。配置、零命令对照、回放及验证见 [冻结下肢控制说明](docs/FROZEN_LOWER_STANDING.md)。
 
 ### 首次训练：Phase 1
 

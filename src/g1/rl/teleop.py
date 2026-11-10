@@ -47,6 +47,12 @@ def _parse_args(argv):
     args, remaining = setup_preset_cli(parser, argv)
     if args.task is None:
         parser.error("--task is required")
+    from .task_registry import require_lower_limb_task
+
+    try:
+        require_lower_limb_task("teleop", args.task)
+    except ValueError as error:
+        parser.error(str(error))
     if args.num_envs != 1:
         parser.error("Teleop supports exactly one environment (--num_envs 1)")
     if args.frontend != "torch" or args.train_env_cfg:
@@ -96,10 +102,9 @@ def run(argv, *, snapshot_path=None):
 
     from isaaclab_tasks.utils import resolve_task_config
 
+    from g1.tasks.lower_limb_agent.runner import create_curriculum_runner
     from g1.tasks.lower_limb_agent.visualization import PelvisVisualizer
     from g1.teleop.kit import KitInput
-
-    from .runner import create_curriculum_runner
 
     args = _parse_args(argv)
     installed_version = check_rsl_rl_version()

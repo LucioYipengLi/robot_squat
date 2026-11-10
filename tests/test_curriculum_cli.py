@@ -12,9 +12,10 @@ import isaaclab.utils
 from isaaclab_rl.rsl_rl import create_rsl_rl_runner
 
 from g1.rl import __main__ as cli
-from g1.rl import runner as project_runner
-from g1.rl.runner import CurriculumOnPolicyRunner, create_curriculum_runner
+from g1.rl.runner import create_task_runner
+from g1.tasks.lower_limb_agent import runner as project_runner
 from g1.tasks.lower_limb_agent.config.g1.agents.rsl_rl_ppo_cfg import PPORunnerCfg
+from g1.tasks.lower_limb_agent.runner import CurriculumOnPolicyRunner, create_curriculum_runner
 
 
 @pytest.mark.parametrize("action", ["train", "play"])
@@ -28,10 +29,15 @@ def test_backend_adapter_is_scoped_and_forwards_curriculum_options(monkeypatch, 
         assert arguments == expected
         assert sys.argv[1:] == expected
         factory = backend.create_rsl_rl_runner
-        assert factory.func is create_curriculum_runner
-        assert factory.keywords == {"snapshot_path": "legacy.json", "evaluation": action == "play"}
+        assert factory.func is create_task_runner
+        assert factory.keywords == {
+            "task_family": "lower_limb_agent",
+            "snapshot_path": "legacy.json",
+            "evaluation": action == "play",
+        }
         with pytest.raises(ValueError, match="OnPolicyRunner only"):
-            factory(None, SimpleNamespace(class_name="DistillationRunner"))
+            env = SimpleNamespace(unwrapped=SimpleNamespace(cfg=SimpleNamespace(task_family="lower_limb_agent")))
+            factory(env, SimpleNamespace(class_name="DistillationRunner"))
         if fail:
             raise RuntimeError("backend failed")
 

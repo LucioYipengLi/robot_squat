@@ -153,9 +153,9 @@ class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
-        # 510 dims = 102 dims * 5 times
+        # Current asset: 650 dims = 130 dims * 5 frames (43 joints, including fingers).
 
-        # 102 dims:
+        # 130 dims:
         #  - root status (9)  
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
@@ -166,7 +166,7 @@ class ObservationsCfg:
         pelvis_height_cmd = ObsTerm(func=mdp.task_command_height, params={"command_name": "task_command"})
         pelvis_offset_cmd = ObsTerm(func=mdp.task_command_pelvis_xy, params={"command_name": "task_command"})
 
-        # - body joint status (58)
+        # - full joint status (86 = 43 positions + 43 velocities)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
 
@@ -570,6 +570,7 @@ class CurriculumCfg:
 @configclass
 class LowerLimbAgentEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the G1 lower-limb agent environment (stand / squat / walk / squat-walk)."""
+    task_family: str = "lower_limb_agent"
     training_phase: int = 1
     # Simulation settings
     upper_body_motion: UpperBodyMotionCfg = UpperBodyMotionCfg()

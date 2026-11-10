@@ -15,6 +15,8 @@ from pathlib import Path
 
 import yaml
 
+from ..task_registry import require_lower_limb_task
+
 MODE_NAMES = ("stand", "squat", "walk", "squat_walk")
 RANGE_FIELDS = ("height_offset", "lin_vel_x", "lin_vel_y", "ang_vel_z", "pelvis_offset_x", "pelvis_offset_y")
 THRESHOLD_FIELDS = ("height_m", "velocity_xy_mps", "yaw_radps", "pelvis_xy_m")
@@ -216,6 +218,7 @@ def validate_suite(raw: Mapping) -> dict:
     task = raw["task"]
     if not isinstance(task, str) or not task.strip() or task != task.strip():
         raise ValueError("task must be a nonempty task identifier without surrounding whitespace")
+    require_lower_limb_task("eval", task)
     outputs = list(_sequence(raw.get("policy_outputs", ["mean"]), "policy_outputs"))
     if any(not isinstance(item, str) or item not in ("mean", "sample") for item in outputs):
         raise ValueError("policy_outputs accepts only 'mean' and 'sample'")

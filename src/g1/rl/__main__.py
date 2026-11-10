@@ -14,6 +14,8 @@ import sys
 from contextlib import contextmanager
 from functools import partial
 
+from .task_registry import TASK_FAMILIES, get_task_family, resolve_task_family
+
 
 @contextmanager
 def _runner_adapter(backend, factory):
@@ -37,9 +39,15 @@ def _runner_adapter(backend, factory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="G1 training/playback/teleop and fixed-condition evaluation", add_help=False
+        description="G1 training/playback/teleop and fixed-condition evaluation", add_help=False, allow_abbrev=False
     )
     parser.add_argument("action", choices=("train", "play", "teleop", "eval"))
+    parser.add_argument(
+        "--task-family",
+        choices=tuple(TASK_FAMILIES),
+        default=None,
+        help="Optional task-family check; train/play infer the family and runner from --task by default",
+    )
     parser.add_argument("--curriculum-snapshot", help="Explicit curriculum JSON for a legacy checkpoint only")
     parser.add_argument("--rl_library", choices=("rsl_rl",), default="rsl_rl")
     parser.add_argument("--frontend", choices=("torch",), default="torch")
@@ -49,7 +57,9 @@ def main(argv=None):
         return 0
     selected, remaining = parser.parse_known_args(arguments)
     if "--distributed" in remaining or int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        parser.error("Curriculum checkpoints currently support single-process training only")
+        parser.error("Project entrypoints currently support single-process training only")
+    if selected.action in ("teleop", "eval") and selected.task_family not in (None, "lower_limb_agent"):
+        parser.error(f"{selected.action} currently supports only --task-family lower_limb_agent")
     if selected.action == "eval":
         if selected.curriculum_snapshot:
             parser.error("eval uses its suite conditions; omit --curriculum-snapshot")
@@ -57,8 +67,6 @@ def main(argv=None):
         from .evaluation.cli import run
 
         return run(remaining)
-    if selected.action in ("play", "teleop") and "--train_env_cfg" in remaining:
-        parser.error("Curriculum playback requires play_mode(); omit --train_env_cfg")
     if selected.curriculum_snapshot and not any(
         arg == "--checkpoint" or arg.startswith("--checkpoint=") for arg in remaining
     ):
@@ -67,11 +75,13 @@ def main(argv=None):
     from isaaclab.app.sim_launcher import fuse_kit_args
     from isaaclab.utils import configure_logging
 
-    from .runner import create_curriculum_runner
+    from .runner import create_task_runner
 
     # The launcher applies --info/--verbose to the root logger and its handlers.
     configure_logging(save_logs_to_file=False)
     if selected.action == "teleop":
+        if "--train_env_cfg" in remaining:
+            parser.error("Curriculum playback requires play_mode(); omit --train_env_cfg")
         from .teleop import run
 
         original_argv = sys.argv
@@ -80,9 +90,28 @@ def main(argv=None):
             return run(fuse_kit_args(remaining), snapshot_path=selected.curriculum_snapshot)
         finally:
             sys.argv = original_argv
+    family_name = selected.task_family
+    if "--help" in remaining or "-h" in remaining:
+        parser.print_help()
+    else:
+        task_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        task_parser.add_argument("--task")
+        task, _ = task_parser.parse_known_args(remaining)
+        if task.task is None:
+            parser.error("--task is required for train/play")
+        try:
+            family_name = resolve_task_family(task.task, expected=selected.task_family)
+            family = get_task_family(family_name)
+        except ValueError as error:
+            parser.error(str(error))
+        if selected.action == "play" and family.requires_play_mode and "--train_env_cfg" in remaining:
+            parser.error("Curriculum playback requires play_mode(); omit --train_env_cfg")
+        if selected.curriculum_snapshot and not family.curriculum_snapshot:
+            parser.error(f"{family_name} does not support --curriculum-snapshot")
     backend = importlib.import_module(f"isaaclab_rl.entrypoints.backends.{selected.action}_rsl_rl")
     factory = partial(
-        create_curriculum_runner,
+        create_task_runner,
+        task_family=family_name,
         snapshot_path=selected.curriculum_snapshot,
         evaluation=selected.action == "play",
     )

@@ -269,7 +269,7 @@ def test_complete_teleop_flow_loads_before_limits_and_cleans_up(monkeypatch, fai
 
     import isaaclab_tasks.utils
 
-    import g1.rl.runner
+    import g1.tasks.lower_limb_agent.runner as task_runner
     import g1.teleop.kit
 
     events = []
@@ -326,7 +326,7 @@ def test_complete_teleop_flow_loads_before_limits_and_cleans_up(monkeypatch, fai
         def close(self):
             events.append("input_close")
 
-    monkeypatch.setattr(g1.rl.runner, "CurriculumOnPolicyRunner", Runner)
+    monkeypatch.setattr(task_runner, "CurriculumOnPolicyRunner", Runner)
     monkeypatch.setattr(g1.teleop.kit, "KitInput", Input)
     monkeypatch.setattr(teleop.time, "sleep", lambda dt: None)
     if fail:

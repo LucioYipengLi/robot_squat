@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from g1.rl.runner import CurriculumOnPolicyRunner
 from g1.tasks.lower_limb_agent.config.g1.env_cfg import LowerLimbAgentEnvCfg
 from g1.tasks.lower_limb_agent.config.g1.env_cfg_phase import LowerLimbAgentEnvCfg_Phase2, LowerLimbAgentEnvCfg_Phase3
 from g1.tasks.lower_limb_agent.curriculum_state import (
@@ -24,6 +23,7 @@ from g1.tasks.lower_limb_agent.curriculum_state import (
 )
 from g1.tasks.lower_limb_agent.mdp.curriculums import curriculum_step, upper_body_disturbance_magnitude_curriculum
 from g1.tasks.lower_limb_agent.performance import ModePerformanceMonitor
+from g1.tasks.lower_limb_agent.runner import CurriculumOnPolicyRunner
 
 
 class _Environment:

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "kind": "g1_workspace_quality",
+  "coordinate_frame": "pelvis",
+  "target_link": "left_wrist_yaw_link",
+  "source_side": "left",
+  "right_mirror_axis": "y",
+  "payload_mass_kg": 0.0,
+  "aggregation": "max_all_saved_configurations",
+  "feasible_only": false,
+  "q_reference": 0.7218234970798301,
+  "normalization": "clip(Q / fixed_source_max_Q0, 0, 1)",
+  "origin_xyz_m": [
+    -0.25999999046325684,
+    -0.33000001311302185,
+    -0.10000000149011612
+  ],
+  "step_xyz_m": [
+    0.05,
+    0.05,
+    0.05
+  ],
+  "shape_xyz": [
+    17,
+    18,
+    17
+  ],
+  "array_axis_order": "xyz",
+  "covered_nodes": 2263,
+  "source_samples": 66044,
+  "source_metrics": {
+    "filename": "left_5cm.batch.metrics_0.4ef.yaw-cropped.npz",
+    "sha256": "bdca30026d1c00913a6305c26a7d070adb4e15424808d98ec0716613925ecf18"
+  },
+  "source_composite_metrics": {
+    "weights": [
+      0.3,
+      0.3,
+      0.4
+    ],
+    "sigma_reference": 0.28675055770652186,
+    "clip_torque": false,
+    "sigma_reference_m_per_rad": 0.28675055770652186,
+    "sigma_normalization": "fixed_reference",
+    "kinematic_definition": "K=sqrt(s_sigma_min*s_k); s_sigma_min=clip(sigma_min/reference,0,1); s_k=1/kappa; 1/inf=0",
+    "quality_definition": "Q=w_kinematic*K+w_posture*joint_limit_margin+w_dynamics*dynamics_performance",
+    "torque_policy": "raw_including_negative",
+    "all_zero_sigma_rule": "s_sigma_min=0 when file maximum is 0",
+    "origin": "preserved_from_parent_spatial_filter",
+    "inherited_reference": true,
+    "parent_sigma_normalization": "file_max"
+  },
+  "meaning": "Best saved 0 kg configuration score per position; missing nodes are unknown"
+}

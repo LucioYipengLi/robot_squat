@@ -28,6 +28,20 @@ def test_task_registrations():
             "env_cfg_entry_point": "g1.tasks.lower_limb_agent.config.g1.env_cfg_phase:LowerLimbAgentEnvCfg_Phase3",
             "default_agent": "rsl_rl",
         },
+        "Template-G1-Upper-v0": {
+            "entry_point": "isaaclab.envs:ManagerBasedRLEnv",
+            "env_cfg_entry_point": "g1.tasks.upper_limb_agent.config.g1.env_cfg:UpperLimbAgentEnvCfg",
+            "default_agent": "rsl_rl",
+            "rsl_rl_cfg_entry_point": "g1.tasks.upper_limb_agent.config.g1.agents.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+        "Template-G1-Upper-Mobile-v0": {
+            "entry_point": "isaaclab.envs:ManagerBasedRLEnv",
+            "env_cfg_entry_point": "g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg:UpperLimbMobileEnvCfg",
+            "default_agent": "rsl_rl",
+            "rsl_rl_cfg_entry_point": (
+                "g1.tasks.upper_limb_agent.config.g1.agents.mobile_rsl_rl_ppo_cfg:MobilePPORunnerCfg"
+            ),
+        },
     }
 
     for task_id, expected_values in expected.items():
@@ -36,3 +50,5 @@ def test_task_registrations():
         assert spec.kwargs["env_cfg_entry_point"] == expected_values["env_cfg_entry_point"]
         if "default_agent" in expected_values:
             assert spec.kwargs["default_agent"] == expected_values["default_agent"]
+        if "rsl_rl_cfg_entry_point" in expected_values:
+            assert spec.kwargs["rsl_rl_cfg_entry_point"] == expected_values["rsl_rl_cfg_entry_point"]

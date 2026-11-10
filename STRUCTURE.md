@@ -47,6 +47,7 @@ src/<包名>/
     ├── __init__.py              #   自动扫描并 import 全部子包
     └── <task_name>/             #   一个任务 = 一个目录
         ├── env.py               #     必要的环境生命周期扩展（可选）
+        ├── runner.py            #     本任务的独立 Runner 与工厂
         ├── curriculum_state.py  #     任务状态协议，不依赖具体 RL Runner（可选）
         ├── visualization.py     #     与任务语义绑定的附加可视化（可选）
         ├── mdp/                 #     MDP 算子
@@ -54,8 +55,9 @@ src/<包名>/
             └── <robot>/         #       机器人 / 变体
                 ├── __init__.py          # 注册点
                 ├── env_cfg.py           # 环境配置
-                └── agents/              # 算法配置
-                    └── <rl_lib>_cfg.py
+                ├── agents/              # 算法配置
+                │   └── <rl_lib>_cfg.py
+                └── utils/               # 本体专用资产配置等辅助内容（可选）
 ```
 
 ---
@@ -80,7 +82,7 @@ tasks / <任务名> / config / <机器人名> / agents / <算法库>_cfg.py
 
 - 换训练算法 → 只加 `agents/xxx_cfg.py`
 - 换机器人本体 → 只加 `config/<新机器人>/`
-- 加新任务 → 只加 `tasks/<新任务>/`
+- 加新任务 → 新增 `tasks/<新任务>/`，并在 `rl/task_registry.py` 绑定该任务自己的 Runner 工厂
 
 任何一条扩展都不需要改动其余层的代码。
 
@@ -98,7 +100,9 @@ tasks / <任务名> / config / <机器人名> / agents / <算法库>_cfg.py
 | `agents/<rl_lib>_cfg.py` | 该 RL 库的 Runner 超参配置 |
 | `mdp/<manager类别>.py` | 按 manager 类别切分的自定义算子函数 |
 | `assets/__init__.py` | 仅路径常量，禁止放逻辑 |
-| `rl/__main__.py`、`rl/runner.py` | 项目运行入口与算法库集成；调用任务状态协议，不把检查点逻辑塞入奖励/观测函数 |
+| `rl/__main__.py`、`rl/runner.py` | 项目运行入口与任务 Runner 分发；不依赖下肢课程字段 |
+| `rl/task_registry.py` | 任务族到独立 Runner 工厂的显式绑定与入口能力声明 |
+| `tasks/<task_name>/runner.py` | 本任务的 Runner、附加检查点状态和诊断接入；下肢课程只是其中一种实现 |
 | `tasks/<task_name>/curriculum_state.py` | 任务状态的导出、校验与导入；不负责模型保存及 CLI |
 | `rl/teleop.py` | 遥操作模型加载与回放生命周期，复用项目 Runner |
 | `teleop/controls.py`、`teleop/kit.py` | 输入状态与设备订阅；原生输入在仿真启动后创建 |
@@ -107,7 +111,7 @@ tasks / <任务名> / config / <机器人名> / agents / <算法库>_cfg.py
 两个刻意的设计细节：
 
 1. **注册用字符串路径引用配置类**，而非直接 import。避免注册阶段就加载全部重型配置，同时让 entry-point 可被外部工具静态解析。
-2. **`mdp/__init__.py` 采用懒加载 + `.pyi` 桩的组合**：运行时按需导出以降低导入开销，静态检查时由同名 `.pyi` 提供完整符号表与补全。二者必须成对维护。
+2. **`mdp/__init__.py` 采用懒加载 + `.pyi` 桩的组合**：运行时按需导出以降低导入开销，静态检查时由同名 `.pyi` 提供完整符号表与补全。二者必须成对维护。模板任务可先转发通用 MDP 算子，有自定义需求时再增加对应模块。
 
 ---
 
