@@ -144,6 +144,9 @@ Phase transitions inherit the live task distribution and cumulative curriculum p
 gate statistics under the new phase's conditions. Phase 2/3 require a checkpoint; phase skips and reverse
 transitions are rejected.
 
+Phase 3 starts with per-axis velocity increments of ±0.10 m/s and progressively expands to ±0.70 m/s
+when both survival EMA and task success pass their gates. See the [push curriculum configuration](docs/CURRICULUM_CHECKPOINTS.md#phase-3-推扰课程与调参) (Chinese).
+
 ### Evaluation and playback
 
 Use the task ID matching the checkpoint's phase, for example Phase 3:

@@ -21,12 +21,13 @@ also recover the checkpoint's actual command distribution. Old checkpoints requi
 explicit --curriculum-snapshot JSON; unknown training conditions are never inferred.
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
 
 from ... import mdp
-from .env_cfg import EventCfg, LowerLimbAgentEnvCfg
+from .env_cfg import CurriculumCfg, EventCfg, LowerLimbAgentEnvCfg
 
 
 @configclass
@@ -135,15 +136,32 @@ class EventCfg_Phase3(EventCfg_Phase2):
     widened friction) and adds velocity-based push disturbance.
     """
 
-    # ── New: external push (瞬时速度跳变, 模拟外部冲击) ──────────────────────────
-    # interval 4~6 s, ±0.7 m/s in x/y. Strong disturbance -- deep squat postures have
-    # small balance margins and are easily toppled. If too aggressive, reduce to ±0.5
-    # or widen the interval to (6.0, 10.0).
+    # World-frame velocity increments, sampled every 4~6 s. The curriculum expands
+    # these initial per-axis bounds toward ±0.7 m/s as performance permits.
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
         interval_range_s=(4.0, 6.0),
-        params={"velocity_range": {"x": (-0.7, 0.7), "y": (-0.7, 0.7)}},
+        params={"velocity_range": {"x": (-0.10, 0.10), "y": (-0.10, 0.10)}},
+    )
+
+
+@configclass
+class CurriculumCfg_Phase3(CurriculumCfg):
+    """Keep inherited curricula and independently pace the external push magnitude."""
+
+    push_velocity_magnitude = CurrTerm(
+        func=mdp.push_velocity_magnitude_curriculum,
+        params={
+            "event_term_name": "push_robot",
+            "command_name": "task_command",
+            "survival_gate": 0.95,  # 存活比例 EMA 门槛；不是回合成功率。
+            "task_success_gate": 0.80,  # 全局联合成功率门槛；与存活 EMA 同时超过才推进。
+            "velocity_final": 0.70,  # m/s，单轴水平速度增量最终上限。
+            "velocity_step": 0.05,  # m/s，每个合格检查窗口只增加一次。
+            "ema_beta": 0.02,  # 存活 EMA 更新系数，越大越快响应近期表现。
+            "update_period": 5000,  # 控制步，默认约 100 个 PPO 迭代。
+        },
     )
 
 
@@ -153,6 +171,7 @@ class LowerLimbAgentEnvCfg_Phase3(LowerLimbAgentEnvCfg_Phase2):
 
     training_phase: int = 3
     events: EventCfg_Phase3 = EventCfg_Phase3()
+    curriculum: CurriculumCfg_Phase3 = CurriculumCfg_Phase3()
 
     def play_mode(self) -> None:
         super().play_mode()

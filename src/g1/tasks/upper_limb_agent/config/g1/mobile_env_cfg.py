@@ -113,7 +113,7 @@ class MobileRewardsCfg(RewardsCfg):
     # H0-H2 calibration: allow ordinary crouching/walking, penalize vertical impulses.
     base_vertical_acc = RewTerm(
         func=mdp.base_vertical_acc_excess_l2_substeps,
-        weight=-0.06,
+        weight=-0.12,
         params={"action_name": "joint_pos", "soft_limit": 4.0},
     )
     # Failure affects Upper's return; the frozen Lower actor receives no optimizer updates.

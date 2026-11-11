@@ -134,6 +134,9 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Phase3-v0 --che
 
 跨阶段继承实际任务分布和累计课程进度，重新积累新阶段条件下的门控统计。Phase 2/3 必须加载检查点，不能跳过阶段或逆向迁移。
 
+Phase 3 推扰从每轴 ±0.10 m/s 的速度增量开始，存活 EMA 和联合成功率同时达标后逐渐扩大至 ±0.70 m/s。
+两个门槛可在 Phase 3 课程配置中独立调整，见 [推扰课程与调参](docs/CURRICULUM_CHECKPOINTS.md#phase-3-推扰课程与调参)。
+
 ### 模型回放
 
 使用与检查点相同阶段的任务 ID，例如回放 Phase 3：

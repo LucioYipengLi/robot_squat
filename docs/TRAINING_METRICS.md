@@ -337,6 +337,9 @@ TensorBoard 的 [Custom Scalars](https://github.com/tensorflow/tensorboard/blob/
 | `Curriculum/upper_body_disturbance_magnitude/task_success_rate` | 各环境最近一个有效已结束回合的联合成功标志均值；有效环境等权，复用正常超时、高度、平面速度、偏航及适用的骨盆误差判定。 | > 0.8 才允许推进扰动；0.8 是可调初值。存活 EMA 高而此项低，说明跟踪质量限制了推进。无有效结果时为 0。 |
 | `Curriculum/upper_body_disturbance_magnitude/survival_valid` | 生存 EMA 是否已经由有效窗口初始化，0/1。 | 为 0 时，不把 survival_ema=0 解释为全部失败。 |
 | `Curriculum/upper_body_disturbance_magnitude/survival_episodes` | 生存课程累计纳入的有效回合数，可包含恢复历史。 | 与 EMA 一起判断数据基础，不是当前窗口 episode_count。 |
+| `Curriculum/push_velocity_magnitude/max_delta_v_mps` | Phase 3 当前单轴水平速度增量上限，m/s。 | 默认从 0.10 逐步到 0.70；平台表示达到上限或尚未满足推进条件。 |
+| `Curriculum/push_velocity_magnitude/survival_ema` | 推扰课程独立窗口内，完整有效回合存活比例的 EMA。 | 默认 > 0.95 且该课程联合成功率 > 0.80 才推进；首次有效窗口前为 0。 |
+| `Curriculum/push_velocity_magnitude/task_success_rate` | 与上肢课程相同定义的全局最近有效回合联合成功率。 | 默认 > 0.80；与存活门槛是同时满足的条件，阈值可在 Phase 3 配置独立调整。 |
 | `Curriculum/squat_walk_mode_introduction/introduced` | 蹲走是否已引入，0/1。 | 0→1 是任务变化点；当前约累计 400000 控制步触发，不代表已学会蹲走。 |
 
 扰动课程仍按原检查周期推进，只有两个信号都严格超过门槛才增加幅度。成功率缓存独立于日志窗口，普通回合重置和日志输出均保留，后续有效回合会替换该环境的旧结果。人工重置、部分回合与混合模式回合沿用已有排除规则。

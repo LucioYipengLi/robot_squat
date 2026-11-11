@@ -17,6 +17,7 @@ from g1.tasks.lower_limb_agent.config.g1.env_cfg_phase import LowerLimbAgentEnvC
 from g1.tasks.lower_limb_agent.curriculum_state import (
     COMMAND_NAME,
     EVENT_NAME,
+    PUSH_STATE_KEY,
     STATE_KEY,
     export_curriculum_state,
     import_curriculum_state,
@@ -55,7 +56,10 @@ class _Environment:
         self.term.performance = ModePerformanceMonitor(num_envs, "cpu", self.step_dt, (0.03, 0.5, 0.4, 0.02))
         self.command_manager = SimpleNamespace(get_term=lambda name: self.term)
         self.event = copy.deepcopy(self.cfg.events.upper_body_disturbance)
-        self.event_manager = SimpleNamespace(get_term_cfg=lambda name: self.event)
+        self.push_event = copy.deepcopy(getattr(self.cfg.events, "push_robot", None))
+        self.event_manager = SimpleNamespace(
+            get_term_cfg=lambda name: self.event if name == EVENT_NAME else self.push_event
+        )
         self.resets = []
         self.reset()
 
@@ -231,6 +235,105 @@ def test_phase_skips_and_wrong_phase_evaluation_are_rejected():
         import_curriculum_state(_Environment(3), saved)
     with pytest.raises(ValueError, match="Phase"):
         import_curriculum_state(_Environment(2, evaluation=True), saved, evaluation=True)
+
+
+def test_old_phase2_starts_new_push_course_after_a_full_window():
+    from g1.tasks.lower_limb_agent.mdp.curriculums import push_velocity_magnitude_curriculum
+
+    saved = export_curriculum_state(_trained(2))
+    assert "push_velocity_range" not in saved["distribution"]
+    assert "push_survival" not in saved["runtime"]
+    target = _Environment(3)
+    import_curriculum_state(target, saved)
+    assert target.push_event.params["velocity_range"] == {"x": (-0.1, 0.1), "y": (-0.1, 0.1)}
+    state = target._g1_curriculum_state[PUSH_STATE_KEY]
+    assert state["last_update_step"] == 500_000 and not state["initialized"]
+    target.term.performance.latest_joint_success.fill_(True)
+    target.term.performance.latest_joint_success_valid.fill_(True)
+    target.common_step_counter = 4999
+    state["start_step"].fill_(4999 - target.max_episode_length)
+    target.episode_length_buf.fill_(target.max_episode_length)
+    target.termination_manager.dones.fill_(True)
+    assert push_velocity_magnitude_curriculum(target, slice(None))["max_delta_v_mps"] == 0.1
+    target.common_step_counter = 5000
+    result = push_velocity_magnitude_curriculum(target, slice(0, 0))
+    assert result["max_delta_v_mps"] == pytest.approx(0.15)
+    assert target.term.cfg.ranges.height_offset == (-0.31, 0.04)
+
+
+def _trained_push():
+    source = _trained(3)
+    source.push_event.params["velocity_range"] = {"x": (-0.35, 0.35), "y": (-0.35, 0.35)}
+    source._g1_curriculum_state[PUSH_STATE_KEY].update(
+        ema=torch.tensor(0.96),
+        initialized=True,
+        length_sum=torch.tensor(1.5),
+        episode_count=torch.tensor(2),
+        total_episodes=torch.tensor(80),
+        last_update_step=499_500,
+    )
+    return source
+
+
+def test_phase3_push_roundtrip_restores_bounds_ema_and_clock_across_env_counts():
+    saved = export_curriculum_state(_trained_push())
+    assert json.loads(json.dumps(saved)) == saved
+    target = _Environment(3, num_envs=5)
+    import_curriculum_state(target, saved)
+    assert target.push_event.params["velocity_range"] == {"x": (-0.35, 0.35), "y": (-0.35, 0.35)}
+    assert target.cfg.events.push_robot.params == target.push_event.params
+    restored = target._g1_curriculum_state[PUSH_STATE_KEY]
+    assert restored["ema"] == pytest.approx(0.96)
+    assert restored["last_update_step"] == 499_500
+    assert restored["observed"].shape == (5,) and restored["observed"].all()
+    assert target.term.performance.task_success_rate() == 0
+    assert export_curriculum_state(target) == saved
+
+
+def test_legacy_phase3_explicitly_restarts_only_push_course(caplog):
+    saved = export_curriculum_state(_trained_push())
+    del saved["distribution"]["push_velocity_range"]
+    del saved["runtime"]["push_survival"]
+    del saved["runtime"]["checks"][PUSH_STATE_KEY]
+    target = _Environment(3)
+    import_curriculum_state(target, saved)
+    assert "Legacy Phase 3" in caplog.text
+    assert target.push_event.params["velocity_range"]["x"] == (-0.1, 0.1)
+    assert target._g1_curriculum_state[PUSH_STATE_KEY]["last_update_step"] == 500_000
+    assert not target._g1_curriculum_state[PUSH_STATE_KEY]["initialized"]
+    assert target._g1_curriculum_state[f"survival:{EVENT_NAME}:0"]["ema"] == pytest.approx(0.91)
+
+
+def test_phase3_play_retains_push_provenance_without_enabling_event():
+    target = _Environment(3, evaluation=True)
+    saved = export_curriculum_state(_trained_push())
+    import_curriculum_state(target, saved, evaluation=True)
+    assert target.cfg.events.push_robot is None and target.cfg.curriculum is None
+    assert (
+        export_curriculum_state(target)["distribution"]["push_velocity_range"]
+        == saved["distribution"]["push_velocity_range"]
+    )
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda state: state["distribution"]["push_velocity_range"].update(x=[-0.2, 0.35]),
+        lambda state: state["distribution"]["push_velocity_range"].update(y=[-0.2, 0.2]),
+        lambda state: state["runtime"]["push_survival"].update(ema=1.1),
+        lambda state: state["runtime"]["push_survival"].update(length_sum=3),
+        lambda state: state["distribution"].update(push_velocity_range={"x": [-0.8, 0.8], "y": [-0.8, 0.8]}),
+    ],
+)
+def test_invalid_push_records_fail_before_distribution_mutates(corrupt):
+    target = _Environment(3)
+    saved = export_curriculum_state(_trained_push())
+    corrupt(saved)
+    before = copy.deepcopy(target.push_event.params)
+    with pytest.raises(ValueError):
+        import_curriculum_state(target, saved)
+    assert target.push_event.params == before
+    assert target.term.cfg.ranges.height_offset == (-0.15, 0.02)
 
 
 class _Algorithm:

@@ -42,6 +42,7 @@ __all__ = [
     "base_yaw_rate_l2",
     "command_range_curriculum",
     "upper_body_disturbance_magnitude_curriculum",
+    "push_velocity_magnitude_curriculum",
     "squat_walk_mode_introduction_curriculum",
     "UpperBodyDisturbanceEvent",
 ]
@@ -53,6 +54,7 @@ from .commands.commands import SquatWalkCommand
 from .commands.commands_cfg import SquatWalkCommandCfg
 from .curriculums import (
     command_range_curriculum,
+    push_velocity_magnitude_curriculum,
     squat_walk_mode_introduction_curriculum,
     upper_body_disturbance_magnitude_curriculum,
 )

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -134,6 +135,55 @@ def command_range_curriculum(
     return {"height_success": height_success, "vel_success": vel_success}
 
 
+def _update_survival_ema(env, env_ids, state, *, ema_beta, update_period) -> bool:
+    """Consume real completed episodes once; return whether a nonempty window was reduced.
+
+    Callers share this implementation while owning independent windows, EMA values and
+    clocks, so tuning the push curriculum cannot change the upper-body curriculum.
+    """
+    if not 0.0 < ema_beta <= 1.0:
+        raise ValueError("ema_beta must be in (0, 1]")
+    if "ema" not in state:
+        state.update(
+            ema=torch.zeros((), device=env.device),
+            initialized=False,
+            length_sum=torch.zeros((), device=env.device),
+            episode_count=torch.zeros((), dtype=torch.long, device=env.device),
+            total_episodes=torch.zeros((), dtype=torch.long, device=env.device),
+            start_step=torch.zeros(env.num_envs, dtype=torch.long, device=env.device),
+            observed=torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+        )
+    episode_lengths = env.episode_length_buf[env_ids]
+    if episode_lengths.numel() > 0:
+        if not getattr(env, "_g1_restoring_curriculum", False):
+            elapsed = env.common_step_counter - state["start_step"][env_ids]
+            valid = (
+                state["observed"][env_ids]
+                & env.termination_manager.dones[env_ids]
+                & (elapsed > 0)
+                & (episode_lengths == elapsed)
+            )
+            finished = episode_lengths.to(torch.float32) / float(env.max_episode_length)
+            state["length_sum"].add_(torch.where(valid, finished, 0.0).sum())
+            count = valid.sum()
+            state["episode_count"].add_(count)
+            state["total_episodes"].add_(count)
+        state["start_step"][env_ids] = env.common_step_counter
+        state["observed"][env_ids] = True
+
+    if not _update_due(env, state, update_period) or not bool(state["episode_count"] > 0):
+        return False
+    episode_mean = state["length_sum"] / state["episode_count"]
+    if state["initialized"]:
+        state["ema"].lerp_(episode_mean, ema_beta)
+    else:
+        state["ema"].copy_(episode_mean)
+        state["initialized"] = True
+    state["length_sum"].zero_()
+    state["episode_count"].zero_()
+    return True
+
+
 def upper_body_disturbance_magnitude_curriculum(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int] | torch.Tensor | slice,
@@ -192,60 +242,88 @@ def upper_body_disturbance_magnitude_curriculum(
     group = event_cfg.params["disturb_groups"][target_group]
     frac = float(group["joint_noise_frac"])
 
-    if not 0.0 < ema_beta <= 1.0:
-        raise ValueError("ema_beta must be in (0, 1]")
     if isinstance(task_success_gate, bool) or not 0.0 <= task_success_gate <= 1.0:
         raise ValueError("task_success_gate must be in [0, 1]")
     task_success = env.command_manager.get_term(command_name).performance.task_success_rate()
     state = _curriculum_state(env, f"survival:{event_term_name}:{target_group}")
-    if "ema" not in state:
-        state.update(
-            ema=torch.zeros((), device=env.device),
-            initialized=False,
-            length_sum=torch.zeros((), device=env.device),
-            episode_count=torch.zeros((), dtype=torch.long, device=env.device),
-            total_episodes=torch.zeros((), dtype=torch.long, device=env.device),
-            start_step=torch.zeros(env.num_envs, dtype=torch.long, device=env.device),
-            observed=torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
-        )
-    # _reset_idx calls the curriculum before clearing episode lengths. Track actual elapsed steps
-    # separately so randomized initial counters cannot masquerade as fully observed episodes.
-    episode_lengths = env.episode_length_buf[env_ids]
-    if episode_lengths.numel() > 0:
-        if not getattr(env, "_g1_restoring_curriculum", False):
-            elapsed = env.common_step_counter - state["start_step"][env_ids]
-            valid = (
-                state["observed"][env_ids]
-                & env.termination_manager.dones[env_ids]
-                & (elapsed > 0)
-                & (episode_lengths == elapsed)
-            )
-            finished = episode_lengths.to(torch.float32) / float(env.max_episode_length)
-            state["length_sum"].add_(torch.where(valid, finished, 0.0).sum())
-            count = valid.sum()
-            state["episode_count"].add_(count)
-            state["total_episodes"].add_(count)
-        state["start_step"][env_ids] = env.common_step_counter
-        state["observed"][env_ids] = True
-
-    ema = state["ema"]
-    if _update_due(env, state, update_period) and bool(state["episode_count"] > 0):
-        episode_mean = state["length_sum"] / state["episode_count"]
-        if state["initialized"]:
-            ema.lerp_(episode_mean, ema_beta)
-        else:
-            ema.copy_(episode_mean)
-            state["initialized"] = True
-        state["length_sum"].zero_()
-        state["episode_count"].zero_()
-        if bool((ema > survival_gate) & (task_success > task_success_gate)) and frac < frac_final:
-            frac = min(frac + frac_step, frac_final)
-            group["joint_noise_frac"] = frac
+    if (
+        _update_survival_ema(env, env_ids, state, ema_beta=ema_beta, update_period=update_period)
+        and bool((state["ema"] > survival_gate) & (task_success > task_success_gate))
+        and frac < frac_final
+    ):
+        frac = min(frac + frac_step, frac_final)
+        group["joint_noise_frac"] = frac
 
     return {
-        "survival_ema": ema,
+        "survival_ema": state["ema"],
         "survival_valid": float(state["initialized"]),
         "survival_episodes": state["total_episodes"],
+        "task_success_rate": task_success,
+    }
+
+
+def _horizontal_push_magnitude(ranges) -> float:
+    """Validate the curriculum's equal, symmetric world X/Y increment bounds."""
+    if set(ranges) != {"x", "y"}:
+        raise ValueError("Push curriculum requires velocity_range with exactly x and y")
+    magnitudes = []
+    for bounds in ranges.values():
+        if len(bounds) != 2 or any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            for value in bounds
+        ):
+            raise ValueError("Push bounds must contain two finite numbers")
+        lo, hi = bounds
+        if hi < 0 or not math.isclose(-lo, hi, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("Push bounds must be symmetric about zero")
+        magnitudes.append(float(hi))
+    if not math.isclose(*magnitudes, rel_tol=0, abs_tol=1e-9):
+        raise ValueError("Push curriculum requires equal x/y magnitudes")
+    return magnitudes[0]
+
+
+def push_velocity_magnitude_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int] | torch.Tensor | slice,
+    event_term_name: str = "push_robot",
+    command_name: str = "task_command",
+    survival_gate: float = 0.95,
+    task_success_gate: float = 0.8,
+    velocity_final: float = 0.7,
+    velocity_step: float = 0.05,
+    ema_beta: float = 0.02,
+    update_period: int = 5000,
+) -> dict[str, float]:
+    """Ramp the per-axis horizontal velocity increment after both quality gates pass.
+
+    Initial bounds come from the event configuration. Each full, nonempty check
+    window permits at most one increase; low quality holds the current bounds.
+    Uses the same episode definitions as the arm curriculum, with its own EMA.
+    """
+    for name, gate in (("survival_gate", survival_gate), ("task_success_gate", task_success_gate)):
+        if isinstance(gate, bool) or not 0.0 <= gate <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+    if not math.isfinite(velocity_final) or velocity_final <= 0:
+        raise ValueError("velocity_final must be positive and finite")
+    if not math.isfinite(velocity_step) or velocity_step <= 0:
+        raise ValueError("velocity_step must be positive and finite")
+    event_cfg = env.event_manager.get_term_cfg(event_term_name)
+    magnitude = _horizontal_push_magnitude(event_cfg.params["velocity_range"])
+    if magnitude > velocity_final + 1e-9:
+        raise ValueError("Current push magnitude exceeds velocity_final")
+    state = _curriculum_state(env, f"push:{event_term_name}")
+    # A transferred Phase 2 may already have many logical steps. Wait a fresh window.
+    state.setdefault("last_update_step", curriculum_step(env))
+    task_success = env.command_manager.get_term(command_name).performance.task_success_rate()
+    if _update_survival_ema(env, env_ids, state, ema_beta=ema_beta, update_period=update_period) and bool(
+        (state["ema"] > survival_gate) & (task_success > task_success_gate)
+    ):
+        magnitude = min(magnitude + velocity_step, velocity_final)
+        for cfg in (event_cfg, getattr(env.cfg.events, event_term_name)):
+            cfg.params["velocity_range"] = {axis: (-magnitude, magnitude) for axis in ("x", "y")}
+    return {
+        "max_delta_v_mps": magnitude,
+        "survival_ema": state["ema"],
         "task_success_rate": task_success,
     }
 

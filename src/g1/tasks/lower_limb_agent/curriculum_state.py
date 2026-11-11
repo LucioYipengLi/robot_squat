@@ -8,18 +8,22 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import asdict
 
 import torch
 
-from .mdp.curriculums import curriculum_step
+from .mdp.curriculums import _horizontal_push_magnitude, curriculum_step
 
 STATE_KEY = "g1_curriculum"
 RANGE_FIELDS = ("height_offset", "lin_vel_x", "lin_vel_y", "ang_vel_z", "pelvis_offset_x", "pelvis_offset_y")
 COMMAND_NAME = "task_command"
 EVENT_NAME = "upper_body_disturbance"
+PUSH_EVENT_NAME = "push_robot"
+PUSH_STATE_KEY = f"push:{PUSH_EVENT_NAME}"
+logger = logging.getLogger(__name__)
 
 
 def disturbance_layout(event):
@@ -53,6 +57,43 @@ def _integer(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return value
+
+
+def _validate_survival(survival, name):
+    if survival is None:
+        return
+    if not isinstance(survival["initialized"], bool):
+        raise ValueError(f"{name}.initialized must be boolean")
+    _number(survival["ema"], f"{name} EMA", minimum=0, maximum=1)
+    count = _integer(survival["episode_count"], "episode_count")
+    total = _integer(survival["total_episodes"], "total_episodes")
+    _number(survival["length_sum"], "length_sum", minimum=0, maximum=count)
+    if total < count:
+        raise ValueError("Total episode count is smaller than the pending window")
+
+
+def _export_survival(state):
+    if state is None or "ema" not in state:
+        return None
+    return {
+        "ema": float(state["ema"]),
+        "initialized": state["initialized"],
+        "length_sum": float(state["length_sum"]),
+        "episode_count": int(state["episode_count"]),
+        "total_episodes": int(state["total_episodes"]),
+    }
+
+
+def _restore_survival(env, saved):
+    return {
+        "ema": torch.tensor(saved["ema"], device=env.device),
+        "initialized": saved["initialized"],
+        "length_sum": torch.tensor(saved["length_sum"], device=env.device),
+        "episode_count": torch.tensor(saved["episode_count"], device=env.device, dtype=torch.long),
+        "total_episodes": torch.tensor(saved["total_episodes"], device=env.device, dtype=torch.long),
+        "start_step": torch.full((env.num_envs,), env.common_step_counter, device=env.device, dtype=torch.long),
+        "observed": torch.ones(env.num_envs, device=env.device, dtype=torch.bool),
+    }
 
 
 def validate_curriculum_state(env, state, *, evaluation=False):
@@ -99,26 +140,31 @@ def validate_curriculum_state(env, state, *, evaluation=False):
             _number(fraction, "disturbance fraction", minimum=0, maximum=1)
         if len(fractions) != len(compatibility["disturbance_groups"]):
             raise ValueError("Checkpoint disturbance group count differs from the target configuration")
+        push_ranges = distribution.get("push_velocity_range")
+        if push_ranges is not None:
+            if phase != 3:
+                raise ValueError("Only Phase 3 checkpoints can contain a push curriculum")
+            magnitude = _horizontal_push_magnitude(push_ranges)
+            push_cfg = getattr(env.cfg.curriculum, "push_velocity_magnitude", None)
+            if not evaluation and push_cfg is not None and magnitude > push_cfg.params["velocity_final"] + 1e-9:
+                raise ValueError("Checkpoint push magnitude exceeds the configured velocity_final")
         steps = _integer(state["progress"]["control_steps"], "control_steps")
         if not isinstance(state["progress"]["mode_introduced"], bool):
             raise ValueError("mode_introduced must be boolean")
         if state["progress"]["mode_introduced"] != (weights[3] > 0):
             raise ValueError("Mode-introduction latch does not match the stored SQUAT_WALK weight")
         for key, elapsed in state["runtime"]["checks"].items():
-            if key not in (f"command_range:{COMMAND_NAME}", f"survival:{EVENT_NAME}:0"):
+            if key not in (f"command_range:{COMMAND_NAME}", f"survival:{EVENT_NAME}:0", PUSH_STATE_KEY):
                 raise ValueError(f"Unknown curriculum clock {key!r}")
+            if key == PUSH_STATE_KEY and push_ranges is None:
+                raise ValueError("Push curriculum clock requires stored push bounds")
             if _integer(elapsed, key) > steps:
                 raise ValueError("A curriculum clock precedes training step zero")
-        survival = state["runtime"]["survival"]
-        if survival is not None:
-            if not isinstance(survival["initialized"], bool):
-                raise ValueError("survival.initialized must be boolean")
-            _number(survival["ema"], "survival EMA", minimum=0, maximum=1)
-            count = _integer(survival["episode_count"], "episode_count")
-            total = _integer(survival["total_episodes"], "total_episodes")
-            _number(survival["length_sum"], "length_sum", minimum=0, maximum=count)
-            if total < count:
-                raise ValueError("Total episode count is smaller than the pending window")
+        _validate_survival(state["runtime"]["survival"], "survival")
+        push_survival = state["runtime"].get("push_survival")
+        if push_survival is not None and push_ranges is None:
+            raise ValueError("Push survival statistics require stored push bounds")
+        _validate_survival(push_survival, "push_survival")
     except (KeyError, TypeError, AttributeError) as exc:
         raise ValueError(f"Malformed G1 curriculum state: {exc}") from exc
 
@@ -135,9 +181,6 @@ def export_curriculum_state(env):
         fractions = [float(group["joint_noise_frac"]) for group in event.params["disturb_groups"]]
     runtime = getattr(env, "_g1_curriculum_state", {})
     step = curriculum_step(env)
-    survival = runtime.get(f"survival:{EVENT_NAME}:0")
-    if survival is not None and "ema" not in survival:
-        survival = None
     state = {
         "schema_version": 1,
         "family": "g1.lower_limb_agent",
@@ -160,17 +203,18 @@ def export_curriculum_state(env):
             "checks": {
                 key: step - value["last_update_step"] for key, value in runtime.items() if "last_update_step" in value
             },
-            "survival": None
-            if survival is None
-            else {
-                "ema": float(survival["ema"]),
-                "initialized": survival["initialized"],
-                "length_sum": float(survival["length_sum"]),
-                "episode_count": int(survival["episode_count"]),
-                "total_episodes": int(survival["total_episodes"]),
-            },
+            "survival": _export_survival(runtime.get(f"survival:{EVENT_NAME}:0")),
         },
     }
+    if env.cfg.training_phase == 3:
+        push_event = getattr(env.cfg.events, PUSH_EVENT_NAME, None)
+        if push_event is not None:
+            bounds = env.event_manager.get_term_cfg(PUSH_EVENT_NAME).params["velocity_range"]
+        else:
+            bounds = getattr(env, "_g1_restored_distribution", {}).get("push_velocity_range")
+        if bounds is not None:
+            state["distribution"]["push_velocity_range"] = {axis: list(values) for axis, values in bounds.items()}
+            state["runtime"]["push_survival"] = _export_survival(runtime.get(PUSH_STATE_KEY))
     validate_curriculum_state(env, state, evaluation=env.cfg.curriculum is None)
     return state
 
@@ -199,6 +243,19 @@ def import_curriculum_state(env, state, *, evaluation=False):
                 event_cfg.params["disturb_groups"], distribution["disturbance_fractions"], strict=True
             ):
                 group["joint_noise_frac"] = fraction
+    push_event = getattr(env.cfg.events, PUSH_EVENT_NAME, None)
+    if push_event is not None:
+        if "push_velocity_range" in distribution:
+            for cfg in (push_event, env.event_manager.get_term_cfg(PUSH_EVENT_NAME)):
+                cfg.params["velocity_range"] = {
+                    axis: tuple(bounds) for axis, bounds in distribution["push_velocity_range"].items()
+                }
+        elif state["phase"] == 3:
+            logger.warning(
+                "Legacy Phase 3 checkpoint has no push curriculum record; restarting the push course "
+                "with configured bounds %s and a fresh quality window.",
+                push_event.params["velocity_range"],
+            )
     env._g1_restored_distribution = distribution
     step = state["progress"]["control_steps"]
     env._g1_curriculum_step_offset = step - env.common_step_counter
@@ -209,15 +266,12 @@ def import_curriculum_state(env, state, *, evaluation=False):
             runtime.setdefault(key, {})["last_update_step"] = step - elapsed
         saved = state["runtime"]["survival"]
         if saved is not None:
-            runtime.setdefault(f"survival:{EVENT_NAME}:0", {}).update(
-                ema=torch.tensor(saved["ema"], device=env.device),
-                initialized=saved["initialized"],
-                length_sum=torch.tensor(saved["length_sum"], device=env.device),
-                episode_count=torch.tensor(saved["episode_count"], device=env.device, dtype=torch.long),
-                total_episodes=torch.tensor(saved["total_episodes"], device=env.device, dtype=torch.long),
-                start_step=torch.full((env.num_envs,), env.common_step_counter, device=env.device, dtype=torch.long),
-                observed=torch.ones(env.num_envs, device=env.device, dtype=torch.bool),
-            )
+            runtime.setdefault(f"survival:{EVENT_NAME}:0", {}).update(_restore_survival(env, saved))
+        push_saved = state["runtime"].get("push_survival")
+        if push_saved is not None:
+            runtime.setdefault(PUSH_STATE_KEY, {}).update(_restore_survival(env, push_saved))
+    if push_event is not None:
+        runtime.setdefault(PUSH_STATE_KEY, {}).setdefault("last_update_step", step)
     # Empty monitoring on phase transfer: wait for newly completed episodes under the new DR.
     if not same_phase and not evaluation:
         runtime[f"command_range:{COMMAND_NAME}"] = {"last_update_step": step}
