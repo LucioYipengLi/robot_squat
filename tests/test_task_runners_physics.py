@@ -58,6 +58,9 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
         common.append("env.episode_length_s=0.05")
         common.append("env.commands.wrist_pose.resampling_time_range=[0.02,0.02]")
         common.append("env.rewards.target_speed.weight=-1e-4")
+    if task == "Template-G1-Upper-Mobile-v0":
+        # Guarantee coverage of episode-held targets even with only four envs.
+        common.append("env.commands.wrist_pose.height_task.probability=1.0")
     invoke(
         [
             "-m",
@@ -121,6 +124,12 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
         assert workspace["position_tolerance_m"] == 0.01
         assert (checkpoint.parent / workspace["artifact"]).is_file()
         if task == "Template-G1-Upper-Mobile-v0":
+            prefix = "Metrics/wrist_pose/task/height_shifted/"
+            for metric in ("episodes", "failure_rate", "position_error_m", "orientation_error_rad",
+                           "position_ready_fraction", "height_shift_mean_m"):
+                assert prefix + metric in tags
+                assert all(math.isfinite(row.value) for row in events.Scalars(prefix + metric))
+            assert all(-0.150001 <= row.value <= -0.049999 for row in events.Scalars(prefix + "height_shift_mean_m"))
             vertical_tag = "Episode_Reward/base_vertical_acc"
             assert vertical_tag in tags
             assert all(math.isfinite(row.value) and row.value <= 0 for row in events.Scalars(vertical_tag))
@@ -198,6 +207,11 @@ def checked_factory(env, *args, **kwargs):
         assert command.command.shape == (4, 14)
         assert command.active_mask.shape == (4, 2)
         assert command.active_mask.sum(dim=-1).min() >= 1
+        if mobile:
+            assert command.height_task_mask.all() and torch.isinf(command.time_left).all()
+            assert ((command.height_shift >= -0.15) & (command.height_shift <= -0.05)).all()
+        else:
+            assert command.cfg.height_task is None and not command.height_task_mask.any()
         assert torch.isfinite(command.pose_error()[0]).all()
         errors = observations[:, 30:42].reshape(4, 2, 6)
         position_error, orientation_error = command.pose_error()
@@ -237,7 +251,16 @@ def short_playback(step, **kwargs):
         fixed_pose = robot.data.body_link_pose_w.torch[:, 0].clone()
     with torch.inference_mode():
         for _ in range(3):
+            if raw_env.cfg.task_family == 'upper_limb_agent':
+                command = raw_env.command_manager.get_term('wrist_pose')
+                goal = command.goal_pose_w.clone()
+                length = raw_env.episode_length_buf.clone()
+                shifted = command.height_task_mask.clone()
             step()
+            if raw_env.cfg.task_family == 'upper_limb_agent' and command.cfg.height_task is not None:
+                held = shifted & (raw_env.episode_length_buf > length)
+                torch.testing.assert_close(command.goal_pose_w[held], goal[held], atol=0, rtol=0)
+                assert (command.command_counter[held] == 1).all()
     if fixed_pose is not None:
         torch.testing.assert_close(robot.data.body_link_pose_w.torch[:, 0], fixed_pose)
     print('G1_DISPATCH_PLAYBACK_STEPS=3', flush=True)

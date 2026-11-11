@@ -327,9 +327,10 @@ def leg_synergy_manifold_exp(
     Gaussian kernel: :math:`\\exp(-\\|d_\\perp\\|^2 / \\sigma^2) - 1 \\in [-1, 0]`. ``sigma`` is the
     manifold bandwidth: at a residual distance of one sigma the penalty reaches 63% of its
     maximum. The result is non-positive, so it is meant to be mounted with a positive weight.
-    When ``velocity_command_name`` is given, the term is additionally gated to zero-velocity
-    command environments (see :func:`_zero_command_gate`), since the walking swing/stance gait
-    naturally leaves the sagittal squatting manifold.
+    When ``velocity_command_name`` is given, ``zero_modes`` selects the active command modes
+    through :func:`_zero_command_gate`. The default (0, 1) selects STAND/SQUAT; the separately
+    configured WALK term uses (2,) and excludes SQUAT_WALK. The plane is a squatting prior;
+    applying it to walking regularizes joint coordination without prescribing gait phase.
     
     Note:
         ``asset_cfg.joint_names`` must list the six pitch joints in the order

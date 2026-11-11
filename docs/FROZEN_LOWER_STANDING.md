@@ -11,7 +11,9 @@ Upper 使用 **21维动作空间**，动作顺序为 `[vx_raw, vy_raw, yaw_raw, 
 
 高度偏置为零表示默认站立高度，双腿仍会根据全身状态进行反馈调整。
 速度和高度由 Upper 策略选择，冻结 Lower 将其转换为腿部关节动作；零速度时继续反馈控制平衡。
-速度和高度共用 `lower_command_rate` 变化惩罚，高度不加入幅值或越界惩罚。腕部采样范围保持原配置，未加入第三类目标采样。
+速度和高度共用 `lower_command_rate` 变化惩罚，高度不加入幅值或越界惩罚。
+Mobile按回合混合70%常规目标与30%额外高度随机化目标，第二类世界Z额外降低5～15 cm并保持整回合。
+采样配置、分类指标与对照命令见 [Upper高度目标说明](UPPER_HEIGHT_TARGETS.md)。
 Mobile 另启用 `base_vertical_acc`，以软阈值约束实际竖直冲击；它对骨盆世界Z方向的运动质量计费。
 原 `Template-G1-Upper-v0` 继续作为固定底座对照。
 
@@ -88,14 +90,15 @@ step_reward = weight * cost * step_dt
 
 默认权重 `-0.10`，保留H2配置；奖励管理器再乘控制步长。它是每控制步差分，不除以 dt，单位为无量纲。
 四个分量直接求和，共用相同权重；原始代价范围为 `[0,16]`。
-高度按正负两侧各自的范围归一化：默认高度从 `-0.15 m` 变为 `+0.02 m` 时，`u_h` 从 `-1` 变为 `+1`，高度差分代价为4。
-相同的归一化差分对应相同代价；默认负向 `0.1` 对应15 mm、正向 `0.1` 对应2 mm，物理变化尺度不同。
+高度按正负两侧各自的范围归一化：默认高度从 `-0.25 m` 变为 `+0.02 m` 时，`u_h` 从 `-1` 变为 `+1`，高度差分代价为4。
+相同的归一化差分对应相同代价；默认负向 `0.1` 对应25 mm、正向 `0.1` 对应2 mm，物理变化尺度不同。
 某个接口 `enabled=false` 时，其分量和差分状态归零，另一接口继续计费；若高度范围某侧端点为0，该侧有效命令按0处理。
 同一控制周期重复读取不推进历史；局部重置清空对应子环境的命令及差分状态。
 不同原始输出若限幅到同一个有效命令，变化代价为零。持续保持非零命令同样没有变化代价。
 TensorBoard 记录为 `Episode_Reward/lower_command_rate`；可通过 `env.rewards.lower_command_rate.weight` 调整权重。
 H0及更早版本的该日志仅覆盖三维速度；新版本加入高度后，代价的统计范围变为四维，跨版本对比需区分这一口径。
-21动作/107观测的H0检查点可以直接续训。已有模型只执行play时输出保持原状，新增奖励通过后续训练影响策略。
+21动作/107观测的H0检查点可以直接续训。复现旧实验的动作映射与目标采样时，
+需按 [Upper高度目标说明](UPPER_HEIGHT_TARGETS.md) 显式配置原高度范围和第二类比例。
 
 ### 可选命令与基座运动惩罚
 
@@ -129,7 +132,7 @@ H0及更早版本的该日志仅覆盖三维速度；新版本加入高度后，
 
 ### 竖直冲击软惩罚 `base_vertical_acc`
 
-首版默认权重为 **`-0.05`**，软阈值为 **`4.0 m/s²`**，四项三轴基座运动惩罚仍保持0。
+当前默认权重沿用H3B的 **`-0.03`**，软阈值为 **`4.0 m/s²`**，四项三轴基座运动惩罚仍保持0。
 `a_z` 是骨盆link原点相对世界Z方向的实际线加速度，使用刚体运动学从质心换算，不使用控制步末速度差分。
 该项与末端相对骨盆加速度分别评价基座和上肢自身运动。
 
@@ -157,7 +160,7 @@ H0～H2回放与正常运动标定给出的首版依据为：
 
 | 配置 | 默认值 |
 | --- | ---: |
-| `env.rewards.base_vertical_acc.weight` | `-0.05` |
+| `env.rewards.base_vertical_acc.weight` | `-0.03` |
 | `env.rewards.base_vertical_acc.params.soft_limit` | `4.0` |
 | `env.rewards.lower_command_rate.weight` | `-0.10` |
 
@@ -165,12 +168,12 @@ TensorBoard 新增 `Episode_Reward/base_vertical_acc`。它是已加权、经回
 关闭新项可设置 `env.rewards.base_vertical_acc.weight=0.0`；子步缓存仍维护。
 诊断可读取 `joint_pos.mean_base_vertical_acc_excess_l2(soft_limit=4.0)`，原 `mean_base_motion_l2()` 四列接口保持不变。
 
-建议先从同一H2检查点、相同种子各续训300轮，仅改变新项权重：
+以下为历史H2同起点续训对照示例，显式保留原高度范围，仅改变竖直项权重：
 
 ```powershell
-uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 --checkpoint .\logs\rsl_rl\g1_upper_mobile\2026-11-08_15-39-55_Lower_command_H2\model_1199.pt --num_envs 4096 --seed 1591316204 --max_iterations 300 --viz none physics=isaacsim_physx agent.run_name=H3A_vertical_off env.rewards.lower_command_rate.weight=-0.10 env.rewards.base_vertical_acc.weight=0.0
+uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 --checkpoint .\logs\rsl_rl\g1_upper_mobile\2026-11-08_15-39-55_Lower_command_H2\model_1199.pt --num_envs 4096 --seed 1591316204 --max_iterations 300 --viz none physics=isaacsim_physx agent.run_name=H3A_vertical_off env.actions.height_offset.height_offset_range=[-0.15,0.02] env.commands.wrist_pose.height_task.probability=0.0 env.rewards.lower_command_rate.weight=-0.10 env.rewards.base_vertical_acc.weight=0.0
 
-uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 --checkpoint .\logs\rsl_rl\g1_upper_mobile\2026-11-08_15-39-55_Lower_command_H2\model_1199.pt --num_envs 4096 --seed 1591316204 --max_iterations 300 --viz none physics=isaacsim_physx agent.run_name=H3B_vertical_on env.rewards.lower_command_rate.weight=-0.10 env.rewards.base_vertical_acc.weight=-0.05 env.rewards.base_vertical_acc.params.soft_limit=4.0
+uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 --checkpoint .\logs\rsl_rl\g1_upper_mobile\2026-11-08_15-39-55_Lower_command_H2\model_1199.pt --num_envs 4096 --seed 1591316204 --max_iterations 300 --viz none physics=isaacsim_physx agent.run_name=H3B_vertical_on env.actions.height_offset.height_offset_range=[-0.15,0.02] env.commands.wrist_pose.height_task.probability=0.0 env.rewards.lower_command_rate.weight=-0.10 env.rewards.base_vertical_acc.weight=-0.05 env.rewards.base_vertical_acc.params.soft_limit=4.0
 ```
 
 评估使用相同目标，重点复查预先选定的中低位问题样本、竖直冲击、足端运动和接触切换，并同时检查腕部跟踪及高度使用分布。
@@ -188,14 +191,19 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-Mobile-v0
 
 | 配置 | 默认值 | 含义 |
 | --- | --- | --- |
-| `height_offset_range` | `(-0.15, 0.02)` | 相对默认根高度的目标偏置，m，必须包含0 |
+| `height_offset_range` | `(-0.25, 0.02)` | 相对默认根高度的目标偏置，m，必须包含0 |
 | `enabled` | `True` | 关闭后固定为默认站高，保留一维动作接口 |
 
 设 `u=clip(height_raw,-1,1)`，负半轴映射到范围下限，正半轴映射到上限。
-默认 `u=-1/0/+1` 对应 `-0.15/0/+0.02 m`，`u=-0.5/+0.5` 对应 `-0.075/+0.01 m`。
+默认 `u=-1/0/+1` 对应 `-0.25/0/+0.02 m`，`u=-0.5/+0.5` 对应 `-0.125/+0.01 m`。
 高度目标不额外平滑或积分，由冻结Lower执行反馈控制。零动作严格对应默认站高。
 高度通过 `lower_command_rate` 参与四维归一化命令变化惩罚，保持任意恒定高度时该分量为零。
 幅值和越界惩罚仍只覆盖三维速度；上肢动作变化项仍只覆盖17维腰臂动作。
+
+高度下限由 `-0.15 m` 扩展到 `-0.25 m` 后，相同负向归一化动作及其变化量对应的物理高度量扩大为原来的5/3。
+相同负向物理高度差分对应的归一化差分代价为原来的0.36倍，权重仍为 `-0.10`。
+动作/观测维度不变，旧21动作检查点可加载；回放H0～H3B等旧范围实验时需显式添加
+`env.actions.height_offset.height_offset_range=[-0.15,0.02]`，保持原有的动作到高度映射。
 
 调整范围或固定高度：
 
@@ -240,11 +248,12 @@ env.actions.height_offset.enabled=false
 
 每回合将根节点恢复到该子环境原点对应的默认位置和朝向，所有关节及PD目标同步重置，起始速度为零。
 下肢速度及高度命令、变化代价、上一动作、观测历史及统计缓冲仅清理被重置的子环境。
-第一版不随机化根位姿，因此腕部默认采样基准可在各回合复用。
+根位姿保持标称重置，因此腕部默认采样基准可在各回合复用；第二类高度偏移叠加在世界Z轴。
 
 Mobile 在原有上肢奖励上增加 `termination`，权重为 `-10`，由奖励管理器乘控制步长。
 机身倾斜超过 `0.8 rad` 或根节点高度低于 `0.45 m` 会终止回合，超时单独处理。
-默认根高度0.75 m，高度偏置范围对应目标根高度0.60–0.77 m，保留当前终止阈值。
+默认根高度0.75 m，高度偏置范围对应目标根高度0.50–0.77 m，保留当前终止阈值0.45 m。
+最低目标距终止阈值为0.05 m；实际跟踪超调与全身运动仍需在目标场景中验证。
 后续开放更深下蹲或地形时，需同步调整合法高度与失败判据。
 
 TensorBoard除原有训练和腕部指标外，记录以下冻结控制指标：

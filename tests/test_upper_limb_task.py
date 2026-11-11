@@ -200,6 +200,133 @@ def test_distance_duration_uses_farthest_active_goal_and_new_cfg_only_at_next_sa
     torch.testing.assert_close(term.time_left, torch.full((3,), 3.0))
 
 
+@pytest.mark.parametrize("mode", [0, 1, 2], ids=["left", "right", "both"])
+@pytest.mark.parametrize("shift", [-0.15, 0.4])
+def test_height_targets_use_world_z_and_active_wrists_independently_of_lower_and_tilt(mode, shift, pose_command):
+    term = pose_command
+    term.cfg.mode_probabilities = tuple(float(i == mode) for i in range(3))
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=1, shift_range=(shift, shift))
+    # A tilted sampling frame distinguishes world Z from local pelvis Z.
+    term._sampling_quat_w[:] = quat_from_euler_xyz(torch.full((3,), 0.4), torch.full((3,), -0.3), torch.zeros(3))
+    for offsets in (term.cfg.left_offsets, term.cfg.right_offsets):
+        offsets.pos_z = (0.08, 0.08)
+    term.reset()
+    expected = term.default_wrist_pose_e.clone()
+    expected[..., :3] += term._env.scene.env_origins[:, None]
+    expected[..., :3] += quat_apply(term._sampling_quat_w, torch.tensor([0.0, 0.0, 0.08]).expand(3, -1))[:, None]
+    expected[..., 2] += shift * term.active_mask
+    torch.testing.assert_close(term.goal_pose_w, expected)
+    torch.testing.assert_close(term.height_shift, torch.full((3,), shift))
+    assert term.height_task_mask.all() and torch.isinf(term.time_left).all()
+    # No Lower configuration is present in this fixture; even positive/large shifts are allowed.
+    if mode != 2:
+        neutral = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]).expand(3, -1)
+        torch.testing.assert_close(term.command.reshape(3, 2, 7)[:, 1 - mode], neutral)
+        assert not idle_arm_default_pose(term._env, "wrist_pose").any()
+
+
+def test_zero_height_probability_preserves_original_goals_modes_timers_and_rng(pose_command):
+    term = pose_command
+    term.cfg.mode_probabilities = (0.33, 0.33, 0.34)
+    term.cfg.left_offsets.pos_x = (-0.05, 0.15)
+    term.cfg.right_offsets.pos_z = (-0.05, 0.20)
+    torch.manual_seed(273)
+    term.reset()
+    expected = [v.clone() for v in (term.goal_pose_w, term.mode_id, term.time_left, torch.get_rng_state())]
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0)
+    torch.manual_seed(273)
+    term.reset()
+    actual = (term.goal_pose_w, term.mode_id, term.time_left, torch.get_rng_state())
+    for current, before in zip(actual, expected, strict=True):
+        torch.testing.assert_close(current, before, atol=0, rtol=0)
+    assert not term.height_task_mask.any() and not term.height_shift.any()
+
+
+def test_height_task_probability_and_range_are_sampled_independently(pose_command):
+    term = pose_command
+    # Exercise the real vectorized sampler on enough episodes to detect a swapped probability.
+    count = 12000
+    term.height_task_mask = torch.zeros(count, dtype=torch.bool)
+    term.height_shift = torch.zeros(count)
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0.3, shift_range=(-0.15, -0.05))
+    torch.manual_seed(427)
+    term._sample_height_task(torch.arange(count))
+    assert 0.28 < term.height_task_mask.float().mean() < 0.32
+    assert not term.height_shift[~term.height_task_mask].any()
+    shifts = term.height_shift[term.height_task_mask]
+    assert (shifts >= -0.15).all() and (shifts <= -0.05).all()
+    assert shifts.mean().item() == pytest.approx(-0.1, abs=0.002)
+
+
+def test_mixed_tasks_keep_height_goals_and_mode_but_regular_goals_resample(pose_command):
+    term = pose_command
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=1, shift_range=(-0.1, -0.1))
+    term.reset()
+    term.height_task_mask[1] = False
+    term.height_shift[1] = 0
+    term.command_counter.zero_()
+    term._resample(torch.arange(3))
+    goal, mode, shift = term.goal_pose_w.clone(), term.mode_id.clone(), term.height_shift.clone()
+    term.cfg.left_offsets.pos_x = (0.2, 0.2)
+    term.cfg.height_task.shift_range = (-0.2, -0.2)  # Applies on the next reset only.
+    term.time_left.zero_()  # Even a forced expiry must respect the episode hold.
+    term.compute(0.02)
+    torch.testing.assert_close(term.goal_pose_w[[0, 2]], goal[[0, 2]])
+    assert not torch.allclose(term.goal_pose_w[1], goal[1])
+    torch.testing.assert_close(term.command_counter, torch.tensor([1, 2, 1]))
+    torch.testing.assert_close(term.mode_id, mode)
+    torch.testing.assert_close(term.height_shift, shift)
+    assert torch.isinf(term.time_left[[0, 2]]).all() and torch.isfinite(term.time_left[1])
+    # Pelvis motion changes the policy observation while the world goal remains fixed.
+    observation = term.command.clone()
+    term.robot.data.body_link_pose_w.torch[:, 1, 2] -= 0.1
+    term.compute(0.02)
+    assert not torch.allclose(term.command, observation)
+    torch.testing.assert_close(term.goal_pose_w[[0, 2]], goal[[0, 2]])
+
+
+def test_height_task_partial_reset_changes_only_reset_environments(pose_command):
+    term = pose_command
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=1, shift_range=(-0.1, -0.1))
+    term.reset()
+    buffers = (
+        term.height_task_mask, term.height_shift, term.goal_pose_w, term.mode_id, term.command_counter, term.time_left,
+    )
+    before = [v.clone() for v in buffers]
+    term.cfg.height_task.probability = 0
+    term.reset(torch.tensor([0]))
+    assert not term.height_task_mask[0] and term.height_shift[0] == 0 and torch.isfinite(term.time_left[0])
+    for current, previous in zip(buffers, before, strict=True):
+        torch.testing.assert_close(current[1:], previous[1:])
+
+
+def test_optional_interval_resampling_keeps_height_shift_fixed_within_episode(pose_command):
+    term = pose_command
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(
+        probability=1, shift_range=(-0.1, -0.1), hold_episode=False
+    )
+    term.reset()
+    goal, shift = term.goal_pose_w.clone(), term.height_shift.clone()
+    term.cfg.left_offsets.pos_x = (0.2, 0.2)
+    term.time_left.zero_()
+    term.compute(0.02)
+    assert torch.isfinite(term.time_left).all() and (term.command_counter == 2).all()
+    assert not torch.allclose(term.goal_pose_w, goal)
+    torch.testing.assert_close(term.height_shift, shift)
+    torch.testing.assert_close(term.goal_pose_w[..., 2], goal[..., 2])
+
+
+@pytest.mark.parametrize("change", [
+    {"probability": -0.1}, {"probability": 1.1}, {"probability": float("nan")},
+    {"shift_range": (0.1,)}, {"shift_range": (-0.05, -0.15)}, {"shift_range": (float("inf"), 0.0)},
+    {"hold_episode": "true"},
+])
+def test_invalid_height_task_configuration_fails_before_scene_access(change):
+    height = BimanualPoseCommandCfg.HeightTaskCfg(**change)
+    with pytest.raises(ValueError, match="height_task"):
+        BimanualPoseCommand(BimanualPoseCommandCfg(height_task=height), None)
+
+
 def test_rewards_gate_inactive_targets_keep_dual_scale_and_ignore_quaternion_sign(pose_command):
     term = pose_command
     term.mode_id[:] = torch.tensor([0, 1, 2])
@@ -342,6 +469,53 @@ def test_metrics_average_valid_steps_by_mode_and_partial_reset_preserves_other_s
     assert term._metric_steps[0] == 0 and term._metric_steps[2] == 0
 
 
+def test_task_metrics_use_completed_class_active_arm_means_and_reset_only_selected_buffers(pose_command):
+    term, env = pose_command, pose_command._env
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0)
+    term.mode_id[:] = torch.tensor([0, 1, 2])
+    term.height_task_mask[:] = torch.tensor([False, True, True])
+    term.height_shift[:] = torch.tensor([0.0, -0.1, -0.15])
+    term.goal_pose_w[..., 0] += torch.tensor([[0.005, 100.0], [100.0, 0.02], [0.005, 0.005]])
+    env.reset_terminated = torch.tensor([False, True, False])
+    env.reset_time_outs = torch.tensor([True, False, True])
+    for _ in range(2):
+        term._update_metrics()
+    third_ready, third_steps = term._position_ready_sum[2].clone(), term._metric_steps[2].clone()
+    logs = term.reset(torch.tensor([0, 1]))
+    assert logs["task/regular/episodes"] == logs["task/height_shifted/episodes"] == 1
+    assert logs["task/regular/failure_rate"] == 0 and logs["task/height_shifted/failure_rate"] == 1
+    assert logs["task/regular/position_error_m"] == pytest.approx(0.005, abs=1e-6)
+    assert logs["task/height_shifted/position_error_m"] == pytest.approx(0.02, abs=1e-6)
+    assert logs["task/regular/position_ready_fraction"] == 1
+    assert logs["task/height_shifted/position_ready_fraction"] == 0
+    assert logs["task/height_shifted/height_shift_mean_m"] == pytest.approx(-0.1)
+    assert not term._position_ready_sum[:2].any() and not term._metric_steps[:2].any()
+    assert term._position_ready_sum[2] == third_ready and term._metric_steps[2] == third_steps
+    logs = term._task_metrics(torch.tensor([2]))
+    assert logs["task/height_shifted/position_error_m"] == pytest.approx(0.005, abs=1e-6)
+    assert logs["task/height_shifted/position_ready_fraction"] == 1
+    assert logs["task/height_shifted/failure_rate"] == 0
+
+
+def test_task_failure_counts_include_one_step_episodes_without_zero_pose_metrics(pose_command):
+    term, env = pose_command, pose_command._env
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0)
+    term.height_task_mask[:] = torch.tensor([False, True, True])
+    env.episode_length_buf[:] = torch.tensor([1, 1, 0])
+    env.reset_terminated = torch.tensor([False, True, True])
+    env.reset_time_outs = torch.tensor([True, False, False])
+    logs = term._task_metrics(torch.arange(3))
+    assert logs["task/regular/episodes"] == logs["task/height_shifted/episodes"] == 1
+    assert logs["task/height_shifted/failure_rate"] == 1
+    pose_metrics = ("position_error_m", "orientation_error_rad", "position_ready_fraction")
+    assert not any(key.endswith(pose_metrics) for key in logs)
+    env.reset_terminated.zero_()
+    env.reset_time_outs.zero_()  # Explicit resets are not naturally completed episodes.
+    logs = term._task_metrics(torch.arange(3))
+    assert logs["task/regular/episodes"] == logs["task/height_shifted/episodes"] == 0
+    assert not any(key.endswith("failure_rate") for key in logs)
+
+
 @pytest.mark.parametrize(
     "change,match",
     [
@@ -414,6 +588,18 @@ def quality_command(pose_command):
     term._env.episode_length_buf = torch.ones(3, dtype=torch.long)
     term.mode_id[:] = torch.tensor([0, 1, 2])
     return term
+
+
+def test_task_readiness_reuses_workspace_position_tolerance_and_joint_active_gate(quality_command):
+    term, env = quality_command, quality_command._env
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0)
+    term.cfg.workspace_quality.position_tolerance_m = 0.02
+    term.goal_pose_w[..., 0] += 0.015
+    env.reset_terminated = torch.zeros(3, dtype=torch.bool)
+    env.reset_time_outs = torch.ones(3, dtype=torch.bool)
+    term._update_metrics()
+    logs = term._episode_metrics(torch.arange(3))
+    assert logs["task/regular/position_ready_fraction"] == logs["workspace_quality/position_ready_fraction"] == 1
 
 
 def test_workspace_reward_uses_fresh_world_goals_masks_idle_and_ignores_orientation(quality_command):

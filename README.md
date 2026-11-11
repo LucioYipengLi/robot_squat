@@ -96,10 +96,12 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-Mobile-v0
 ```
 
 默认下肢模型为 `2026-10-21_22-59-54/model_9999.pt`，权重冻结，腿脚参数跟随最新 Lower 配置。
-初始速度范围为 `vx ±0.3 m/s、vy ±0.1 m/s、ωz ±0.3 rad/s`，高度偏置范围为 `[-0.15, 0.02] m`，零动作保持默认站高。
+初始速度范围为 `vx ±0.3 m/s、vy ±0.1 m/s、ωz ±0.3 rad/s`，高度偏置范围为 `[-0.25, 0.02] m`，零动作保持默认站高。
 `lower_command_rate=-0.10` 保留H2的四维归一化命令变化约束；保持恒定高度时该分量为零。
-`base_vertical_acc=-0.05` 对骨盆世界Z加速度超过4 m/s²的部分施加软惩罚，覆盖全部物理子步。
-幅值与越界惩罚仍只约束速度，权重保留R9C配置；腕部目标采样范围保持原配置。
+`base_vertical_acc=-0.03` 沿用H3B配置，对骨盆世界Z加速度超过4 m/s²的部分施加软惩罚，覆盖全部物理子步。
+幅值与越界惩罚仍只约束速度，权重保留R9C配置。
+Mobile默认混合70%常规目标、30%额外降低5～15 cm的高度目标；第二类整回合保持。
+参数、分类指标和续训对照见 [Upper高度目标说明](docs/UPPER_HEIGHT_TARGETS.md)。
 旧 Mobile 的20动作/106观测模型（包括R9C系列）需重新训练或显式迁移。配置、零命令对照、回放及验证见 [冻结下肢控制说明](docs/FROZEN_LOWER_STANDING.md)。
 
 ### 首次训练：Phase 1

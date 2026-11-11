@@ -99,11 +99,13 @@ Its reward weight defaults to zero while diagnostics remain active. See the [wor
 
 `Template-G1-Upper-Mobile-v0` lets Upper choose base-frame `vx`, `vy`, yaw rate, and a target height offset for frozen Lower.
 It uses 21 actions (3 velocities, 1 height offset, then 17 Upper joints) and 107 observations. Velocity bounds are
-±0.3 m/s, ±0.1 m/s and ±0.3 rad/s; height offsets range from −0.15 to +0.02 m, with zero action preserving default height.
+±0.3 m/s, ±0.1 m/s and ±0.3 rad/s; height offsets range from −0.25 to +0.02 m, with zero action preserving default height.
 The shared `lower_command_rate=-0.10` retains H2's penalty on changes in all four normalized velocity/height commands;
 holding any constant height has zero height-change cost. Magnitude and overflow costs still cover only velocities,
-with the R9C weights retained. Wrist target sampling is unchanged.
-`base_vertical_acc=-0.05` adds a soft penalty above 4 m/s² for pelvis-link world-Z acceleration, covering every physics substep.
+with the R9C weights retained. Mobile samples regular targets in 70% of episodes and adds a shared world-Z
+shift of −0.15 to −0.05 m to active wrist targets in the other 30%, holding the full shifted poses until reset.
+See the [height target guide](docs/UPPER_HEIGHT_TARGETS.md) (Chinese) for configuration, metrics and paired continuation runs.
+`base_vertical_acc=-0.03` retains the H3B setting and adds a soft penalty above 4 m/s² for pelvis-link world-Z acceleration, covering every physics substep.
 Set both `env.actions.lower_command.enabled=false` and `env.actions.height_offset.enabled=false` for a zero-command control.
 Older 20-action/106-observation Mobile checkpoints require retraining or explicit migration.
 See the [frozen Lower control guide](docs/FROZEN_LOWER_STANDING.md) (Chinese).

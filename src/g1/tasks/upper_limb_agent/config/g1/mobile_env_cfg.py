@@ -4,7 +4,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.utils import configclass
+from isaaclab.utils import configclass, replace
 
 from ... import mdp
 from .env_cfg import (
@@ -37,7 +37,7 @@ class MobileActionsCfg:
     )
     height_offset = mdp.LowerHeightCommandActionCfg(
         asset_name="robot",
-        height_offset_range=(-0.15, 0.02),  # m relative to default root height; zero action keeps standing height.
+        height_offset_range=(-0.25, 0.02),  # m relative to default root height; zero action keeps standing height.
         enabled=True,  # False fixes height at zero and excludes it from lower_command_rate.
     )
     joint_pos = mdp.FrozenLowerActionCfg(
@@ -51,6 +51,18 @@ class MobileActionsCfg:
         base_body_name="pelvis",  # Link origin for all three-axis world base-motion costs.
         acceleration_reference_body_name=ActionsCfg().joint_pos.acceleration_reference_body_name,
         acceleration_body_names=ActionsCfg().joint_pos.acceleration_body_names,
+    )
+
+
+@configclass
+class MobileCommandsCfg(CommandsCfg):
+    wrist_pose = replace(
+        CommandsCfg().wrist_pose,
+        height_task=mdp.BimanualPoseCommandCfg.HeightTaskCfg(
+            probability=0.30,  # 每回合：70%常规目标、30%额外高度随机化目标。
+            shift_range=(-0.15, -0.05),  # 世界Z额外偏移，m；独立于Lower能力和高度命令范围。
+            hold_episode=True,  # 第二类整个位姿保持一回合；常规目标仍按原间隔刷新。
+        ),
     )
 
 
@@ -101,7 +113,7 @@ class MobileRewardsCfg(RewardsCfg):
     # H0-H2 calibration: allow ordinary crouching/walking, penalize vertical impulses.
     base_vertical_acc = RewTerm(
         func=mdp.base_vertical_acc_excess_l2_substeps,
-        weight=-0.05,
+        weight=-0.06,
         params={"action_name": "joint_pos", "soft_limit": 4.0},
     )
     # Failure affects Upper's return; the frozen Lower actor receives no optimizer updates.
@@ -121,7 +133,7 @@ class UpperLimbMobileEnvCfg(UpperLimbAgentEnvCfg):
     scene: MobileSceneCfg = MobileSceneCfg(num_envs=4096, env_spacing=2.5)
     actions: MobileActionsCfg = MobileActionsCfg()
     observations: MobileObservationsCfg = MobileObservationsCfg()
-    commands: CommandsCfg = CommandsCfg()
+    commands: MobileCommandsCfg = MobileCommandsCfg()
     events: MobileEventsCfg = MobileEventsCfg()
     rewards: MobileRewardsCfg = MobileRewardsCfg()
     terminations: MobileTerminationsCfg = MobileTerminationsCfg()

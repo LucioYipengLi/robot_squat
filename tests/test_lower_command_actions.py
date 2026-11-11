@@ -40,13 +40,13 @@ def test_height_zero_asymmetric_bounds_clipping_and_partial_reset():
     assert term.action_dim == 1 and not term.processed_actions.any()
     values = torch.tensor([[-2.0], [0.0], [2.0]])
     term.process_actions(values)
-    torch.testing.assert_close(term.processed_actions, torch.tensor([[-0.15], [0.0], [0.02]]))
+    torch.testing.assert_close(term.processed_actions, torch.tensor([[-0.25], [0.0], [0.02]]))
     torch.testing.assert_close(term.raw_actions, values)
     term.process_actions(torch.tensor([[-0.5], [0.5], [1.0]]))
-    torch.testing.assert_close(term.processed_actions, torch.tensor([[-0.075], [0.01], [0.02]]))
+    torch.testing.assert_close(term.processed_actions, torch.tensor([[-0.125], [0.01], [0.02]]))
     term.apply_actions()
     term.reset(torch.tensor([1]))
-    torch.testing.assert_close(term.processed_actions, torch.tensor([[-0.075], [0.0], [0.02]]))
+    torch.testing.assert_close(term.processed_actions, torch.tensor([[-0.125], [0.0], [0.02]]))
     assert not term.raw_actions[1].any()
     term.cfg.enabled = False
     term.process_actions(values)
@@ -274,7 +274,7 @@ def test_manager_publishes_current_commands_and_upper_preview_before_one_lower_i
     values[:, 4:] = 0.2
     env.action_manager.process_action(values)
     assert len(calls) == 1
-    expected = torch.tensor([-0.075, 0.15, -0.1, 0.3, 0, 0]).expand(3, -1)
+    expected = torch.tensor([-0.125, 0.15, -0.1, 0.3, 0, 0]).expand(3, -1)
     torch.testing.assert_close(calls[0][:, :6], expected)
     torch.testing.assert_close(calls[0][:, 6:23], torch.full((3, 17), 0.1))
     torch.testing.assert_close(bridge.last_lower_observations, calls[0])
@@ -321,7 +321,7 @@ def test_height_changes_only_affect_shared_rate_and_keep_velocity_amplitude_and_
     env.action_manager.process_action(values)
     values[:, 3] = -8.0
     env.action_manager.process_action(values)
-    torch.testing.assert_close(calls[-1][:, 0], torch.full((3,), -0.15))
+    torch.testing.assert_close(calls[-1][:, 0], torch.full((3,), -0.25))
     torch.testing.assert_close(lower_command_rate_l2(env), torch.full((3,), 4.0))
     assert not action_term_rate_l2(env, "joint_pos").any()
     torch.testing.assert_close(lower_command_overflow_l2(env), torch.full((3,), 5.0))
@@ -372,10 +372,10 @@ def test_height_tracking_metric_pairs_physical_height_with_previous_target(monke
     assert not bridge._motion_sum[:, 0].any()
     data = env.scene["robot"].data
     data.root_pos_w.torch = data.root_pos_w.torch.clone()
-    data.root_pos_w.torch[:, 2] = 0.65  # Default 0.8 plus previous -0.15 command.
+    data.root_pos_w.torch[:, 2] = 0.55  # Default 0.8 plus previous -0.25 command.
     env.action_manager.process_action(torch.zeros_like(values))
     torch.testing.assert_close(bridge._motion_sum[:, 0], torch.zeros(3), atol=1e-7, rtol=0)
-    torch.testing.assert_close(bridge._motion_sum[:, 8], torch.full((3,), -0.15))
+    torch.testing.assert_close(bridge._motion_sum[:, 8], torch.full((3,), -0.25))
 
 
 def test_command_penalties_use_named_term_and_reward_manager_weight_dt_once(monkeypatch):

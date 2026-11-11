@@ -34,6 +34,8 @@ class BimanualPoseCommand(CommandTerm):
     Modes are left-only, right-only and both. World goals are authoritative;
     ``command`` returns their current pelvis-relative poses, left then right.
     Inactive goals have a neutral observation and contribute no tracking reward.
+    Optional height tasks add one episode-wide world-Z shift shared by active
+    wrists. Their complete poses can be held until reset, independently of Lower.
     """
 
     cfg: BimanualPoseCommandCfg
@@ -56,6 +58,8 @@ class BimanualPoseCommand(CommandTerm):
         self._env_ids = torch.arange(self.num_envs, device=self.device)
         self.mode_id = torch.full((self.num_envs,), 2, device=self.device, dtype=torch.long)
         self._mode_masks = torch.tensor([[True, False], [False, True], [True, True]], device=self.device)
+        self.height_task_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.height_shift = torch.zeros(self.num_envs, device=self.device)
         self.goal_pose_w = torch.zeros(self.num_envs, 2, 7, device=self.device)
         self.goal_pose_w[..., 6] = 1.0
         self.default_wrist_pose_e = self.goal_pose_w.clone()
@@ -66,6 +70,7 @@ class BimanualPoseCommand(CommandTerm):
         self._orientation_sum = torch.zeros_like(self._position_sum)
         self._idle_deviation_sum = torch.zeros_like(self._position_sum)
         self._metric_steps = torch.zeros(self.num_envs, device=self.device)
+        self._position_ready_sum = torch.zeros(self.num_envs, device=self.device)
         self.workspace_quality_map = None
         self._workspace_sums = None
         if cfg.workspace_quality is not None:
@@ -76,6 +81,18 @@ class BimanualPoseCommand(CommandTerm):
 
     @staticmethod
     def _validate_cfg(cfg):
+        if cfg.height_task is not None:
+            height = cfg.height_task
+            if not math.isfinite(height.probability) or not 0 <= height.probability <= 1:
+                raise ValueError("height_task.probability must be finite and in [0,1]")
+            if (
+                len(height.shift_range) != 2
+                or not all(math.isfinite(value) for value in height.shift_range)
+                or height.shift_range[0] > height.shift_range[1]
+            ):
+                raise ValueError("height_task.shift_range must contain two finite, ordered world-Z offsets [m]")
+            if not isinstance(height.hold_episode, bool):
+                raise ValueError("height_task.hold_episode must be a bool")
         if cfg.workspace_quality is not None:
             tolerance = cfg.workspace_quality.position_tolerance_m
             if not math.isfinite(tolerance) or tolerance <= 0:
@@ -188,15 +205,33 @@ class BimanualPoseCommand(CommandTerm):
         if len(ids) == 0:
             return {}
         extras = self._episode_metrics(ids)
-        for buffer in (self._position_sum, self._orientation_sum, self._idle_deviation_sum, self._metric_steps):
+        for buffer in (
+            self._position_sum, self._orientation_sum, self._idle_deviation_sum,
+            self._metric_steps, self._position_ready_sum,
+        ):
             buffer[ids] = 0
         if self._workspace_sums is not None:
             self._workspace_sums[ids] = 0
         self._capture_default_pose(ids)
         probabilities = torch.tensor(self.cfg.mode_probabilities, device=self.device, dtype=torch.float32)
         self.mode_id[ids] = torch.multinomial(probabilities, len(ids), replacement=True)
+        self._sample_height_task(ids)
         super().reset(ids)
         return extras
+
+    def _sample_height_task(self, env_ids):
+        """Sample only at reset; disabling height tasks preserves the old RNG sequence."""
+        self.height_task_mask[env_ids] = False
+        self.height_shift[env_ids] = 0
+        height = self.cfg.height_task
+        if height is None or height.probability == 0:
+            return
+        if height.probability == 1:
+            self.height_task_mask[env_ids] = True
+        else:
+            self.height_task_mask[env_ids] = torch.rand(len(env_ids), device=self.device) < height.probability
+        ids = env_ids[self.height_task_mask[env_ids]]
+        self.height_shift[ids] = torch.empty(len(ids), device=self.device).uniform_(*height.shift_range)
 
     def _capture_default_pose(self, env_ids):
         """Capture each environment once, after default joint reset and before physics steps."""
@@ -210,8 +245,13 @@ class BimanualPoseCommand(CommandTerm):
         self._reference_initialized[ids] = True
 
     def _resample(self, env_ids):
-        """Set the interval after sampling, using the most distant active wrist goal."""
+        """Keep height-task poses for the episode; regular goals use distance-based intervals."""
         ids = self._env_ids[env_ids]
+        height = self.cfg.height_task
+        if height is not None and height.hold_episode:
+            held = self.height_task_mask[ids] & (self.command_counter[ids] > 0)
+            self.time_left[ids[held]] = torch.inf
+            ids = ids[~held]
         if len(ids) == 0:
             return
         self._resample_command(ids)
@@ -219,6 +259,10 @@ class BimanualPoseCommand(CommandTerm):
         distances = (self.goal_pose_w[ids, :, :3] - pelvis[:, None, :]).norm(dim=-1)
         distance = (distances * self.active_mask[ids]).amax(dim=1)
         self.time_left[ids] = (distance / self.cfg.distance_reference_speed).clamp(*self.cfg.resampling_time_range)
+        if height is not None and height.hold_episode:
+            # A lifecycle marker, never an observation or scalar metric. Avoid
+            # floating-point timer expiry just before an episode timeout.
+            self.time_left[ids[self.height_task_mask[ids]]] = torch.inf
         self.command_counter[ids] += 1
 
     def _resample_command(self, env_ids):
@@ -240,6 +284,9 @@ class BimanualPoseCommand(CommandTerm):
             self.goal_pose_w[env_ids, side, 3:] = quat_unique(
                 quat_mul(default[:, 3:], quat_from_euler_xyz(*angles.unbind(-1)))
             )
+        # Add after rotation: this is world vertical even if the sampling pelvis
+        # is tilted. Inactive goals keep their original, masked-out poses.
+        self.goal_pose_w[env_ids, :, 2] += self.height_shift[env_ids, None] * self.active_mask[env_ids]
 
     def _update_command(self):
         # World goals stay fixed; command converts to the live pelvis frame on access.
@@ -274,6 +321,13 @@ class BimanualPoseCommand(CommandTerm):
                 )
                 * valid[:, None]
             )
+        if self.cfg.height_task is not None:
+            # Reuse Q's readiness gate when enabled. Without Q diagnostics the
+            # same all-active-wrist criterion uses the standard 1 cm tolerance.
+            ready = state.position_ready if self._workspace_sums is not None else (
+                (position <= 0.01) | ~active
+            ).all(dim=-1)
+            self._position_ready_sum += ready * valid
 
     def _episode_metrics(self, env_ids):
         extras = {}
@@ -303,6 +357,41 @@ class BimanualPoseCommand(CommandTerm):
                     extras[f"{name}/{label}_orientation_error_rad"] = (self._orientation_sum[ids, side] / steps).mean()
                 else:
                     extras[f"{name}/idle_joint_rms_rad"] = (self._idle_deviation_sum[ids, side] / steps).sqrt().mean()
+        extras.update(self._task_metrics(env_ids))
+        return extras
+
+    def _task_metrics(self, env_ids):
+        """Summarize completed episodes before reset changes their class or mode.
+
+        Failure counts include one-step episodes without pose samples. Pose
+        means retain the existing pre-terminal sampling convention. Explicit
+        resets without a termination/timeout signal are excluded from this group.
+        """
+        if self.cfg.height_task is None:
+            return {}
+        terminated = getattr(self._env, "reset_terminated", None)
+        timeouts = getattr(self._env, "reset_time_outs", None)
+        if terminated is None or timeouts is None:
+            return {}
+        completed = (terminated[env_ids] | timeouts[env_ids]) & (self._env.episode_length_buf[env_ids] > 0)
+        extras = {}
+        for shifted, name in ((False, "regular"), (True, "height_shifted")):
+            ids = env_ids[completed & (self.height_task_mask[env_ids] == shifted)]
+            prefix = f"task/{name}"
+            extras[f"{prefix}/episodes"] = torch.tensor(float(len(ids)), device=self.device)
+            if len(ids) == 0:
+                continue
+            extras[f"{prefix}/failure_rate"] = terminated[ids].float().mean()
+            if shifted:
+                extras[f"{prefix}/height_shift_mean_m"] = self.height_shift[ids].mean()
+            ids = ids[self._metric_steps[ids] > 0]
+            if len(ids) == 0:
+                continue
+            steps = self._metric_steps[ids]
+            denominator = steps * self.active_mask[ids].sum(-1)
+            extras[f"{prefix}/position_error_m"] = (self._position_sum[ids].sum(-1) / denominator).mean()
+            extras[f"{prefix}/orientation_error_rad"] = (self._orientation_sum[ids].sum(-1) / denominator).mean()
+            extras[f"{prefix}/position_ready_fraction"] = (self._position_ready_sum[ids] / steps).mean()
         return extras
 
     def _set_debug_vis_impl(self, debug_vis):
@@ -350,6 +439,20 @@ class BimanualPoseCommandCfg(CommandTermCfg):
     """
     workspace_quality: WorkspaceQualityCfg | None = None
     """Optional spatial prior and diagnostics, independent of its reward weight."""
+
+    @configclass
+    class HeightTaskCfg:
+        """Episode-level target randomization, independent of Lower's command limits."""
+
+        probability: float = 0.3
+        """Probability of selecting the height-shifted target class at episode reset."""
+        shift_range: tuple[float, float] = (-0.15, -0.05)
+        """Additional world-Z target shift [m], shared by active wrists; positive shifts are allowed."""
+        hold_episode: bool = True
+        """Hold the full target pose until reset; False retains normal interval resampling."""
+
+    height_task: HeightTaskCfg | None = None
+    """None retains original sampling. Probability 0 is a regular-only ablation with class diagnostics."""
     # TODO(curriculum): Update the offset ranges, distance_reference_speed and/or
     # resampling_time_range through the command's cfg; preserve world goals and
     # the current interval until the next sample. Keep curriculum policy outside this term.

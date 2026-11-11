@@ -245,7 +245,7 @@ def test_mobile_retains_velocity_weights_and_enables_only_the_vertical_soft_base
     assert MobileActionsCfg().joint_pos.base_body_name == "pelvis"
     assert mobile.lower_command_rate.weight == -0.10 and mobile.action_rate.weight == -0.03
     assert mobile.base_vertical_acc.func is base_vertical_acc_excess_l2_substeps
-    assert mobile.base_vertical_acc.weight == -0.05
+    assert mobile.base_vertical_acc.weight == -0.03
     assert mobile.base_vertical_acc.params == {"action_name": "joint_pos", "soft_limit": 4.0}
     assert mdp.base_vertical_acc_excess_l2_substeps is base_vertical_acc_excess_l2_substeps
     assert not hasattr(fixed, "base_vertical_acc")

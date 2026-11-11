@@ -312,6 +312,12 @@ class RewardsCfg:
             "velocity_command_name": "task_command",
         },
     )
+    # WALK-only synergy; independently tunable and disabled by default. Excludes SQUAT_WALK.
+    leg_synergy_walk = RewTerm(
+        func=mdp.leg_synergy_manifold_exp,
+        weight=0.4,
+        params={**leg_synergy.copy().params, "zero_modes": (2,)},
+    )
     # hip ankle deviation penalty
     hip_default_deviation = RewTerm(
         func=mdp.standing_joint_default_deviation_l2,

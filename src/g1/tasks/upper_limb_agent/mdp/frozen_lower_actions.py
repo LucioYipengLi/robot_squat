@@ -148,7 +148,7 @@ class LowerHeightCommandAction(ActionTerm):
 @configclass
 class LowerHeightCommandActionCfg(ActionTermCfg):
     class_type: type = LowerHeightCommandAction
-    height_offset_range: tuple[float, float] = (-0.15, 0.02)
+    height_offset_range: tuple[float, float] = (-0.25, 0.02)
     """Target offsets from default standing height [m]; zero action maps to zero offset."""
     enabled: bool = True
     """False fixes the target offset at zero while retaining the one-dimensional action."""

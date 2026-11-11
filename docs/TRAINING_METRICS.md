@@ -378,6 +378,7 @@ TensorBoard 的 [Custom Scalars](https://github.com/tensorflow/tensorboard/blob/
 | `track_velocity` | 前后、侧向、yaw 三个速度通道的指数奖励之和。 | 较高可能由其中两个通道贡献，仍需查看具体误差。 |
 | `track_pelvis_xy` | 站立/下蹲的骨盆水平偏移跟踪奖励。 | 结合骨盆误差看；静止模式占比减少也会使它下降。 |
 | `leg_synergy` | 静止模式下髋膝踝俯仰角偏离协同平面的惩罚。 | 趋近 0 表示偏离较小，不保证平衡或全部联动正确。 |
+| `leg_synergy_walk` | 仅普通 WALK 模式的髋膝踝协同平面惩罚，不包含蹲走；默认权重为 0。 | 默认曲线为 0；启用正权重后，趋近 0 表示偏离减小，需结合速度跟踪和步态判断。 |
 | `hip_default_deviation` | 近站立高度、静止模式下髋 yaw/roll 偏离默认角度的惩罚。 | 趋近 0 通常更接近参考；低高度或行走时可能未启用。 |
 | `ankle_default_deviation` | 同样条件下踝 pitch/roll 偏离默认角度的惩罚。 | 不应为了接近 0 而压制必要的平衡补偿。 |
 | `hip_yaw_soft_deviation` | 静止模式下髋 yaw 超出默认角度死区的惩罚。 | 明显变负时检查脚尖外撇或扭转；死区内为 0。 |

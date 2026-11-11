@@ -97,6 +97,7 @@ def test_upper_g1_resolves_its_own_configs():
     assert env_cfg.rewards.workspace_quality.weight == 0.0
     assert env_cfg.rewards.workspace_quality.func.__name__ == "workspace_quality_bonus"
     assert env_cfg.commands.wrist_pose.workspace_quality.position_tolerance_m == 0.01
+    assert env_cfg.commands.wrist_pose.height_task is None
     assert env_cfg.rewards.target_speed.func.__name__ == "joint_target_speed_excess_l2"
     assert env_cfg.rewards.target_speed.params == {"action_name": "joint_pos", "soft_limit": 2.5}
     for name in ("joint_vel", "torque_limits"):
@@ -132,13 +133,16 @@ def test_mobile_upper_owns_velocity_commands_and_upper_actions_and_uses_latest_l
     assert list(vars(env.actions)) == ["lower_command", "height_offset", "joint_pos"]
     assert env.actions.lower_command.command_scale == (0.3, 0.1, 0.3)
     assert env.actions.lower_command.enabled
-    assert env.actions.height_offset.height_offset_range == (-0.15, 0.02)
+    assert env.actions.height_offset.height_offset_range == (-0.25, 0.02)
     assert env.actions.height_offset.enabled
+    assert env.commands.wrist_pose.height_task.probability == 0.30
+    assert env.commands.wrist_pose.height_task.shift_range == (-0.15, -0.05)
+    assert env.commands.wrist_pose.height_task.hold_episode
     assert env.rewards.action_rate.func.__name__ == "action_term_rate_l2"
     assert env.rewards.action_rate.params == {"action_name": "joint_pos"}
     assert env.rewards.action_rate.weight == -0.03
     assert env.rewards.lower_command_rate.weight == -0.10
-    assert env.rewards.base_vertical_acc.weight == -0.05
+    assert env.rewards.base_vertical_acc.weight == -0.03
     assert env.rewards.base_vertical_acc.func.__name__ == "base_vertical_acc_excess_l2_substeps"
     assert env.rewards.base_vertical_acc.params == {"action_name": "joint_pos", "soft_limit": 4.0}
     assert env.rewards.lower_command_rate.func.__name__ == "lower_command_rate_l2"
@@ -171,6 +175,31 @@ def test_mobile_upper_owns_velocity_commands_and_upper_actions_and_uses_latest_l
     assert env.rewards.termination.weight < 0
     assert env.curriculum is None
     assert agent.experiment_name == "g1_upper_mobile"
+
+
+def test_mobile_height_target_overrides_are_independent_of_fixed_upper_and_lower_commands():
+    from isaaclab_tasks.utils.hydra import resolve_task_config
+
+    mobile, _ = resolve_task_config(
+        "Template-G1-Upper-Mobile-v0", "rsl_rl_cfg_entry_point",
+        overrides=[
+            "physics=isaacsim_physx",
+            "env.commands.wrist_pose.height_task.probability=0.0",
+            "env.commands.wrist_pose.height_task.shift_range=[-0.30,0.10]",
+            "env.commands.wrist_pose.height_task.hold_episode=false",
+        ],
+    )
+    height = mobile.commands.wrist_pose.height_task
+    assert height.probability == 0 and tuple(height.shift_range) == (-0.30, 0.10) and not height.hold_episode
+    assert mobile.actions.height_offset.height_offset_range == (-0.25, 0.02)
+    fixed, _ = resolve_task_config(
+        "Template-G1-Upper-v0", "rsl_rl_cfg_entry_point", overrides=["physics=isaacsim_physx"]
+    )
+    assert fixed.commands.wrist_pose.height_task is None
+    another, _ = resolve_task_config(
+        "Template-G1-Upper-Mobile-v0", "rsl_rl_cfg_entry_point", overrides=["physics=isaacsim_physx"]
+    )
+    assert another.commands.wrist_pose.height_task.probability == 0.30
 
 
 def test_family_is_inferred_from_registration_and_explicit_selection_is_a_check(upper_task):
@@ -450,6 +479,7 @@ def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_allows_comm
             self.step_dt = 1 / 60
             self.observation_manager = SimpleNamespace(group_obs_dim={"policy": (107,)})
             self.command_cfg = SimpleNamespace(command_scale=(0.3, 0.1, 0.3), enabled=True)
+            # Keep a historical range to verify loading into the expanded interface below.
             self.height_cfg = SimpleNamespace(height_offset_range=(-0.15, 0.02), enabled=True)
             terms = {
                 "lower_command": SimpleNamespace(cfg=self.command_cfg),
@@ -473,7 +503,7 @@ def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_allows_comm
     assert control["schema_version"] == 2
     assert control["height_offset_range"] == [-0.15, 0.02] and control["height_enabled"]
     env.command_cfg.command_scale, env.command_cfg.enabled = (0.2, 0.1, 0.2), False
-    env.height_cfg.height_offset_range, env.height_cfg.enabled = (-0.1, 0.01), False
+    env.height_cfg.height_offset_range, env.height_cfg.enabled = (-0.25, 0.02), False
     runner.load(checkpoint)
     env.action_manager.active_terms.reverse()
     with pytest.raises(ValueError, match="control interface mismatch"):
