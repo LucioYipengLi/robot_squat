@@ -28,6 +28,15 @@ class _Scene(dict):
     def __init__(self, robot, num_envs):
         super().__init__(robot=robot)
         self.env_origins = torch.zeros(num_envs, 3)
+        self.sensors = {
+            "contact_forces": SimpleNamespace(
+                find_bodies=lambda *args, **kwargs: ([0, 1], ["left", "right"]),
+                data=SimpleNamespace(
+                    current_air_time=SimpleNamespace(torch=torch.zeros(num_envs, 2)),
+                    current_contact_time=SimpleNamespace(torch=torch.ones(num_envs, 2)),
+                ),
+            ),
+        }
 
 
 def _command(num_envs=2):
@@ -42,8 +51,12 @@ def _command(num_envs=2):
             default_root_pose=SimpleNamespace(torch=root_pose),
             root_lin_vel_b=SimpleNamespace(torch=torch.zeros(num_envs, 3)),
             root_ang_vel_b=SimpleNamespace(torch=torch.zeros(num_envs, 3)),
+            body_link_pose_w=SimpleNamespace(torch=torch.zeros(num_envs, 2, 7)),
+            joint_pos=SimpleNamespace(torch=torch.zeros(num_envs, 2)),
+            default_joint_pos=SimpleNamespace(torch=torch.zeros(num_envs, 2)),
         ),
         find_bodies=lambda *args, **kwargs: ([0, 1], ["left", "right"]),
+        find_joints=lambda *args, **kwargs: ([0, 1], ["left_hip_pitch_joint", "right_hip_pitch_joint"]),
     )
     env = SimpleNamespace(
         num_envs=num_envs,
@@ -90,6 +103,25 @@ def test_action_acceleration_and_subset_resets():
     env.action_manager.action.fill_(2)
     env.action_manager.prev_action.zero_()
     torch.testing.assert_close(reward(env), torch.tensor([4.0, 4.0]))
+
+
+def test_walk_physical_metrics_use_the_existing_step_stamp_and_include_terminal_frame():
+    term, env = _command()
+    term.mode.fill_(2)
+    term.task_command[:, 1] = 0.6
+    sensor = env.scene.sensors["contact_forces"]
+    sensor.data.current_contact_time.torch[:] = torch.tensor([0.0, 0.2])
+    sensor.data.current_air_time.torch[:] = torch.tensor([0.2, 0.0])
+    env.scene["robot"].data.body_link_pose_w.torch[:, 0, 2] = 0.2
+    env.common_step_counter = 1
+    env.episode_length_buf.fill_(1)
+    term._update_metrics()
+    term._update_metrics()
+    assert term.performance.walk[0] == 2
+    term.reset(torch.tensor([0]))  # Repeated terminal sampling in reset must not add a frame.
+    assert term.performance.walk[0] == 2
+    metrics = term.performance.drain(term._mode_probs)
+    assert metrics["Performance/walk/swing_foot_height_m"] == pytest.approx(0.2)
 
 
 def test_initial_reset_has_no_success_sample():

@@ -15,6 +15,8 @@ import torch
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, wrap_to_pi, yaw_quat
 
+from ..walk import WALK_COMMAND_THRESHOLD, foot_contact_timing, moving_walk_mask
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
     from isaaclab.envs import ManagerBasedRLEnv
@@ -328,9 +330,8 @@ def leg_synergy_manifold_exp(
     manifold bandwidth: at a residual distance of one sigma the penalty reaches 63% of its
     maximum. The result is non-positive, so it is meant to be mounted with a positive weight.
     When ``velocity_command_name`` is given, ``zero_modes`` selects the active command modes
-    through :func:`_zero_command_gate`. The default (0, 1) selects STAND/SQUAT; the separately
-    configured WALK term uses (2,) and excludes SQUAT_WALK. The plane is a squatting prior;
-    applying it to walking regularizes joint coordination without prescribing gait phase.
+    through :func:`_zero_command_gate`. The default (0, 1) selects STAND/SQUAT. This plane
+    is a squatting prior; ordinary WALK uses a separate actual-liftoff joint reference.
     
     Note:
         ``asset_cfg.joint_names`` must list the six pitch joints in the order
@@ -364,6 +365,77 @@ def leg_synergy_manifold_exp(
     reward = torch.exp(-dist_sq / sigma**2) - 1.0
     zero_gate = _zero_command_gate(env, velocity_command_name, zero_modes)
     return reward if zero_gate is None else reward * zero_gate
+
+def walk_joint_reference(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "task_command",
+    swing_time: float = 0.4,
+    hip_amplitude: float = 0.30,
+    knee_amplitude: float = 0.50,
+    ankle_amplitude: float = 0.12,
+    sigma: float = 0.20,
+    speed_reference: float = 0.6,
+    command_threshold: float = WALK_COMMAND_THRESHOLD,
+) -> torch.Tensor:
+    """Match six pitch joints to an actual-air-time-driven swing reference [0,1].
+
+    Positive weight. Joint order is left hip/knee/ankle, then right hip/knee/ankle;
+    sensor order is left/right. Both entity configurations must preserve order.
+    Single support and a nonzero swing signal are required. No actuator targets,
+    phase caches or sensor timers are written. RewardManager applies weight/dt.
+    """
+    if not all(math.isfinite(value) and value > 0 for value in (swing_time, sigma, speed_reference)):
+        raise ValueError("swing_time, sigma and speed_reference must be positive and finite")
+    if not all(math.isfinite(value) and value >= 0 for value in (hip_amplitude, knee_amplitude, ankle_amplitude)):
+        raise ValueError("WALK reference amplitudes must be nonnegative and finite")
+    term = env.command_manager.get_term(command_name)
+    moving = moving_walk_mask(term.mode, term.command, command_threshold)
+    air, _, contacts = foot_contact_timing(env.scene.sensors[sensor_cfg.name], sensor_cfg.body_ids)
+    phase = (air / swing_time).clamp(0, 1)
+    lift = torch.where((air < swing_time) & ~contacts, torch.sin(torch.pi * phase).clamp_min(0), 0)
+    signal = lift - lift.flip(-1)
+    command = term.command
+    motion = command[:, 1:3].norm(dim=-1) + 0.3 * command[:, 3].abs()
+    scale = (motion / speed_reference).clamp(0.5, 1.0)[:, None]
+    directed = scale * (command[:, 1] / (2 * command_threshold)).clamp(-1, 1)[:, None]
+    asset = env.scene[asset_cfg.name]
+    q = asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
+    default = asset.data.default_joint_pos.torch[:, asset_cfg.joint_ids]
+    if q.shape[1] != 6:
+        raise ValueError("WALK joint reference requires exactly six ordered hip/knee/ankle pitch joints")
+    offset = torch.stack(
+        (-hip_amplitude * directed * signal, knee_amplitude * scale * lift, -ankle_amplitude * directed * signal),
+        dim=-1,
+    ).flatten(1)
+    error = (q - default - offset).square().mean(dim=-1)
+    single = contacts.sum(dim=-1) == 1
+    return torch.exp(-error / sigma**2) * lift.amax(dim=-1) * single * moving
+
+
+def walk_support_timing(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "task_command",
+    swing_time: float = 0.4,
+    max_stance_time: float = 0.6,
+    command_threshold: float = WALK_COMMAND_THRESHOLD,
+) -> torch.Tensor:
+    """Bounded non-single-support plus prolonged swing/stance cost [0,2].
+
+    Negative weight. Contact status and durations share the sensor's definition;
+    double support is penalized immediately, overdue durations rise and saturate.
+    """
+    if not all(math.isfinite(value) and value > 0 for value in (swing_time, max_stance_time)):
+        raise ValueError("swing_time and max_stance_time must be positive and finite")
+    term = env.command_manager.get_term(command_name)
+    moving = moving_walk_mask(term.mode, term.command, command_threshold)
+    air, contact, contacts = foot_contact_timing(env.scene.sensors[sensor_cfg.name], sensor_cfg.body_ids)
+    non_single = (contacts.sum(dim=-1) != 1).float()
+    overdue = torch.maximum((air / swing_time - 1).clamp(0, 1), (contact / max_stance_time - 1).clamp(0, 1))
+    return (non_single + overdue.mean(dim=-1)) * moving
+
 
 def feet_ground_parallel_var(
     env: ManagerBasedRLEnv,

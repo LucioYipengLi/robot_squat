@@ -112,6 +112,9 @@ See the [frozen Lower control guide](docs/FROZEN_LOWER_STANDING.md) (Chinese).
 
 ### Initial training: Phase 1
 
+Ordinary WALK uses actual-liftoff joint references and support-duration shaping; squat-walk retains the phase clock.
+See the [WALK reward guide](docs/WALK_REWARDS.md) (Chinese) for the local settings, metrics and validation.
+
 ```bash
 uv run --extra isaacsim python -m g1.rl train --task Template-G1-v0 --max_iterations 10000 physics=isaacsim_physx
 ```

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from .walk import moving_walk_mask
+
 MODE_NAMES = ("stand", "squat", "walk", "squat_walk")
 STEP_FIELDS = ("height_offset_m", "command_speed_xy_mps", "command_yaw_abs_radps")
 EPISODE_FIELDS = (
@@ -51,6 +53,8 @@ class ModePerformanceMonitor:
         self.events = torch.zeros((4, 2), device=device)
         self.terminations: dict[str, torch.Tensor] = {}
         self.excluded = torch.zeros(3, device=device)
+        # Moving WALK frames, single-support frames, swing-link Z sum, hip mean-square sum.
+        self.walk = torch.zeros(4, device=device)
         # Evaluation can consume terminal records without changing training log columns.
         self.episode_callback = None
 
@@ -81,6 +85,27 @@ class ModePerformanceMonitor:
         self.mixed |= valid & (mode != self.start_mode)
         context = torch.stack((command[:, 0], command[:, 1:3].norm(dim=1), command[:, 3].abs()), dim=1)
         self.steps.index_add_(0, mode, torch.cat((valid[:, None].float(), context * valid[:, None]), dim=1))
+
+    def sample_walk(self, mode, valid, command, contacts, foot_height_w, hip_deviation):
+        """Sample physical WALK diagnostics with the command's once-per-step mask.
+
+        Motion selection uses the common 0.1 m/s / 0.2 rad/s diagnostic thresholds.
+        Foot height is the link origin in world Z, not sole clearance. Hip RMS is
+        relative to default angles and includes both hips in each selected frame.
+        """
+        moving = valid & moving_walk_mask(mode, command)
+        single = moving & (contacts.sum(dim=-1) == 1)
+        swing_height = (foot_height_w * ~contacts).sum(dim=-1)
+        values = torch.stack(
+            (
+                moving.float(),
+                single.float(),
+                torch.where(single, swing_height, 0),
+                torch.where(moving, hip_deviation.square().mean(dim=-1), 0),
+            ),
+            dim=-1,
+        )
+        self.walk.add_(values.sum(dim=0))
 
     def finish(self, env_ids, *, step, lengths, terminated, time_outs, reasons, max_steps):
         """Log eligible episodes and return nonempty tracking results for range gates."""
@@ -185,7 +210,8 @@ class ModePerformanceMonitor:
         reason_values = [self.terminations[name][:, None] for name in reason_names]
         rows = torch.cat((self.steps, self.episodes, self.pelvis, self.events, *reason_values), dim=1).cpu().tolist()
         probs = (probabilities / probabilities.sum()).detach().cpu().tolist()
-        excluded = self.excluded.cpu().tolist()
+        extra_counts = torch.cat((self.excluded, self.walk)).cpu().tolist()
+        excluded, walk = extra_counts[:3], extra_counts[3:]
         result = {}
         total_steps = sum(row[0] for row in rows)
         total_episodes = sum(row[4] for row in rows)
@@ -218,6 +244,11 @@ class ModePerformanceMonitor:
                 result[prefix + "disturbance_hz"] = events / (steps * self.step_dt)
             if events:
                 result[prefix + "disturbance_arm_fraction"] = fraction / events
+        if walk[0]:
+            result["Performance/walk/single_stance_fraction"] = walk[1] / walk[0]
+            result["Performance/walk/hip_pitch_rms_rad"] = (walk[3] / walk[0]) ** 0.5
+            if walk[1]:
+                result["Performance/walk/swing_foot_height_m"] = walk[2] / walk[1]
         for name, value in zip(("manual_episodes", "partial_episodes", "mixed_mode_episodes"), excluded, strict=True):
             result["Performance/excluded/" + name] = value
         self.steps.zero_()
@@ -225,6 +256,7 @@ class ModePerformanceMonitor:
         self.pelvis.zero_()
         self.events.zero_()
         self.excluded.zero_()
+        self.walk.zero_()
         for values in self.terminations.values():
             values.zero_()
         return result

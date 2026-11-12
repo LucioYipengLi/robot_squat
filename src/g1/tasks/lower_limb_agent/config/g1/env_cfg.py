@@ -35,11 +35,14 @@ from isaaclab_tasks.utils import PresetCfg
 from ... import mdp
 from ...mdp.actions import LowerBodyPositionActionCfg
 from ...motion import UpperBodyMotionCfg
+from ...walk import WALK_COMMAND_THRESHOLD
 
 ##
 # Pre-defined configs
 ##
 from .utils import G1_29DOF_CFG
+
+WALK_SWING_TIME = 0.4
 
 
 @configclass
@@ -97,7 +100,10 @@ class LowerLimbAgentSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = replace(G1_29DOF_CFG, prim_path="{ENV_REGEX_NS}/Robot")
 
     # sensors
-    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/[^/]*", history_length=3, track_air_time=True)
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/[^/]*", history_length=3, track_air_time=True,
+        force_threshold=1.0,  # Preserve this machine's PhysX timer threshold.
+    )
 
     # lights
     dome_light = AssetBaseCfg(
@@ -312,11 +318,39 @@ class RewardsCfg:
             "velocity_command_name": "task_command",
         },
     )
-    # WALK-only synergy; independently tunable and disabled by default. Excludes SQUAT_WALK.
-    leg_synergy_walk = RewTerm(
-        func=mdp.leg_synergy_manifold_exp,
-        weight=0.4,
-        params={**leg_synergy.copy().params, "zero_modes": (2,)},
+    # Actual-liftoff-driven WALK shaping. STAND/SQUAT keep the original synergy term.
+    walk_joint_reference = RewTerm(
+        func=mdp.walk_joint_reference,
+        weight=2.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=list(leg_synergy.params["asset_cfg"].joint_names), preserve_order=True,
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"], preserve_order=True,
+            ),
+            "command_name": "task_command",
+            "swing_time": WALK_SWING_TIME,
+            "hip_amplitude": 0.30,
+            "knee_amplitude": 0.50,
+            "ankle_amplitude": 0.12,
+            "sigma": 0.20,
+            "speed_reference": 0.6,
+            "command_threshold": WALK_COMMAND_THRESHOLD,
+        },
+    )
+    walk_support_timing = RewTerm(
+        func=mdp.walk_support_timing,
+        weight=-0.75,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"], preserve_order=True,
+            ),
+            "command_name": "task_command",
+            "swing_time": WALK_SWING_TIME,
+            "max_stance_time": 0.6,
+            "command_threshold": WALK_COMMAND_THRESHOLD,
+        },
     )
     # hip ankle deviation penalty
     hip_default_deviation = RewTerm(
@@ -419,6 +453,7 @@ class RewardsCfg:
             "stride_freq_intercept": 0.595,
             "stride_freq_slope": 0.395,
             "std": 0.3,
+            "walk_modes": (2, 3,),  
         },
     )
 

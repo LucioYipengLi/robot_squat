@@ -22,6 +22,8 @@ __all__ = [
     "track_ang_vel_z_world_exp",
     "knee_guidance_l1",
     "leg_synergy_manifold_exp",
+    "walk_joint_reference",
+    "walk_support_timing",
     "feet_ground_parallel_var",
     "feet_parallel_var",
     "feet_lateral_separation",
@@ -95,5 +97,7 @@ from .rewards import (
     track_pelvis_height_exp,
     track_pelvis_xy_exp,
     track_velocity_exp,
+    walk_joint_reference,
+    walk_support_timing,
     zero_velocity_exp,
 )

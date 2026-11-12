@@ -106,6 +106,9 @@ Mobile默认混合70%常规目标、30%额外降低5～15 cm的高度目标；�
 
 ### 首次训练：Phase 1
 
+普通 WALK 使用实际离地计时驱动的髋膝踝参考和支撑时长奖励，蹲走保留原步态时钟。
+配置、本机保留参数和物理指标见 [WALK 奖励说明](docs/WALK_REWARDS.md)。
+
 ```bash
 uv run --extra isaacsim python -m g1.rl train --task Template-G1-v0 --max_iterations 10000 physics=isaacsim_physx
 ```

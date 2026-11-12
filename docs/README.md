@@ -6,6 +6,7 @@
 | [修复归档](CODE_REVIEW_ARCHIVE.md) | 已完成修复、设计选择与验证记录。 |
 | [课程检查点](CURRICULUM_CHECKPOINTS.md) | 三阶段续训、课程状态保存/恢复及旧检查点迁移。 |
 | [训练性能指标](TRAINING_METRICS.md) | 逐模式生存、跟踪、样本分配、扰动暴露及统计口径。 |
+| [WALK 奖励](WALK_REWARDS.md) | 实际离地驱动的关节参考、支撑时长约束及本机保留参数。 |
 | [统一评估框架](EVALUATION.md) | 快速评估与 TensorBoard 查看；自定义套件、指标定义及执行机制。 |
 | [上肢渐进扰动](UPPER_BODY_MOTION.md) | 平滑参考、参数、重置、统一评估套件、执行统计及验证边界。 |
 | [模型遥操作](TELEOP.md) | 人工控制、键盘/手柄映射、几何可视化及代码组织。 |

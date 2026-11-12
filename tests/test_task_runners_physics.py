@@ -53,6 +53,16 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
         "agent.actor.hidden_dims=[16]",
         "agent.critic.hidden_dims=[16]",
     ]
+    if family == "lower_limb_agent":
+        common.extend(
+            [
+                "env.episode_length_s=0.05",
+                "env.commands.task_command.rel_mode_envs=(0,0,1,0)",
+                "env.commands.task_command.ranges.lin_vel_x=(0.6,0.6)",
+                "env.commands.task_command.ranges.lin_vel_y=(0,0)",
+                "env.commands.task_command.ranges.ang_vel_z=(0,0)",
+            ]
+        )
     if family == "upper_limb_agent":
         # Exercise repeated physical/PD resets during the short rollout and playback.
         common.append("env.episode_length_s=0.05")
@@ -84,6 +94,13 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
         state = infos["g1_curriculum"]
         assert state["family"] == "g1.lower_limb_agent" and state["phase"] == 1
         assert state["progress"]["control_steps"] == 8
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+        events = EventAccumulator(str(checkpoint.parent)).Reload()
+        assert events.Scalars("Episode_Reward/walk_joint_reference")
+        assert events.Scalars("Episode_Reward/walk_support_timing")
+        assert events.Scalars("Performance/task_command/walk/single_stance_fraction")
+        assert events.Scalars("Performance/task_command/walk/hip_pitch_rms_rad")
     else:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
@@ -125,8 +142,14 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
         assert (checkpoint.parent / workspace["artifact"]).is_file()
         if task == "Template-G1-Upper-Mobile-v0":
             prefix = "Metrics/wrist_pose/task/height_shifted/"
-            for metric in ("episodes", "failure_rate", "position_error_m", "orientation_error_rad",
-                           "position_ready_fraction", "height_shift_mean_m"):
+            for metric in (
+                "episodes",
+                "failure_rate",
+                "position_error_m",
+                "orientation_error_rad",
+                "position_ready_fraction",
+                "height_shift_mean_m",
+            ):
                 assert prefix + metric in tags
                 assert all(math.isfinite(row.value) for row in events.Scalars(prefix + metric))
             assert all(-0.150001 <= row.value <= -0.049999 for row in events.Scalars(prefix + "height_shift_mean_m"))
@@ -168,6 +191,10 @@ original_factory = project_runner.create_task_runner
 def checked_factory(env, *args, **kwargs):
     global raw_env
     raw_env = env.unwrapped
+    if raw_env.cfg.task_family == 'lower_limb_agent':
+        assert env.num_actions == 12 and env.get_observations()['policy'].shape == (4, 650)
+        assert raw_env.reward_manager.get_term_cfg('track_pelvis_height').weight == 2.0
+        assert raw_env.reward_manager.get_term_cfg('vertical_bounce').weight == -0.5
     if raw_env.cfg.task_family == 'upper_limb_agent':
         from g1.tasks.upper_limb_agent.mdp.actions import UPPER_BODY_JOINT_NAMES
         robot = raw_env.scene['robot']

@@ -34,6 +34,9 @@ _GROUPS = (
             ("高度跟踪成功率 ↑", "height_tracking_success_rate"),
             ("速度跟踪成功率 ↑", "velocity_tracking_success_rate"),
             ("骨盆逐步成功率 ↑", "pelvis_step_success_rate"),
+            ("WALK 单支撑比例", "single_stance_fraction"),
+            ("WALK 摆动足 link 高度 (m)", "swing_foot_height_m"),
+            ("WALK 髋俯仰 RMS (rad)", "hip_pitch_rms_rad"),
         ),
     ),
     (
@@ -87,8 +90,13 @@ def performance_layout(command_names=("task_command",)):
             category = layout.category.add(title=f"{title} · {name}", closed=index != 0)
             categories[title[:2]] = category
             for chart_title, metric in charts:
-                # Pelvis tracking has no definition for walking modes; do not invent curves.
-                modes = _MODES[:2] if metric in ("error_pelvis_xy_m", "pelvis_step_success_rate") else _MODES
+                # Plot only modes where the measurement is defined.
+                if metric in ("single_stance_fraction", "swing_foot_height_m", "hip_pitch_rms_rad"):
+                    modes = ("walk",)
+                elif metric in ("error_pelvis_xy_m", "pelvis_step_success_rate"):
+                    modes = _MODES[:2]
+                else:
+                    modes = _MODES
                 tags = [f"^{re.escape(prefix + mode + '/' + metric)}$" for mode in modes]
                 category.chart.add(title=chart_title).multiline.tag.extend(tags)
         categories["03"].chart.add(title="排除回合数").multiline.tag.extend(

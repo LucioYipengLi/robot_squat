@@ -15,6 +15,7 @@ from isaaclab.managers import CommandTerm
 from isaaclab.markers import VisualizationMarkers
 
 from g1.tasks.lower_limb_agent.performance import ModePerformanceMonitor
+from g1.tasks.lower_limb_agent.walk import foot_contact_timing
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -136,6 +137,13 @@ class SquatWalkCommand(CommandTerm):
         self._support_foot_ids, _ = self.robot.find_bodies(list(cfg.support_foot_body_names), preserve_order=True)
         if len(self._support_foot_ids) != 2 or len(set(self._support_foot_ids)) != 2:
             raise ValueError("骨盆偏置参考系必须精确匹配两个不同的足部 link。")
+        self._walk_sensor = env.scene.sensors["contact_forces"]
+        self._walk_sensor_ids, _ = self._walk_sensor.find_bodies(list(cfg.support_foot_body_names), preserve_order=True)
+        self._walk_hip_ids, _ = self.robot.find_joints(
+            ["left_hip_pitch_joint", "right_hip_pitch_joint"], preserve_order=True
+        )
+        if len(self._walk_sensor_ids) != 2 or len(self._walk_hip_ids) != 2:
+            raise ValueError("WALK diagnostics require two ordered feet and two hip-pitch joints")
 
         # 前四维兼容原切片；最后两维是限速后的有效骨盆 X-Y 目标。
         self.task_command = torch.zeros(self.num_envs, 6, device=self.device)
@@ -302,6 +310,13 @@ class SquatWalkCommand(CommandTerm):
         error_yaw = torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b.torch[:, 2])
         pelvis_error = torch.linalg.vector_norm(self.pelvis_error_xy(), dim=-1)
         self.performance.sample(self.mode, valid, error_height, error_xy, error_yaw, pelvis_error, self.task_command)
+        _, _, contacts = foot_contact_timing(self._walk_sensor, self._walk_sensor_ids)
+        foot_height = self.robot.data.body_link_pose_w.torch[:, self._support_foot_ids, 2]
+        hip_deviation = (
+            self.robot.data.joint_pos.torch[:, self._walk_hip_ids]
+            - self.robot.data.default_joint_pos.torch[:, self._walk_hip_ids]
+        )
+        self.performance.sample_walk(self.mode, valid, self.task_command, contacts, foot_height, hip_deviation)
 
     def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> dict[str, float]:
         """Finalize one shared episode record, retain curriculum flags and draw new modes.
