@@ -15,6 +15,12 @@ from isaaclab.utils import to_dict
 class UpperLimbOnPolicyRunner(OnPolicyRunner):
     """Keep PPO updates unchanged and archive the configured prior and frozen Lower model."""
 
+    def _range_curriculum(self):
+        manager = getattr(self.env.unwrapped, "command_manager", None)
+        if manager is not None and "wrist_pose" in manager.active_terms:
+            return getattr(manager.get_term("wrist_pose"), "range_curriculum", None)
+        return None
+
     def _frozen_lower(self):
         manager = getattr(self.env.unwrapped, "action_manager", None)
         if manager is None or "joint_pos" not in manager.active_terms:
@@ -28,20 +34,42 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
             return None
         command = manager.get_term("lower_command")
         height = manager.get_term("height_offset")
-        return {
-            "schema_version": 2,
+        pelvis = manager.get_term("pelvis_offset")
+        joint_cfg = manager.get_term("joint_pos").cfg
+        control = {
+            "schema_version": 4,
+            "action_mapping": "episode_range",
+            "range_command_names": [
+                command.cfg.range_command_name,
+                height.cfg.range_command_name,
+                pelvis.cfg.range_command_name,
+            ],
             "action_terms": list(manager.active_terms),
             "action_dimensions": list(manager.action_term_dim),
             "policy_observation_dim": raw.observation_manager.group_obs_dim["policy"][0],
             "upper_joint_names": list(manager.get_term("joint_pos")._joint_names),
-            "command_scale": list(command.cfg.command_scale),
+            "command_ranges": command.cfg.command_ranges,
+            "velocity_reward_reference": command.cfg.reward_reference_scale,
+            "velocity_magnitude_normalization": "episode_range",
             "commands_enabled": command.cfg.enabled,
             "height_offset_range": list(height.cfg.height_offset_range),
             "height_enabled": height.cfg.enabled,
+            "height_reward_reference": height.cfg.reward_reference_range,
+            "pelvis_ranges": pelvis.cfg.offset_ranges,
+            "pelvis_reward_reference": pelvis.cfg.reward_reference_scale,
+            "pelvis_target_speed": pelvis.cfg.target_speed,
+            "pelvis_enabled": pelvis.cfg.enabled,
+            "use_training_envelope": joint_cfg.use_training_envelope,
+            "standing_thresholds": (joint_cfg.standing_linear_threshold, joint_cfg.standing_yaw_threshold),
             "control_dt": raw.step_dt,
         }
+        return json.loads(json.dumps(control))
 
     def save(self, path, infos=None):
+        curriculum = self._range_curriculum()
+        if curriculum is not None:
+            infos = copy.deepcopy(infos) if infos is not None else {}
+            infos["g1_upper_ranges"] = curriculum.state_dict(self.env.unwrapped.common_step_counter)
         control = self._control_interface()
         if control is not None:
             infos = copy.deepcopy(infos) if infos is not None else {}
@@ -98,22 +126,33 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
         control = self._control_interface()
         saved_control = (saved.get("infos") or {}).get("g1_control_interface")
         if control is not None:
-            # Bounds and enabled are experiment settings that may be overridden.
-            # Structure and timing must match to interpret network weights safely.
+            # Enabled flags permit playback ablations; layout, mapping and cost scales are structural.
+            # Magnitude normalization is recorded for audits, allowing reward changes on fine-tuning.
             keys = (
                 "schema_version",
+                "action_mapping",
+                "range_command_names",
                 "action_terms",
                 "action_dimensions",
                 "policy_observation_dim",
                 "upper_joint_names",
                 "control_dt",
+                "command_ranges",
+                "velocity_reward_reference",
+                "height_offset_range",
+                "height_reward_reference",
+                "pelvis_ranges",
+                "pelvis_reward_reference",
+                "pelvis_target_speed",
+                "use_training_envelope",
+                "standing_thresholds",
             )
             if saved_control is None or any(saved_control.get(key) != control[key] for key in keys):
                 raise ValueError(
-                    "Mobile Upper control interface mismatch: expected 21 actions "
-                    "[lower_command:3, height_offset:1, joint_pos:17] and 107 observations. "
-                    "Older Mobile checkpoints (including 20-action/106-observation) require retraining "
-                    "or explicit weight migration."
+                    "Mobile Upper control interface mismatch: expected 23 actions "
+                    "[lower_command:3, height_offset:1, pelvis_offset:2, joint_pos:17], 109 observations "
+                    "with episode-range action mapping and matching physical/reward scales. "
+                    "A1 schema-3 fixed-maximum mappings and older 21/107 or 20/106 checkpoints require retraining."
                 )
         elif saved_control is not None:
             raise ValueError("This mobile Upper checkpoint requires the velocity-command environment")
@@ -126,7 +165,27 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
                 raise ValueError("Frozen Lower model or interface differs from the Upper checkpoint")
         elif expected is not None:
             raise ValueError("A mobile Upper checkpoint requires the frozen Lower environment")
-        return super().load(path, load_cfg, strict, map_location)
+        curriculum = self._range_curriculum()
+        range_state = (saved.get("infos") or {}).get("g1_upper_ranges")
+        if curriculum is not None and not curriculum.cfg.reset_on_load:
+            if range_state is None:
+                raise ValueError("Upper range curriculum state is missing; use range_curriculum.reset_on_load=true")
+            # Validate and restore before any simulation reset; PPO owns all optimizer restoration.
+            curriculum.load_state_dict(range_state, self.env.unwrapped.common_step_counter)
+        elif curriculum is not None:
+            curriculum.restart(self.env.unwrapped.common_step_counter)
+        elif range_state is not None and curriculum is None:
+            raise ValueError("Checkpoint requires an Upper range curriculum configuration")
+        result = super().load(path, load_cfg, strict, map_location)
+        if curriculum is not None:
+            raw = self.env.unwrapped
+            command = raw.command_manager.get_term("wrist_pose")
+            command._restoring_ranges = True
+            try:
+                raw.reset()  # Fresh physical episodes; checkpoint stores curriculum, not simulator state.
+            finally:
+                command._restoring_ranges = False
+        return result
 
 
 def create_upper_limb_runner(env, agent_cfg, log_dir=None, *, snapshot_path=None, evaluation=False):
@@ -135,4 +194,8 @@ def create_upper_limb_runner(env, agent_cfg, log_dir=None, *, snapshot_path=None
         raise ValueError("Upper-limb training currently supports OnPolicyRunner only")
     if snapshot_path is not None:
         raise ValueError("upper_limb_agent does not support --curriculum-snapshot")
-    return UpperLimbOnPolicyRunner(env, to_dict(agent_cfg), log_dir=log_dir, device=agent_cfg.device)
+    runner = UpperLimbOnPolicyRunner(env, to_dict(agent_cfg), log_dir=log_dir, device=agent_cfg.device)
+    curriculum = runner._range_curriculum()
+    if curriculum is not None:
+        curriculum.evaluation = evaluation
+    return runner

@@ -83,6 +83,15 @@ def test_upper_g1_resolves_its_own_configs():
     assert env_cfg.commands.wrist_pose.reference_body_name == "pelvis"
     assert env_cfg.commands.wrist_pose.body_names == ("left_wrist_yaw_link", "right_wrist_yaw_link")
     for index, side in enumerate(("left", "right")):
+        position = getattr(env_cfg.rewards, f"{side}_position")
+        assert position.weight == 1.0
+        assert position.params == {
+            "command_name": "wrist_pose",
+            "arm_index": index,
+            "std": 0.1,
+            "sigma_fine": 0.01,
+            "fine_weight": 0.4,
+        }
         orientation = getattr(env_cfg.rewards, f"{side}_orientation")
         assert orientation.weight > 0
         assert orientation.func.__name__ == "end_effector_orientation_tracking"
@@ -96,7 +105,7 @@ def test_upper_g1_resolves_its_own_configs():
     assert env_cfg.rewards.target_speed.weight == 0.0
     assert env_cfg.rewards.workspace_quality.weight == 0.0
     assert env_cfg.rewards.workspace_quality.func.__name__ == "workspace_quality_bonus"
-    assert env_cfg.commands.wrist_pose.workspace_quality.position_tolerance_m == 0.01
+    assert env_cfg.commands.wrist_pose.workspace_quality.position_tolerance_m == 0.008
     assert env_cfg.commands.wrist_pose.height_task is None
     assert env_cfg.rewards.target_speed.func.__name__ == "joint_target_speed_excess_l2"
     assert env_cfg.rewards.target_speed.params == {"action_name": "joint_pos", "soft_limit": 2.5}
@@ -130,10 +139,14 @@ def test_mobile_upper_owns_velocity_commands_and_upper_actions_and_uses_latest_l
     env, agent = resolve_task_config(task, "rsl_rl_cfg_entry_point", overrides=["physics=isaacsim_physx"])
     assert resolve_task_family(task) == "upper_limb_agent"
     assert env.actions.joint_pos.class_type.__name__ == "FrozenLowerAction"
-    assert list(vars(env.actions)) == ["lower_command", "height_offset", "joint_pos"]
-    assert env.actions.lower_command.command_scale == (0.3, 0.1, 0.3)
+    assert list(vars(env.actions)) == ["lower_command", "height_offset", "pelvis_offset", "joint_pos"]
+    assert env.actions.lower_command.command_ranges == ((-0.5, 1.0), (-0.2, 0.2), (-0.8, 0.8))
+    assert env.actions.lower_command.reward_reference_scale == (0.3, 0.1, 0.3)
     assert env.actions.lower_command.enabled
-    assert env.actions.height_offset.height_offset_range == (-0.25, 0.02)
+    assert env.actions.height_offset.height_offset_range == (-0.4, 0.05)
+    assert env.actions.height_offset.reward_reference_range == (-0.25, 0.02)
+    assert env.actions.pelvis_offset.offset_ranges == ((-0.03, 0.03), (-0.03, 0.03))
+    assert env.commands.wrist_pose.range_curriculum.num_levels == 11
     assert env.actions.height_offset.enabled
     assert env.commands.wrist_pose.height_task.probability == 0.30
     assert env.commands.wrist_pose.height_task.shift_range == (-0.15, -0.05)
@@ -142,13 +155,14 @@ def test_mobile_upper_owns_velocity_commands_and_upper_actions_and_uses_latest_l
     assert env.rewards.action_rate.params == {"action_name": "joint_pos"}
     assert env.rewards.action_rate.weight == -0.03
     assert env.rewards.lower_command_rate.weight == -0.10
-    assert env.rewards.base_vertical_acc.weight == -0.03
+    assert env.rewards.base_vertical_acc.weight == -0.12
     assert env.rewards.base_vertical_acc.func.__name__ == "base_vertical_acc_excess_l2_substeps"
     assert env.rewards.base_vertical_acc.params == {"action_name": "joint_pos", "soft_limit": 4.0}
     assert env.rewards.lower_command_rate.func.__name__ == "lower_command_rate_l2"
     assert env.rewards.lower_command_rate.params == {
         "action_name": "lower_command",
         "height_action_name": "height_offset",
+        "pelvis_action_name": "pelvis_offset",
     }
     assert env.observations.policy.actions.func.__name__ == "term_action"
     assert env.observations.policy.lower_command.func.__name__ == "lower_velocity_command"
@@ -181,7 +195,8 @@ def test_mobile_height_target_overrides_are_independent_of_fixed_upper_and_lower
     from isaaclab_tasks.utils.hydra import resolve_task_config
 
     mobile, _ = resolve_task_config(
-        "Template-G1-Upper-Mobile-v0", "rsl_rl_cfg_entry_point",
+        "Template-G1-Upper-Mobile-v0",
+        "rsl_rl_cfg_entry_point",
         overrides=[
             "physics=isaacsim_physx",
             "env.commands.wrist_pose.height_task.probability=0.0",
@@ -191,7 +206,7 @@ def test_mobile_height_target_overrides_are_independent_of_fixed_upper_and_lower
     )
     height = mobile.commands.wrist_pose.height_task
     assert height.probability == 0 and tuple(height.shift_range) == (-0.30, 0.10) and not height.hold_episode
-    assert mobile.actions.height_offset.height_offset_range == (-0.25, 0.02)
+    assert mobile.actions.height_offset.height_offset_range == (-0.4, 0.05)
     fixed, _ = resolve_task_config(
         "Template-G1-Upper-v0", "rsl_rl_cfg_entry_point", overrides=["physics=isaacsim_physx"]
     )
@@ -469,26 +484,28 @@ def test_mobile_runner_keeps_frozen_parameters_outside_ppo_and_checks_model_iden
         fixed.load(checkpoint)
 
 
-def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_allows_command_overrides(tmp_path):
+def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_physical_remapping(tmp_path):
     class MobileEnv(_UpperEnv):
-        num_actions = 21
+        num_actions = 23
 
         def __init__(self):
             super().__init__()
-            self.state = torch.zeros(self.num_envs, 107)
+            self.state = torch.zeros(self.num_envs, 109)
             self.step_dt = 1 / 60
-            self.observation_manager = SimpleNamespace(group_obs_dim={"policy": (107,)})
-            self.command_cfg = SimpleNamespace(command_scale=(0.3, 0.1, 0.3), enabled=True)
-            # Keep a historical range to verify loading into the expanded interface below.
-            self.height_cfg = SimpleNamespace(height_offset_range=(-0.15, 0.02), enabled=True)
+            self.observation_manager = SimpleNamespace(group_obs_dim={"policy": (109,)})
+            from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileActionsCfg
+
+            actions = MobileActionsCfg()
+            self.command_cfg, self.height_cfg = actions.lower_command, actions.height_offset
             terms = {
                 "lower_command": SimpleNamespace(cfg=self.command_cfg),
                 "height_offset": SimpleNamespace(cfg=self.height_cfg),
-                "joint_pos": SimpleNamespace(_joint_names=[f"upper_{i}" for i in range(17)]),
+                "pelvis_offset": SimpleNamespace(cfg=actions.pelvis_offset),
+                "joint_pos": SimpleNamespace(_joint_names=[f"upper_{i}" for i in range(17)], cfg=actions.joint_pos),
             }
             self.action_manager = SimpleNamespace(
-                active_terms=["lower_command", "height_offset", "joint_pos"],
-                action_term_dim=[3, 1, 17],
+                active_terms=["lower_command", "height_offset", "pelvis_offset", "joint_pos"],
+                action_term_dim=[3, 1, 2, 17],
                 get_term=terms.__getitem__,
             )
 
@@ -498,13 +515,31 @@ def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_allows_comm
     runner.save(checkpoint)
     saved = torch.load(checkpoint, weights_only=False)
     control = saved["infos"]["g1_control_interface"]
-    assert control["action_dimensions"] == [3, 1, 17] and control["policy_observation_dim"] == 107
-    assert control["command_scale"] == [0.3, 0.1, 0.3] and control["commands_enabled"]
-    assert control["schema_version"] == 2
-    assert control["height_offset_range"] == [-0.15, 0.02] and control["height_enabled"]
-    env.command_cfg.command_scale, env.command_cfg.enabled = (0.2, 0.1, 0.2), False
-    env.height_cfg.height_offset_range, env.height_cfg.enabled = (-0.25, 0.02), False
+    assert control["action_dimensions"] == [3, 1, 2, 17] and control["policy_observation_dim"] == 109
+    assert control["velocity_reward_reference"] == [0.3, 0.1, 0.3] and control["commands_enabled"]
+    assert control["schema_version"] == 4 and control["action_mapping"] == "episode_range"
+    assert control["velocity_magnitude_normalization"] == "episode_range"
+    assert control["height_offset_range"] == [-0.4, 0.05] and control["height_enabled"]
+    env.command_cfg.enabled = env.height_cfg.enabled = False
     runner.load(checkpoint)
+    # Reward-only changes do not invalidate A2's identical control/observation layout.
+    old_magnitude = torch.load(checkpoint, weights_only=False)
+    old_magnitude["infos"]["g1_control_interface"].pop("velocity_magnitude_normalization")
+    a2 = tmp_path / "a2.pt"
+    torch.save(old_magnitude, a2)
+    runner.load(a2)
+    env.height_cfg.height_offset_range = (-0.25, 0.02)
+    with pytest.raises(ValueError, match="control interface mismatch"):
+        runner.load(checkpoint)
+    env.height_cfg.height_offset_range = (-0.4, 0.05)
+    # A1 has identical tensor dimensions but different physical action semantics.
+    old = torch.load(checkpoint, weights_only=False)
+    old["infos"]["g1_control_interface"]["schema_version"] = 3
+    old["infos"]["g1_control_interface"].pop("action_mapping")
+    a1 = tmp_path / "a1.pt"
+    torch.save(old, a1)
+    with pytest.raises(ValueError, match="A1 schema-3"):
+        runner.load(a1)
     env.action_manager.active_terms.reverse()
     with pytest.raises(ValueError, match="control interface mismatch"):
         runner.load(checkpoint)
@@ -512,7 +547,7 @@ def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_allows_comm
     saved["infos"].pop("g1_control_interface")
     legacy = tmp_path / "legacy.pt"
     torch.save(saved, legacy)
-    with pytest.raises(ValueError, match="20-action/106-observation"):
+    with pytest.raises(ValueError, match="23 actions"):
         runner.load(legacy)
     saved["infos"]["g1_control_interface"] = {
         **control,

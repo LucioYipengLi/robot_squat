@@ -57,7 +57,7 @@ def test_real_frozen_actor_matches_export_and_is_deterministic_for_batched_input
     assert not frozen_policy.model.training
     assert all(not parameter.requires_grad for parameter in frozen_policy.model.parameters())
     assert not frozen_policy(observations).requires_grad
-    assert frozen_policy.metadata["iteration"] == 9999
+    assert frozen_policy.metadata["iteration"] == 19997
     assert len(frozen_policy.metadata["sha256"]) == 64
 
 

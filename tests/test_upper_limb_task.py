@@ -67,7 +67,21 @@ def pose_command():
     ranges = BimanualPoseCommandCfg.Ranges(
         pos_x=(0, 0), pos_y=(0, 0), pos_z=(0, 0), roll=(0, 0), pitch=(0, 0), yaw=(0, 0)
     )
-    cfg = BimanualPoseCommandCfg(mode_probabilities=(0, 0, 1), left_offsets=ranges, right_offsets=ranges.copy())
+    dual = BimanualPoseCommandCfg.DualTargetsCfg(
+        pos_x=(0, 0),
+        pos_y=(0, 0),
+        pos_z=(0, 0),
+        roll=(0, 0),
+        pitch=(0, 0),
+        yaw=(0, 0),
+        separation_range=(0.3, 0.3),
+        relative_pos_x=(0, 0),
+        relative_pos_z=(0, 0),
+        max_relative_angle=0,
+    )
+    cfg = BimanualPoseCommandCfg(
+        mode_probabilities=(0, 0, 1), left_offsets=ranges, right_offsets=ranges.copy(), dual_targets=dual
+    )
     term = BimanualPoseCommand(cfg, env)
     env.command_manager = SimpleNamespace(get_term=lambda name: term)
     term.reset()
@@ -134,8 +148,9 @@ def test_world_goals_hold_while_live_pelvis_observations_change_without_command_
     torch.testing.assert_close(term.pose_error()[0], torch.zeros(3, 2), atol=1e-6, rtol=0)
     # Rewards see current world geometry even before the command manager runs.
     poses[:, 2, 0] += 0.04
-    expected = 1 - torch.tanh(torch.full((3,), 0.04) / 0.1)
-    torch.testing.assert_close(end_effector_position_tracking(term._env, "wrist_pose", 0, 0.1), expected)
+    error = torch.full((3,), 0.04)
+    expected = 0.6 * (1 - torch.tanh(error / 0.1)) + 0.4 * torch.exp(-(error / 0.01).square())
+    torch.testing.assert_close(end_effector_position_tracking(term._env, "wrist_pose", 0, 0.1, 0.01, 0.4), expected)
 
 
 def test_offsets_use_default_wrist_and_environment_origin_not_current_robot_pose(pose_command):
@@ -146,6 +161,7 @@ def test_offsets_use_default_wrist_and_environment_origin_not_current_robot_pose
     term._env.scene.env_origins[0] += torch.tensor([1.0, 2.0, 0.0])
     term.cfg.left_offsets.pos_x = (0.1, 0.1)
     term.cfg.left_offsets.yaw = (0.2, 0.2)
+    term.cfg.mode_probabilities = (1, 0, 0)
     term.reset(torch.tensor([0]))
     expected = (
         anchor[0, 0, :3] + term._env.scene.env_origins[0] + quat_apply(initial_quat[0], torch.tensor([0.1, 0.0, 0.0]))
@@ -180,6 +196,7 @@ def test_distance_duration_uses_farthest_active_goal_and_new_cfg_only_at_next_sa
     term.cfg.resampling_time_range = (0.01, 20.0)
     term.cfg.distance_reference_speed = 0.1
     term.cfg.right_offsets.pos_x = (0.5, 0.5)
+    term.cfg.dual_targets.pos_x = (0.5, 0.5)
     term.mode_id[:] = torch.tensor([0, 1, 2])
     term._resample(torch.arange(3))
     left_distance = (0.2**2 + 0.15**2 + 0.1**2) ** 0.5
@@ -208,11 +225,13 @@ def test_height_targets_use_world_z_and_active_wrists_independently_of_lower_and
     term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=1, shift_range=(shift, shift))
     # A tilted sampling frame distinguishes world Z from local pelvis Z.
     term._sampling_quat_w[:] = quat_from_euler_xyz(torch.full((3,), 0.4), torch.full((3,), -0.3), torch.zeros(3))
-    for offsets in (term.cfg.left_offsets, term.cfg.right_offsets):
+    term.mode_id.fill_(mode)
+    term.height_shift.zero_()
+    term._resample_command(torch.arange(3))
+    expected = term.goal_pose_w.clone()
+    for offsets in (term.cfg.left_offsets, term.cfg.right_offsets, term.cfg.dual_targets):
         offsets.pos_z = (0.08, 0.08)
     term.reset()
-    expected = term.default_wrist_pose_e.clone()
-    expected[..., :3] += term._env.scene.env_origins[:, None]
     expected[..., :3] += quat_apply(term._sampling_quat_w, torch.tensor([0.0, 0.0, 0.08]).expand(3, -1))[:, None]
     expected[..., 2] += shift * term.active_mask
     torch.testing.assert_close(term.goal_pose_w, expected)
@@ -268,6 +287,7 @@ def test_mixed_tasks_keep_height_goals_and_mode_but_regular_goals_resample(pose_
     term._resample(torch.arange(3))
     goal, mode, shift = term.goal_pose_w.clone(), term.mode_id.clone(), term.height_shift.clone()
     term.cfg.left_offsets.pos_x = (0.2, 0.2)
+    term.cfg.dual_targets.pos_x = (0.2, 0.2)
     term.cfg.height_task.shift_range = (-0.2, -0.2)  # Applies on the next reset only.
     term.time_left.zero_()  # Even a forced expiry must respect the episode hold.
     term.compute(0.02)
@@ -290,7 +310,12 @@ def test_height_task_partial_reset_changes_only_reset_environments(pose_command)
     term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=1, shift_range=(-0.1, -0.1))
     term.reset()
     buffers = (
-        term.height_task_mask, term.height_shift, term.goal_pose_w, term.mode_id, term.command_counter, term.time_left,
+        term.height_task_mask,
+        term.height_shift,
+        term.goal_pose_w,
+        term.mode_id,
+        term.command_counter,
+        term.time_left,
     )
     before = [v.clone() for v in buffers]
     term.cfg.height_task.probability = 0
@@ -308,6 +333,7 @@ def test_optional_interval_resampling_keeps_height_shift_fixed_within_episode(po
     term.reset()
     goal, shift = term.goal_pose_w.clone(), term.height_shift.clone()
     term.cfg.left_offsets.pos_x = (0.2, 0.2)
+    term.cfg.dual_targets.pos_x = (0.2, 0.2)
     term.time_left.zero_()
     term.compute(0.02)
     assert torch.isfinite(term.time_left).all() and (term.command_counter == 2).all()
@@ -316,11 +342,18 @@ def test_optional_interval_resampling_keeps_height_shift_fixed_within_episode(po
     torch.testing.assert_close(term.goal_pose_w[..., 2], goal[..., 2])
 
 
-@pytest.mark.parametrize("change", [
-    {"probability": -0.1}, {"probability": 1.1}, {"probability": float("nan")},
-    {"shift_range": (0.1,)}, {"shift_range": (-0.05, -0.15)}, {"shift_range": (float("inf"), 0.0)},
-    {"hold_episode": "true"},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"probability": -0.1},
+        {"probability": 1.1},
+        {"probability": float("nan")},
+        {"shift_range": (0.1,)},
+        {"shift_range": (-0.05, -0.15)},
+        {"shift_range": (float("inf"), 0.0)},
+        {"hold_episode": "true"},
+    ],
+)
 def test_invalid_height_task_configuration_fails_before_scene_access(change):
     height = BimanualPoseCommandCfg.HeightTaskCfg(**change)
     with pytest.raises(ValueError, match="height_task"):
@@ -332,10 +365,12 @@ def test_rewards_gate_inactive_targets_keep_dual_scale_and_ignore_quaternion_sig
     term.mode_id[:] = torch.tensor([0, 1, 2])
     term.goal_pose_w[..., 0] += 0.04
     term.goal_pose_w[..., 3:] *= -1
-    expected = 1 - torch.tanh(torch.full((3,), 0.04) / 0.1)
+    error = torch.full((3,), 0.04)
+    expected = 0.6 * (1 - torch.tanh(error / 0.1)) + 0.4 * torch.exp(-(error / 0.01).square())
     for side, weights in enumerate(([2.0, 0.0, 1.0], [0.0, 2.0, 1.0])):
         torch.testing.assert_close(
-            end_effector_position_tracking(term._env, "wrist_pose", side, 0.1), expected * torch.tensor(weights)
+            end_effector_position_tracking(term._env, "wrist_pose", side, 0.1, 0.01, 0.4),
+            expected * torch.tensor(weights),
         )
         torch.testing.assert_close(
             end_effector_orientation_tracking(term._env, "wrist_pose", side, 0.2462, 0.05655, 0.4),
@@ -347,6 +382,68 @@ def test_rewards_gate_inactive_targets_keep_dual_scale_and_ignore_quaternion_sig
     assert 0 < orientation_reward[2] < 1
     torch.testing.assert_close(orientation_reward[0], orientation_reward[2] * 2)
     assert orientation_reward[1] == 0
+
+
+def test_position_blend_increases_eight_mm_precision_gain_and_retains_large_error_guidance(pose_command, monkeypatch):
+    term = pose_command
+    error = torch.tensor([0.0, 0.008, 0.011])[:, None].expand(-1, 2)
+    monkeypatch.setattr(term, "pose_error", lambda: (error, torch.zeros_like(error)))
+    before = (term.goal_pose_w.clone(), term._metric_steps.clone())
+    coarse = end_effector_position_tracking(term._env, "wrist_pose", 0, 0.1, 0.01, 0.0)
+    fine = end_effector_position_tracking(term._env, "wrist_pose", 0, 0.1, 0.01, 1.0)
+    mixture = end_effector_position_tracking(term._env, "wrist_pose", 0, 0.1, 0.01, 0.4)
+    torch.testing.assert_close(fine[1:], torch.tensor([0.52729242, 0.29819728]))
+    torch.testing.assert_close(mixture, torch.tensor([1.0, 0.76301912, 0.65354384]))
+    torch.testing.assert_close(mixture, 0.6 * coarse + 0.4 * fine)
+    assert mixture[1] - mixture[2] > 3.5 * (coarse[1] - coarse[2])
+    assert torch.all(mixture[:-1] > mixture[1:])
+    torch.testing.assert_close(term.goal_pose_w, before[0], atol=0, rtol=0)
+    torch.testing.assert_close(term._metric_steps, before[1], atol=0, rtol=0)
+    error.fill_(0.1)
+    far = end_effector_position_tracking(term._env, "wrist_pose", 0, 0.1, 0.01, 0.4)
+    assert (far > 0.14).all()  # Broad tanh still guides recovery from a 10 cm error.
+
+
+@pytest.mark.parametrize(
+    "std,sigma_fine,fine_weight",
+    [
+        (0.0, 0.01, 0.4),
+        (-0.1, 0.01, 0.4),
+        (float("inf"), 0.01, 0.4),
+        (float("nan"), 0.01, 0.4),
+        (0.1, 0.0, 0.4),
+        (0.1, -0.01, 0.4),
+        (0.1, float("nan"), 0.4),
+        (0.1, float("inf"), 0.4),
+        (0.1, 0.2, 0.4),
+        (0.1, 0.01, -0.1),
+        (0.1, 0.01, 1.1),
+        (0.1, 0.01, float("nan")),
+    ],
+)
+def test_position_tracking_rejects_invalid_scales_and_blend(std, sigma_fine, fine_weight):
+    with pytest.raises(ValueError):
+        end_effector_position_tracking(None, "wrist_pose", 0, std, sigma_fine, fine_weight)
+
+
+def test_position_blend_preserves_mode_normalization_and_reward_manager_weight_dt(pose_command):
+    from isaaclab.managers import RewardManager, RewardTermCfg
+
+    term, env = pose_command, pose_command._env
+    term.mode_id[:] = torch.tensor([0, 1, 2])
+    term.goal_pose_w[..., 0] += torch.tensor([[0.011, 0.1], [0.1, 0.008], [0.0, 0.0]])
+    env.max_episode_length_s = 10.0
+    env.sim.is_playing = lambda: True
+    cfg = {
+        f"{side}_position": RewardTermCfg(
+            func=end_effector_position_tracking,
+            weight=1.0,
+            params={"command_name": "wrist_pose", "arm_index": i, "std": 0.1, "sigma_fine": 0.01, "fine_weight": 0.4},
+        )
+        for i, side in enumerate(("left", "right"))
+    }
+    manager = RewardManager(cfg, env)
+    torch.testing.assert_close(manager.compute(1 / 60), torch.tensor([2 * 0.65354384, 2 * 0.76301912, 2.0]) / 60)
 
 
 def test_quaternion_error_matches_half_angle_at_small_and_half_turn_rotations(pose_command):
@@ -588,6 +685,25 @@ def quality_command(pose_command):
     term._env.episode_length_buf = torch.ones(3, dtype=torch.long)
     term.mode_id[:] = torch.tensor([0, 1, 2])
     return term
+
+
+@pytest.mark.parametrize("with_quality", [False, True])
+def test_eight_mm_readiness_uses_all_active_wrists_with_and_without_quality(quality_command, with_quality):
+    term = quality_command
+    term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0)
+    assert term.cfg.workspace_quality.position_tolerance_m == 0.008
+    if not with_quality:
+        term.cfg.workspace_quality = None
+        term.workspace_quality_map = None
+        term._workspace_sums = None
+    term.goal_pose_w[..., 0] += torch.tensor([[0.0075, 0.2], [0.2, 0.0085], [0.0075, 0.0085]])
+    term._update_metrics()
+    torch.testing.assert_close(term._position_ready_sum, torch.tensor([1.0, 0.0, 0.0]))
+    if with_quality:
+        torch.testing.assert_close(term._workspace_sums[:, 4], term._position_ready_sum)
+    term.goal_pose_w[2, 1, 0] -= 0.001
+    term._update_metrics()
+    torch.testing.assert_close(term._position_ready_sum, torch.tensor([2.0, 0.0, 1.0]))
 
 
 def test_task_readiness_reuses_workspace_position_tolerance_and_joint_active_gate(quality_command):

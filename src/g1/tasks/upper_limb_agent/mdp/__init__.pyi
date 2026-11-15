@@ -13,6 +13,8 @@ from .frozen_lower_actions import (
     FrozenLowerActionCfg,
     LowerHeightCommandAction,
     LowerHeightCommandActionCfg,
+    LowerPelvisCommandAction,
+    LowerPelvisCommandActionCfg,
     LowerVelocityCommandAction,
     LowerVelocityCommandActionCfg,
 )
@@ -29,11 +31,14 @@ from .observations import (
     joint_vel_rel,
     last_action,
     lower_height_offset,
+    lower_pelvis_offset,
     lower_velocity_command,
     projected_gravity,
     term_action,
 )
+from .range_curriculum import RangeCurriculum, RangeCurriculumCfg
 from .rewards import (
+    DwellReward,
     action_rate_l2,
     action_term_rate_l2,
     base_ang_acc_l2_substeps,

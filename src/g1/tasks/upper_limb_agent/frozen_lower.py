@@ -12,7 +12,7 @@ import yaml
 from rsl_rl.utils import resolve_class
 from tensordict import TensorDict
 
-DEFAULT_LOWER_CHECKPOINT = "logs/rsl_rl/g1_flat/2026-10-21_22-59-54/model_9999.pt"
+DEFAULT_LOWER_CHECKPOINT = "logs/rsl_rl/g1_flat/2026-11-11_21-45-46_lower_base_p3/model_19997.pt"
 
 
 def lower_actor_config() -> dict:
@@ -56,6 +56,11 @@ class FrozenLowerPolicy:
         if "actor_state_dict" not in saved:
             raise ValueError("Expected a Lower model_*.pt checkpoint containing actor_state_dict")
         self._validate_contract(saved, interface)
+        self.training_ranges = copy.deepcopy(saved["infos"]["g1_curriculum"]["distribution"]["ranges"])
+        self.command_training = {
+            key: float(_yaml_value(self.path.parent / "params/env.yaml", "commands", "task_command", key).value)
+            for key in ("envelope_depth_frac", "envelope_vx_floor", "envelope_wz_floor", "pelvis_target_speed")
+        }
         cfg = copy.deepcopy(actor_cfg)
         cfg.pop("stochastic", None)  # Legacy config-only flag; inference is always deterministic.
         if cfg.get("class_name") != "MLPModel":

@@ -174,6 +174,17 @@ def test_command_costs_separate_raw_overflow_from_effective_magnitude():
     assert not lower_command_overflow_l2(env).any() and not lower_command_magnitude_l2(env).any()
 
 
+def test_magnitude_without_curriculum_uses_signed_configured_ranges_not_rate_references():
+    term = make_command(
+        command_ranges=((-0.5, 1.0), (-0.2, 0.2), (-0.8, 0.8)),
+        reward_reference_scale=(0.3, 0.1, 0.3),
+    )
+    env = SimpleNamespace(action_manager=SimpleNamespace(get_term=lambda name: term))
+    term.process_actions(torch.tensor([[-0.5, 0.5, 1.0], [0.5, -0.5, -1.0], [0.0, 0.0, 0.0]]))
+    torch.testing.assert_close(lower_command_magnitude_l2(env), torch.tensor([1.5, 1.5, 0.0]))
+    assert not torch.allclose(lower_command_magnitude_l2(env), term.reward_normalized.square().sum(-1))
+
+
 @pytest.mark.parametrize("reward", [lower_command_overflow_l2, lower_command_magnitude_l2])
 def test_command_costs_require_the_velocity_action_type(reward):
     env = SimpleNamespace(action_manager=SimpleNamespace(get_term=lambda name: object()))
@@ -224,6 +235,7 @@ def make_bridge(monkeypatch):
         sim=SimpleNamespace(is_playing=lambda: True),
         episode_length_buf=torch.ones(3),
         max_episode_length_s=10,
+        step_dt=1 / 60,
     )
     bridge = object.__new__(FrozenLowerAction)
     bridge._env = env
@@ -236,8 +248,8 @@ def make_bridge(monkeypatch):
     bridge.lower_actions = torch.zeros(3, 12)
     bridge.last_lower_observations = torch.zeros(3, 650)
     bridge._motion_sum, bridge._motion_steps = torch.zeros(3, 9), torch.zeros(3)
-    bridge._base_motion_sum, bridge._base_motion_mean = torch.zeros(3, 4), None
-    bridge._base_vertical_acc_samples = torch.zeros(3, 2)
+    bridge._substep_count, bridge._apply_count = 2, 0
+    bridge._initialize_base_motion_buffers()
     calls = []
 
     def upper_process(term, values):
@@ -263,6 +275,7 @@ def make_bridge(monkeypatch):
         "joint_pos": ActionTermCfg(asset_name="robot", class_type=lambda cfg, env: bridge),
     }
     env.action_manager = ActionManager(SimpleNamespace(**manager_cfg), env)
+    env.command_manager = SimpleNamespace(get_term=lambda name: SimpleNamespace(range_curriculum=None))
     return env, bridge, calls
 
 

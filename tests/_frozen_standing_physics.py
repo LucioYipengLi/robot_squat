@@ -25,6 +25,7 @@ def main():
     cfg.scene.num_envs = 4
     cfg.actions.lower_command.enabled = False
     cfg.actions.height_offset.enabled = False
+    cfg.actions.pelvis_offset.enabled = False
     cfg.seed = 42
     cfg.episode_length_s = 30.0
     with launch_simulation(cfg, {"headless": True, "device": "cuda:0", "visualizer": None}):
@@ -36,8 +37,8 @@ def main():
             action = env.action_manager.get_term("joint_pos")
             robot = env.scene["robot"]
             assert not robot.is_fixed_base
-            assert env.action_manager.total_action_dim == 21
-            assert observations["policy"].shape == (4, 107)
+            assert env.action_manager.total_action_dim == 23
+            assert observations["policy"].shape == (4, 109)
             assert action.last_lower_observations.shape == (4, 650)
             assert action.lower_actions.shape == (4, 12)
             assert not hasattr(env, "upper_body_motion")
@@ -66,8 +67,8 @@ def main():
 
             action.frozen_policy.model.register_forward_pre_hook(compare_observations)
             original_weights = {name: value.clone() for name, value in action.frozen_policy.model.state_dict().items()}
-            actions = torch.zeros(4, 21, device=env.device)
-            upper_actions = actions[:, 4:]
+            actions = torch.zeros(4, 23, device=env.device)
+            upper_actions = actions[:, 6:]
             summary = {}
             with torch.inference_mode():
                 for phase in ("standing", "upper_motion"):
@@ -79,6 +80,7 @@ def main():
                     for step in range(600):  # Ten physical seconds per phase.
                         actions.zero_()
                         actions[:, :3] = 1.0  # Force-zero mode ignores even nonzero policy commands.
+                        actions[:, 3:6] = 1.0
                         if phase == "upper_motion":
                             # Different sub-environments exercise unilateral and bilateral motions.
                             t = step * env.step_dt

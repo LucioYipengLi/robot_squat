@@ -6,12 +6,29 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.utils.math import quat_apply_inverse
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.assets.articulation.base_articulation_data import BaseArticulationData
 
-__all__ = ["link_origin_linear_acceleration_w", "relative_link_linear_acceleration"]
+__all__ = ["link_origin_linear_acceleration_w", "relative_link_linear_acceleration", "pelvis_xy_in_support_frame"]
+
+
+def pelvis_xy_in_support_frame(data, pelvis_id, foot_ids):
+    """Match Lower's double-ankle midpoint and circular-mean horizontal heading."""
+    positions = data.body_pos_w.torch[:, foot_ids]
+    quats = data.body_quat_w.torch[:, foot_ids]
+    forward = torch.zeros_like(positions)
+    forward[..., 0] = 1
+    directions = quat_apply(quats, forward)[..., :2]
+    directions = directions / directions.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    mean = directions.sum(dim=1)
+    root_forward = forward[:, 0]
+    fallback = quat_apply(yaw_quat(data.root_quat_w.torch), root_forward)[..., :2]
+    x = torch.where(mean.norm(dim=-1, keepdim=True) > 1e-6, mean, fallback)
+    x = x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    delta = data.body_pos_w.torch[:, pelvis_id, :2] - positions[..., :2].mean(dim=1)
+    return torch.stack(((delta * x).sum(-1), -delta[:, 0] * x[:, 1] + delta[:, 1] * x[:, 0]), dim=-1)
 
 
 def link_origin_linear_acceleration_w(data: BaseArticulationData, body_ids: list[int]) -> torch.Tensor:

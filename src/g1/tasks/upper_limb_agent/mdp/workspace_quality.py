@@ -16,12 +16,14 @@ from isaaclab.utils import configclass
 
 __all__ = ["WorkspaceQualityCfg", "WorkspaceQualityMap", "WorkspaceQualityState"]
 
+DEFAULT_POSITION_TOLERANCE_M = 0.008
+
 
 @configclass
 class WorkspaceQualityCfg:
     map_path: str = "data/workspace_q0_v1.npz"
     """Absolute path, or a path relative to the upper_limb_agent package directory."""
-    position_tolerance_m: float = 0.01
+    position_tolerance_m: float = DEFAULT_POSITION_TOLERANCE_M
     """All active wrists must satisfy this Euclidean position tolerance to earn Q."""
 
 

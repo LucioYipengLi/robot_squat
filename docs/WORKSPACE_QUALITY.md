@@ -33,7 +33,7 @@ Q_ref 来自导出时的数据，此后保持固定。各次训练使用同一�
 
 运行时使用三线性插值。所有有贡献的邻接节点都必须有样本；缺失节点和网格外位置标记为未知。
 已知节点本身可查询，权重为零的相邻缺失节点不影响结果。
-内部使用很小的数值容差恢复 float32 网格节点，此容差与位置达标的 1 cm 阈值相互独立。
+内部使用很小的数值容差恢复 float32 网格节点，此容差与位置达标的 8 mm 阈值相互独立。
 未知位置的奖励贡献为零，诊断统计通过有效性掩码将其与“已知但评分低”区分开。
 
 右臂利用位置对称性查询左臂表：`(x, y, z) → (x, -y, z)`。
@@ -53,7 +53,7 @@ reward_raw = ready × covered × mean(score(p_goal_b)，仅活动手)
 reward_step = weight × reward_raw × control_dt
 ```
 
-默认 `position_tolerance_m = 0.01`，单位为米。单手模式只检查活动手；闲置手继续受原有默认关节角惩罚约束。
+默认 `position_tolerance_m = 0.008`，单位为米。单手模式只检查活动手；闲置手继续受原有默认关节角惩罚约束。
 双手模式要求两只手同时满足位置阈值和地图覆盖，原始奖励范围为 `[0, 1]`，各模式使用相同最大值。
 朝向误差不参与这项门控。
 
@@ -61,7 +61,8 @@ reward_step = weight × reward_raw × control_dt
 例如，世界目标保持静止，骨盆移动后 `p_goal_b` 改变；只要腕部继续跟上目标，就能获得新的空间评分。
 固定底座下，同一目标的 Q 基本固定，此时主要验证查询和门控；Mobile 可通过下肢速度和高度命令改变目标相对骨盆的位置。
 
-门控使用硬阈值，误差在 1 cm 附近波动时奖励会切换。初版保持这一清晰定义，训练时结合达标比例判断信号是否足够。
+门控使用硬阈值，误差在 8 mm 附近波动时奖励会切换。该阈值同时用于纯位置达标指标，
+与粗细位置奖励的宽度参数、课程联合位姿达标的15 mm容差分别配置。
 RewardManager 统一施加权重和控制步长，函数本身只返回未加权分数。
 
 ## 3. 配置和启动
@@ -71,7 +72,7 @@ RewardManager 统一施加权重和控制步长，函数本身只返回未加权
 | 配置路径 | 默认值 | 作用 |
 | --- | --- | --- |
 | `env.commands.wrist_pose.workspace_quality.map_path` | `data/workspace_q0_v1.npz` | 先验表路径 |
-| `env.commands.wrist_pose.workspace_quality.position_tolerance_m` | `0.01` | 所有活动手的位置达标阈值，m |
+| `env.commands.wrist_pose.workspace_quality.position_tolerance_m` | `0.008` | 所有活动手的位置达标阈值，m；纯位置达标指标共用 |
 | `env.rewards.workspace_quality.weight` | `0.0` | Q 奖励权重；为零时仍记录诊断 |
 
 相对资源路径以 `upper_limb_agent` 包目录为基准；也可以传入绝对路径。

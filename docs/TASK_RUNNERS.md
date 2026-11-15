@@ -122,7 +122,7 @@ tasks/upper_limb_agent/
 后续采样按 `子环境原点 + 默认腕部局部位置 + 旋转后的位置偏移` 产生世界目标，因此支持不同原点及原点平移。
 默认参考只捕获一次，后续腕部运动和重复重置不会改变采样中心。
 
-偏移范围如下：位置偏移沿首次默认盆骨的坐标轴；姿态为默认腕部朝向右乘局部 Euler 偏移对应的四元数。
+单手模式偏移范围如下：位置偏移沿首次默认盆骨的坐标轴；姿态为默认腕部朝向右乘局部 Euler 偏移对应的四元数。
 目标产生后，在下一次重采样前保持世界静止。观测实时转换参考系，奖励直接比较世界位姿，避免指令更新时序造成的缓存滞后。
 
 | 维度 | 左腕 | 右腕 |
@@ -131,6 +131,26 @@ tasks/upper_limb_agent/
 | `left_offsets/right_offsets.pos_y` (m) | `[-0.05, 0.10]` | `[-0.10, 0.05]` |
 | `left_offsets/right_offsets.pos_z` (m) | `[-0.05, 0.20]` | `[-0.05, 0.20]` |
 | `roll/pitch/yaw` 偏移 (rad，各轴) | `[-0.3, 0.3]` | `[-0.3, 0.3]` |
+
+双手模式使用独立的 `env.commands.wrist_pose.dual_targets`，由公共中心、受限相对位置和公共朝向上的小幅相对旋转直接生成：
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `pos_x / pos_y / pos_z`，m | `[-0.05,0.15] / [-0.05,0.05] / [-0.05,0.20]` | 公共中心相对默认双腕中点的偏移，沿初始盆骨轴 |
+| `separation_range`，m | `[0.25,0.40]` | 双腕三维实际距离 |
+| `relative_pos_x / relative_pos_z`，m | 各`[-0.05,0.05]` | 左目标减右目标的前后错位／高度差 |
+| `roll / pitch / yaw`，rad | 各`[-0.30,0.30]` | 公共腕朝向在默认双腕四元数中点上的Euler扰动 |
+| `max_relative_angle`，rad | `0.15`，约8.6° | 两腕完整朝向之间的最短旋转角上限 |
+
+采样距离d、前后差dx和高度差dz后，直接计算正的 `dy = sqrt(d² - dx² - dz²)`，
+再将左右目标设为 `公共中心 ± 初始盆骨旋转 × [dx,dy,dz]/2`。
+配置校验要求最大X/Z差组合小于最小距离，确保任一采样均有解、左右顺序明确。
+双手每腕的最终位置范围由中心与相对位移共同决定；`left_offsets/right_offsets`只控制单手模式。
+
+默认公共朝向取符号对齐后的默认双腕四元数中点，再叠加一份随机Euler旋转。
+随机相对旋转轴方向均匀，完整相对角在`[0,max_relative_angle]`内均匀采样，左右各承担相反方向的一半。
+例如相对角0.15 rad时，各腕偏离公共朝向0.075 rad。腕部旋转不改变目标位置连线。
+这些是几何采样约束，联合运动学可达性和自碰撞情况仍需训练验证。
 
 当前默认腕部相对盆骨的位姿实测约为 `(0.20, ±0.15, 0.095) m`、单位朝向。
 代码读取实际默认位姿作为基准，表中值均为附加偏移。当前位置分布接近原来的工作空间；修改资产默认关节角后，采样基准也随之更新。
@@ -144,7 +164,9 @@ tasks/upper_limb_agent/
 
 例如距离 `0.32 m` 对应 `4 s`。该参数只控制多久重采样，与 PD 或关节运动速度无关。
 课程 TODO 位于 `BimanualPoseCommandCfg`：后续可修改偏移范围、距离时间比例及时间上下限，新值在下一次采样生效；当前目标和剩余保持时间继续执行。
-模式概率在下一回合采样时读取。课程推进条件尚未实现。
+模式概率在下一回合采样时读取。固定基座任务使用完整配置范围；Mobile的范围缩放与推进见
+[Upper范围课程](UPPER_RANGE_CURRICULUM.md)。双手中心和X/Z差随位置课程缩放，距离围绕默认间距缩放变化量；
+公共旋转和相对旋转角随朝向课程缩放。几何配置纳入Mobile课程契约，旧采样检查点续训／play需要显式重建课程统计。
 
 可以通过现有 train/play 的配置覆盖项指定模式和采样参数，例如：
 
@@ -160,8 +182,8 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-v0 --viz 
 
 | 奖励项 | 目标 | 权重 |
 | --- | --- | --- |
-| `left_position` / `right_position` | 有效侧 `2/n × (1 - tanh(位置误差 / 0.1 m))`，`n` 为有效手臂数 | 各 `1.0` |
-| `left_orientation` / `right_orientation` | 有效侧 `2/n × [0.6 G(e_q, 0.3) + 0.4 G(e_q, 0.05)]`，`e_q` 为单位误差四元数的虚部范数 | 各 `+0.3` |
+| `left_position` / `right_position` | 有效侧 `2/n × [0.6 (1 - tanh(e_p / 0.1 m)) + 0.4 exp(-e_p² / (0.01 m)²)]`，`n` 为有效手臂数 | 各 `1.0` |
+| `left_orientation` / `right_orientation` | 有效侧 `2/n × [0.6 G(e_q, 0.10) + 0.4 G(e_q, 0.015)]`，`e_q` 为单位误差四元数的虚部范数 | 各 `+0.3` |
 | `idle_arm_pose` | 闲置臂 7 个关节偏离默认角度的平方均值，单位 rad²；双手模式为 0 | `-1.0` |
 | `workspace_quality` | 所有活动腕部位置达标且目标受地图覆盖时，取目标相对骨盆的归一化 Q 均值 | `0.0`，默认只记录诊断 |
 | `action_rate` | 原始策略动作的一阶差分平方和，使用 `action_rate_l2` | `-0.03` |
@@ -173,7 +195,7 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-v0 --viz 
 | `torque_limits` | 17 个受控关节超过各自物理力矩上限 80% 的力矩绝对值超出量之和 | `-1e-3` |
 | `joint_limits` | 惩罚受控关节超出软位置限制 | `-1.0` |
 
-空间 Q 使用左臂 0 kg、5 cm 网格，右臂镜像查询；默认位置阈值为 1 cm。
+空间 Q 使用左臂 0 kg、5 cm 网格，右臂镜像查询；默认位置阈值为 8 mm。
 数据定义、五项诊断和启用方式见 [空间 Q 奖励说明](WORKSPACE_QUALITY.md)。
 
 `action_rate` 惩罚 `sum((a_t - a_{t-1})²)`，不除以控制步长；当前动作只有 17 个受控关节，因此覆盖范围与动作一致。
@@ -204,14 +226,36 @@ a_link = a_com + alpha × r + omega × (omega × r)
 新增项由标准日志记录为 `Episode_Reward/joint_vel`、`Episode_Reward/end_effector_acc`、`Episode_Reward/torque_limits`。
 
 跟踪项对无效侧返回 0；单手模式乘以 2，双手模式乘以 1，保留各模式之间的归一化关系。
-位置项沿用 `1 - tanh(e / 0.1 m)`。朝向项使用双尺度四元数指数奖励：
+位置项保留tanh粗项，并混合指数精细项，尺度单位均为m：
+
+```text
+e_p = ||p_goal_w - p_wrist_w||₂
+coarse = 1 - tanh(e_p / std)
+fine = exp(-e_p² / sigma_fine²)
+position = (1 - fine_weight) × coarse + fine_weight × fine
+当前 std = 0.10 m，sigma_fine = 0.010 m，fine_weight = 0.4
+```
+
+`std`保留目标刷新后较大误差下的引导，`sigma_fine`加强8 mm附近的精度收益。
+8 mm和11 mm固定误差点的单腕混合核值分别约0.7630和0.6535，改善收益约0.1095；
+原tanh对应收益约0.0297。完美对齐时位置核值仍为1，总位置奖励上限保持2，最终乘控制步长。
+这些是固定误差点的函数值，训练日志均值还包含目标切换和不同模式的影响。
+参数在左右位置项中显式配置；支持 `0 < sigma_fine <= std < inf`、`fine_weight ∈ [0,1]`。
+沿用 `Episode_Reward/left_position`、`right_position`，粗细项在函数内部混合。
+
+纯位置达标指标 `position_ready_fraction` 采用8 mm阈值，与Q门控共用
+`commands.wrist_pose.workspace_quality.position_tolerance_m`；关闭Q诊断时仍使用默认8 mm。
+它衡量所有活动手同时达标的时间比例，不包含朝向要求。课程联合位姿门槛仍是15 mm／0.10 rad。
+位置奖励没有8 mm死区，达到指标阈值后仍会提供继续减小误差的收益。
+
+朝向项使用双尺度四元数指数奖励：
 
 ```text
 q_error = normalize(q_goal ⊗ conjugate(q_current))  # 四元数顺序为 (x, y, z, w)
 e_q² = ||q_error.xyz||² = sin²(theta / 2)
 G(e_q, sigma) = exp(-e_q² / sigma²)
 orientation = (1 - fine_weight) × G(e_q, sigma_coarse) + fine_weight × G(e_q, sigma_fine)
-当前 sigma_coarse = 0.3，sigma_fine = 0.05，fine_weight = 0.4
+当前 sigma_coarse = 0.10，sigma_fine = 0.015，fine_weight = 0.4
 ```
 
 `theta` 为最短旋转角；`e_q` 和 sigma 均无量纲，`e_q` 范围为 `[0, 1]`。
@@ -220,13 +264,13 @@ orientation = (1 - fine_weight) × G(e_q, sigma_coarse) + fine_weight × G(e_q, 
 
 若从角度核函数 `exp(-theta² / (2 sigma_angle²))` 换算，可用
 `sigma_q = sqrt(2) × sin(sigma_angle / 2)` 保留 `theta = sigma_angle` 参考点处的核函数值。
-当前配置使用 `0.3`、`0.05` 两档带宽；此前观测到的 `0.11 rad` 误差对应 `e_q ≈ 0.05497`，
-混合朝向奖励约为 `0.700`（模式归一化与外层权重之前）。后续根据误差与运动平滑性调整带宽。
+当前配置使用 `0.10`、`0.015` 两档带宽；`0.02 rad` 误差对应 `e_q ≈ 0.0100`，
+混合朝向核值约为 `0.8505`（模式归一化与外层权重之前）。后续根据误差与运动平滑性调整带宽。
 
 参数在 `env_cfg.py` 的 `left_orientation`、`right_orientation` 中显式配置：大 sigma 提供粗跟踪收益，
 小 sigma 提供精跟踪收益，`fine_weight` 调整精细项占比；两项占比之和为 1。
 sigma 是奖励带宽，成功阈值需独立定义。支持 `0 < sigma_fine <= sigma_coarse`，两者均为有限数，`fine_weight` 在 `[0, 1]` 内。
-外层 `weight=0.1` 为正，完美对齐时单手模式下该手加权值为 `0.2`，双手模式下每手为 `0.1`；最终再乘控制步长。
+外层 `weight=0.3` 为正，完美对齐时单手模式下该手加权值为 `0.6`，双手模式下每手为 `0.3`；最终再乘控制步长。
 `Episode_Reward/left_orientation` 和 `right_orientation` 记录正向奖励。
 跨奖励版本比较优先查看原始 `orientation_error_rad`、位置误差和运动平滑指标。
 观测中的朝向误差仍是 3 维旋转向量（rad），日志仍记录最短旋转角（rad）；此次调整保持动作与观测维度。
@@ -248,11 +292,17 @@ sigma 是奖励带宽，成功阈值需独立定义。支持 `0 < sigma_fine <= 
 新增双腕位姿误差后，当前观测为 93 维，原 79/81 维布局的检查点需要重新训练，并使用新检查点回放。
 镜像数据增强和 mirror loss 的研究计划保留在上肢 PPO 配置的 TODO 中。
 
-Upper 的自由底座版本 `Template-G1-Upper-Mobile-v0` 复用同一任务族和 Runner，使用21维动作：
-前3维选择基座速度，第4维选择高度偏置，后17维控制腰臂关节。观测为107维，冻结 Lower 执行速度与高度命令。
-Mobile 的 `action_rate` 限定为17维上肢动作，`lower_command_rate=-0.10` 保留H2的3维速度与1维高度的归一化命令变化约束。
+Upper 的自由底座版本 `Template-G1-Upper-Mobile-v0` 复用同一任务族和 Runner，使用23维动作：
+速度3维、高度1维、骨盆偏移2维、腰臂17维；观测109维。冻结Lower执行六维命令。
+Mobile 的 `action_rate` 限定为17维上肢动作，`lower_command_rate=-0.10` 使用固定物理尺度约束六维有效命令变化。
+`lower_command_magnitude=-0.05` 按各子环境本回合范围的正／负向边界归一化，仅约束三维有效速度。
+范围课程和联合位姿EMA、保存恢复见 [Upper范围课程](UPPER_RANGE_CURRICULUM.md)。
 高度没有幅值和越界惩罚，保持任意恒定高度时其变化代价为零。
-`base_vertical_acc=-0.05` 对骨盆link原点的世界Z加速度施加4 m/s²软阈值惩罚，覆盖全部物理子步。
+`base_vertical_acc=-0.12` 对骨盆link原点的世界Z加速度施加4 m/s²软阈值惩罚，覆盖全部物理子步。
+Mobile另有 `dwell=+0.2`：当前活动手同时满足10 mm／0.04 rad位姿容差，且过去0.1秒
+骨盆世界Z速度RMS≤0.02 m/s时发奖。RMS覆盖全部物理子步，新回合满窗前不发奖。
+目标刷新保留速度历史，局部重置只清空对应环境；固定底座Upper不注册此项。
+配置、三条诊断与时间窗口含义见 [Dwell稳定保持奖励](UPPER_RANGE_CURRICULUM.md#dwell稳定保持奖励)。
 范围配置、零命令对照、接口兼容与物理验证见 [冻结下肢控制说明](FROZEN_LOWER_STANDING.md)。
 
 ## 3. 新任务接入步骤

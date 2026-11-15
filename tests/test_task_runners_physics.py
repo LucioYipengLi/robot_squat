@@ -67,6 +67,8 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
         # Exercise repeated physical/PD resets during the short rollout and playback.
         common.append("env.episode_length_s=0.05")
         common.append("env.commands.wrist_pose.resampling_time_range=[0.02,0.02]")
+        # Exercise the coupled geometry even with only four physical environments.
+        common.append("env.commands.wrist_pose.mode_probabilities=[0,0,1]")
         common.append("env.rewards.target_speed.weight=-1e-4")
     if task == "Template-G1-Upper-Mobile-v0":
         # Guarantee coverage of episode-held targets even with only four envs.
@@ -138,7 +140,7 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
             assert all(math.isfinite(row.value) and 0 <= row.value <= 1.000001 for row in events.Scalars(tag))
         assert all(row.value == 0 for row in events.Scalars("Episode_Reward/workspace_quality"))
         workspace = infos["g1_workspace_quality"]
-        assert workspace["position_tolerance_m"] == 0.01
+        assert workspace["position_tolerance_m"] == 0.008
         assert (checkpoint.parent / workspace["artifact"]).is_file()
         if task == "Template-G1-Upper-Mobile-v0":
             prefix = "Metrics/wrist_pose/task/height_shifted/"
@@ -152,18 +154,24 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
             ):
                 assert prefix + metric in tags
                 assert all(math.isfinite(row.value) for row in events.Scalars(prefix + metric))
-            assert all(-0.150001 <= row.value <= -0.049999 for row in events.Scalars(prefix + "height_shift_mean_m"))
+            assert all(-0.050001 <= row.value <= -0.019999 for row in events.Scalars(prefix + "height_shift_mean_m"))
+            assert prefix + "pose_ready_fraction" in tags
+            assert "Curriculum/upper_ranges/level" in tags
+            assert infos["g1_upper_ranges"]["level"] == 0
+            dual = infos["g1_upper_ranges"]["contract"]["target"]["dual_targets"]
+            assert dual["separation_range"] == [0.25, 0.4] and dual["max_relative_angle"] == 0.15
             vertical_tag = "Episode_Reward/base_vertical_acc"
             assert vertical_tag in tags
             assert all(math.isfinite(row.value) and row.value <= 0 for row in events.Scalars(vertical_tag))
             assert any(row.value < 0 for row in events.Scalars(vertical_tag))
             control = infos["g1_control_interface"]
-            assert control["action_terms"] == ["lower_command", "height_offset", "joint_pos"]
-            assert control["action_dimensions"] == [3, 1, 17] and control["policy_observation_dim"] == 107
+            assert control["schema_version"] == 4 and control["action_mapping"] == "episode_range"
+            assert control["action_terms"] == ["lower_command", "height_offset", "pelvis_offset", "joint_pos"]
+            assert control["action_dimensions"] == [3, 1, 2, 17] and control["policy_observation_dim"] == 109
             for metric in ("command_speed_m_s", "command_yaw_rad_s", "velocity_error_m_s", "yaw_error_rad_s"):
                 assert f"FrozenLower/{metric}" in tags
             assert any(row.value < 0 for row in events.Scalars("Episode_Reward/lower_command_rate"))
-            assert infos["g1_frozen_lower"]["iteration"] == 9999
+            assert infos["g1_frozen_lower"]["iteration"] == 19997
             assert infos["g1_frozen_lower"]["interface"]["input_dim"] == 650
             assert (checkpoint.parent / "artifacts/frozen_lower_model.pt").is_file()
             assert (checkpoint.parent / "artifacts/params/env.yaml").is_file()
@@ -171,6 +179,32 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
                 f"FrozenLower/{name}" in tags
                 for name in ("height_error_m", "height_m", "command_height_offset_m", "planar_speed_m_s", "tilt_rad")
             )
+            # Continue the actual optimizer and curriculum clock through the public entrypoint.
+            invoke(
+                [
+                    "-m",
+                    "g1.rl",
+                    "train",
+                    *common,
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--max_iterations",
+                    "2",
+                    f"agent.experiment_name={models.as_posix()}",
+                    "agent.run_name=resume_smoke",
+                    "agent.num_steps_per_env=4",
+                    "agent.algorithm.num_learning_epochs=1",
+                    "agent.algorithm.num_mini_batches=1",
+                ],
+                "resume",
+            )
+            resumed = list(models.rglob("model_2.pt"))
+            assert len(resumed) == 1
+            continued = torch.load(resumed[0], weights_only=False, map_location="cpu")["infos"]
+            assert continued["g1_upper_ranges"]["control_steps"] == 16
+            assert continued["g1_upper_ranges"]["contract"] == infos["g1_upper_ranges"]["contract"]
+            assert continued["g1_frozen_lower"]["sha256"] == infos["g1_frozen_lower"]["sha256"]
+            checkpoint = resumed[0]
     # IsaacLab emits Python tuple/slice tags. Inspect the scalar node without
     # constructing unrelated configuration objects or enabling unsafe loaders.
     saved_env = yaml.compose((checkpoint.parent / "params/env.yaml").read_text(encoding="utf-8"))
@@ -200,7 +234,7 @@ def checked_factory(env, *args, **kwargs):
         robot = raw_env.scene['robot']
         mobile = hasattr(raw_env.action_manager.get_term('joint_pos'), 'frozen_policy')
         assert robot.is_fixed_base != mobile
-        assert env.num_actions == (21 if mobile else 17)
+        assert env.num_actions == (23 if mobile else 17)
         assert raw_env.action_manager.get_term('joint_pos')._joint_names == list(UPPER_BODY_JOINT_NAMES)
         acceleration_cfg = raw_env.reward_manager.get_term_cfg('joint_acc')
         action_ids = raw_env.action_manager.get_term('joint_pos')._joint_ids
@@ -216,7 +250,7 @@ def checked_factory(env, *args, **kwargs):
             assert cfg.params['asset_cfg'].joint_ids.tolist() == action_ids.tolist()
         assert raw_env.reward_manager.get_term_cfg('torque_limits').params['soft_ratio'] == 0.8
         observations = env.get_observations()['policy']
-        assert observations.shape == (4, 107 if mobile else 93)
+        assert observations.shape == (4, 109 if mobile else 93)
         assert set(raw_env.command_manager.active_terms) == {'wrist_pose'}
         command = raw_env.command_manager.get_term('wrist_pose')
         wrist_cfg = raw_env.reward_manager.get_term_cfg('end_effector_acc')
@@ -234,9 +268,34 @@ def checked_factory(env, *args, **kwargs):
         assert command.command.shape == (4, 14)
         assert command.active_mask.shape == (4, 2)
         assert command.active_mask.sum(dim=-1).min() >= 1
+        from isaaclab.utils.math import quat_apply_inverse, quat_error_magnitude
+        ids = torch.arange(env.num_envs, device=env.device)
+        scales = command.range_curriculum.target_scale(ids) if mobile else torch.ones(4, device=env.device)
+        angle_scales = (
+            command.range_curriculum.target_scale(ids, orientation=True) if mobile else scales
+        )
+        frame = command._sampling_quat_w
+        pair_delta = quat_apply_inverse(frame, command.goal_pose_w[:, 0, :3] - command.goal_pose_w[:, 1, :3])
+        default_delta = quat_apply_inverse(
+            frame, command.default_wrist_pose_e[:, 0, :3] - command.default_wrist_pose_e[:, 1, :3]
+        )
+        dual_cfg = command.cfg.dual_targets
+        distance = pair_delta.norm(dim=-1)
+        default_distance = default_delta.norm(dim=-1)
+        assert command.active_mask.all() and (pair_delta[:, 1] > 0).all()
+        lo, hi = dual_cfg.separation_range
+        assert (distance >= default_distance + scales * (lo - default_distance) - 1e-5).all()
+        assert (distance <= default_distance + scales * (hi - default_distance) + 1e-5).all()
+        for axis, bounds in ((0, dual_cfg.relative_pos_x), (2, dual_cfg.relative_pos_z)):
+            lo, hi = bounds
+            baseline = default_delta[:, axis]
+            assert (pair_delta[:, axis] >= baseline + scales * (lo - baseline) - 1e-5).all()
+            assert (pair_delta[:, axis] <= baseline + scales * (hi - baseline) + 1e-5).all()
+        pair_angle = quat_error_magnitude(command.goal_pose_w[:, 0, 3:], command.goal_pose_w[:, 1, 3:])
+        assert (pair_angle <= dual_cfg.max_relative_angle * angle_scales + 1e-5).all()
         if mobile:
             assert command.height_task_mask.all() and torch.isinf(command.time_left).all()
-            assert ((command.height_shift >= -0.15) & (command.height_shift <= -0.05)).all()
+            assert ((command.height_shift >= -0.05) & (command.height_shift <= -0.02)).all()
         else:
             assert command.cfg.height_task is None and not command.height_task_mask.any()
         assert torch.isfinite(command.pose_error()[0]).all()

@@ -97,17 +97,19 @@ The policy now receives 93 observations, including wrist pose errors, and requir
 Upper tasks also provide a 0 kg workspace Q prior, queried at pelvis-relative target positions after active wrists meet the position tolerance.
 Its reward weight defaults to zero while diagnostics remain active. See the [workspace Q guide](docs/WORKSPACE_QUALITY.md) (Chinese) for configuration, metrics and archived resources.
 
-`Template-G1-Upper-Mobile-v0` lets Upper choose base-frame `vx`, `vy`, yaw rate, and a target height offset for frozen Lower.
-It uses 21 actions (3 velocities, 1 height offset, then 17 Upper joints) and 107 observations. Velocity bounds are
-±0.3 m/s, ±0.1 m/s and ±0.3 rad/s; height offsets range from −0.25 to +0.02 m, with zero action preserving default height.
-The shared `lower_command_rate=-0.10` retains H2's penalty on changes in all four normalized velocity/height commands;
-holding any constant height has zero height-change cost. Magnitude and overflow costs still cover only velocities,
-with the R9C weights retained. Mobile samples regular targets in 70% of episodes and adds a shared world-Z
-shift of −0.15 to −0.05 m to active wrist targets in the other 30%, holding the full shifted poses until reset.
-See the [height target guide](docs/UPPER_HEIGHT_TARGETS.md) (Chinese) for configuration, metrics and paired continuation runs.
-`base_vertical_acc=-0.03` retains the H3B setting and adds a soft penalty above 4 m/s² for pelvis-link world-Z acceleration, covering every physics substep.
-Set both `env.actions.lower_command.enabled=false` and `env.actions.height_offset.enabled=false` for a zero-command control.
-Older 20-action/106-observation Mobile checkpoints require retraining or explicit migration.
+`Template-G1-Upper-Mobile-v0` uses 23 actions (3 velocities, 1 height, 2 pelvis offsets, then 17 Upper joints)
+and 109 observations. Its frozen Lower defaults to `2026-11-11_21-45-46_lower_base_p3/model_19997.pt`.
+An 11-level curriculum expands ability and target ranges using joint position/orientation readiness EMA and failure protection.
+Effective commands respect Lower's crouch-speed envelope and stationary pelvis-offset semantics.
+Schema 4 decodes actions directly into each episode's current ranges. A1 schema-3 checkpoints require their original implementation; retrain for the new mapping.
+Command-rate costs use fixed physical references. Velocity-magnitude costs use each episode's signed range endpoints,
+with weight -0.05, so equal fractions of the allowed range have equal costs at every level.
+Mobile retains 70% regular and 30% episode-held height targets. `base_vertical_acc=-0.12` penalizes physical-substep
+pelvis-link world-Z acceleration above 4 m/s². Disable all three command terms for a zero-command control.
+Mobile also uses a +0.2 dwell bonus for active wrists within 10 mm / 0.04 rad and a full 0.1 s window
+of pelvis world-Z speed RMS at or below 0.02 m/s. Each physics substep contributes to the RMS.
+See the [Upper range curriculum guide](docs/UPPER_RANGE_CURRICULUM.md) (Chinese) for limits, metrics and restore behavior.
+Older 21-action/107-observation Mobile checkpoints, including H5C, require retraining or explicit migration.
 See the [frozen Lower control guide](docs/FROZEN_LOWER_STANDING.md) (Chinese).
 
 ### Initial training: Phase 1

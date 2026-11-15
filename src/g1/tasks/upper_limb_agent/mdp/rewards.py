@@ -14,16 +14,22 @@ from isaaclab.envs.mdp.rewards import (
     joint_torques_l2,
     joint_vel_l2,
 )
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 
 from .actions import UpperJointPositionAction
-from .frozen_lower_actions import FrozenLowerAction, LowerHeightCommandAction, LowerVelocityCommandAction
+from .frozen_lower_actions import (
+    FrozenLowerAction,
+    LowerHeightCommandAction,
+    LowerPelvisCommandAction,
+    LowerVelocityCommandAction,
+)
 from .observations import term_action
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 __all__ = [
+    "DwellReward",
     "action_rate_l2",
     "action_term_rate_l2",
     "base_ang_acc_l2_substeps",
@@ -49,6 +55,79 @@ __all__ = [
 ]
 
 
+class DwellReward(ManagerTermBase):
+    """Current active-wrist pose readiness plus rolling world-Z base-speed readiness.
+
+    Returns one task-level binary bonus, without per-arm scaling. Position and
+    shortest-angle gates are instantaneous; only vertical speed has a history
+    window. RewardManager applies the configured weight and dt once.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        for key in ("position_tolerance_m", "orientation_tolerance_rad", "vertical_speed_tolerance_m_s"):
+            value = cfg.params[key]
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{key} must be positive and finite")
+        # Per-episode pose count, bonus count, RMS sum and full-window count.
+        self._sums = torch.zeros(self.num_envs, 4, device=self.device)
+        self._steps = torch.zeros(self.num_envs, device=self.device)
+        self._last_metric_step = -1
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str = "wrist_pose",
+        action_name: str = "joint_pos",
+        position_tolerance_m: float = 0.01,
+        orientation_tolerance_rad: float = 0.04,
+        vertical_speed_tolerance_m_s: float = 0.02,
+    ) -> torch.Tensor:
+        action = env.action_manager.get_term(action_name)
+        if not isinstance(action, FrozenLowerAction):
+            raise TypeError("DwellReward requires FrozenLowerAction for complete-substep vertical-speed RMS")
+        rms, full_window = action.base_vertical_speed_rms()
+        command = env.command_manager.get_term(command_name)
+        position, orientation = command.pose_error()
+        active = command.active_mask
+        pose_ready = (((position <= position_tolerance_m) & (orientation <= orientation_tolerance_rad)) | ~active).all(
+            dim=-1
+        ) & active.any(dim=-1)
+        sampled = env.episode_length_buf > 0
+        ready = (
+            pose_ready
+            & full_window
+            & (rms <= vertical_speed_tolerance_m_s)
+            & sampled
+            & ~env.termination_manager.terminated
+        )
+        if self._last_metric_step != env.common_step_counter:
+            valid_rms = full_window & sampled
+            self._steps += sampled
+            self._sums[:, 0] += pose_ready & sampled
+            self._sums[:, 1] += ready
+            self._sums[:, 2] += torch.where(valid_rms, rms, 0.0)
+            self._sums[:, 3] += valid_rms
+            self._last_metric_step = env.common_step_counter
+        return ready.float()
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        steps, sums = self._steps[ids], self._sums[ids]
+        valid = steps > 0
+        log = self._env.extras.setdefault("log", {})
+        if valid.any():
+            for column, name in enumerate(("pose_ready_fraction", "ready_fraction")):
+                log[f"Dwell/{name}"] = (sums[valid, column] / steps[valid]).mean()
+        full = sums[:, 3] > 0
+        if full.any():
+            log["Dwell/base_vertical_speed_rms_m_s"] = (sums[full, 2] / sums[full, 3]).mean()
+        self._steps[ids] = 0
+        self._sums[ids] = 0
+        if env_ids is None:
+            self._last_metric_step = -1
+
+
 def action_term_rate_l2(env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
     """Raw action difference squared sum for one named term; no dt division.
 
@@ -59,11 +138,14 @@ def action_term_rate_l2(env: ManagerBasedRLEnv, action_name: str) -> torch.Tenso
 
 
 def lower_command_rate_l2(
-    env: ManagerBasedRLEnv, action_name: str = "lower_command", height_action_name: str = "height_offset"
+    env: ManagerBasedRLEnv,
+    action_name: str = "lower_command",
+    height_action_name: str = "height_offset",
+    pelvis_action_name: str | None = None,
 ) -> torch.Tensor:
-    """Sum normalized step differences squared for vx, vy, yaw rate and height.
+    """Sum effective-command differences squared in fixed physical reward scales.
 
-    Each action term caches its clipped normalized change once per control step.
+    Each action term caches its final normalized change once per control step.
     Disabled terms contribute zero; constant nonzero commands have zero change
     cost. Reads do not advance history. There is no dt division; RewardManager
     applies the shared weight and control dt once.
@@ -72,7 +154,13 @@ def lower_command_rate_l2(
     height = env.action_manager.get_term(height_action_name)
     if not isinstance(height, LowerHeightCommandAction):
         raise TypeError(f"{height_action_name!r} must use LowerHeightCommandAction for height-command changes")
-    return velocity.change_l2 + height.change_l2
+    cost = velocity.change_l2 + height.change_l2
+    if pelvis_action_name is not None:
+        pelvis = env.action_manager.get_term(pelvis_action_name)
+        if not isinstance(pelvis, LowerPelvisCommandAction):
+            raise TypeError("Pelvis command changes require LowerPelvisCommandAction")
+        cost = cost + pelvis.change_l2
+    return cost
 
 
 def _lower_command_action(env: ManagerBasedRLEnv, action_name: str) -> LowerVelocityCommandAction:
@@ -95,15 +183,17 @@ def lower_command_overflow_l2(env: ManagerBasedRLEnv, action_name: str = "lower_
 
 
 def lower_command_magnitude_l2(env: ManagerBasedRLEnv, action_name: str = "lower_command") -> torch.Tensor:
-    """Sum squared effective normalized commands, in [0, 3], before SI scaling.
+    """Sum squared effective velocities divided by their episode range endpoints.
 
-    Constant nonzero commands retain a cost. Disabled interfaces return zero;
-    RewardManager applies weight and control dt once. Reads change no history.
+    Positive/negative commands use their corresponding signed bounds. Without a
+    curriculum, use configured velocity ranges. Constant nonzero commands retain
+    a cost; disabled interfaces return zero. RewardManager applies weight and
+    control dt once. Reads change no command or change-cost history.
     """
     action = _lower_command_action(env, action_name)
     if not action.cfg.enabled:
         return torch.zeros_like(action.change_l2)
-    return action.raw_actions.clamp(-1.0, 1.0).square().sum(dim=-1)
+    return action.magnitude_normalized.square().sum(dim=-1)
 
 
 def _base_motion_cost(env: ManagerBasedRLEnv, action_name: str, component: int) -> torch.Tensor:
@@ -188,13 +278,31 @@ def joint_acc_l2_substeps(env: ManagerBasedRLEnv, action_name: str = "joint_pos"
 
 
 def end_effector_position_tracking(
-    env: ManagerBasedRLEnv, command_name: str, arm_index: int, std: float
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    arm_index: int,
+    std: float,
+    sigma_fine: float,
+    fine_weight: float,
 ) -> torch.Tensor:
-    """Active wrist reward, weighted by 2 / active-arm count; std is a distance scale [m]."""
+    """Blend broad tanh tracking with a fine position exponential for an active wrist.
+
+    Coarse = 1 - tanh(e / std); fine = exp(-e² / sigma_fine²).
+    Both scales are distances [m]. The blend peaks at 2 / active-arm count
+    for an active wrist and is zero for an inactive wrist. Reads fresh world
+    pose errors without modifying command or metric state.
+    """
+    if not 0.0 < sigma_fine <= std < float("inf"):
+        raise ValueError("Position scales must satisfy 0 < sigma_fine <= std < inf [m]")
+    if not 0.0 <= fine_weight <= 1.0:
+        raise ValueError("fine_weight must be finite and within [0, 1]")
     term = env.command_manager.get_term(command_name)
     position_error, _ = term.pose_error()
+    error = position_error[:, arm_index]
+    coarse = 1.0 - torch.tanh(error / std)
+    fine = torch.exp(-(error / sigma_fine).square())
     weight = 2.0 * term.active_mask[:, arm_index] / term.active_mask.sum(dim=-1)
-    return weight * (1.0 - torch.tanh(position_error[:, arm_index] / std))
+    return weight * ((1.0 - fine_weight) * coarse + fine_weight * fine)
 
 
 def end_effector_orientation_tracking(

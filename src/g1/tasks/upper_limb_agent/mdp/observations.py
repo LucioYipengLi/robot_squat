@@ -33,6 +33,7 @@ __all__ = [
     "last_action",
     "lower_velocity_command",
     "lower_height_offset",
+    "lower_pelvis_offset",
     "projected_gravity",
     "term_action",
 ]
@@ -61,6 +62,11 @@ def lower_velocity_command(env: ManagerBasedRLEnv, action_name: str = "lower_com
 
 def lower_height_offset(env: ManagerBasedRLEnv, action_name: str = "height_offset") -> torch.Tensor:
     """Effective target height offset from default standing height [m], shape [N,1]."""
+    return env.action_manager.get_term(action_name).processed_actions
+
+
+def lower_pelvis_offset(env: ManagerBasedRLEnv, action_name: str = "pelvis_offset") -> torch.Tensor:
+    """Effective double-ankle-frame pelvis offset [m], shape [N,2]."""
     return env.action_manager.get_term(action_name).processed_actions
 
 

@@ -10,7 +10,7 @@
 - `Template-G1-Phase2-v0`：Phase 2，增加静态物理随机化。
 - `Template-G1-Phase3-v0`：Phase 3，增加外部推力。
 - `Template-G1-Upper-v0`：固定根节点，控制腰部与双臂，按左手、右手、双手三种模式跟踪世界固定目标，观测使用实时盆骨相对位姿。
-- `Template-G1-Upper-Mobile-v0`：自由底座，Upper 同时控制上肢关节与三维速度命令，冻结下肢负责执行。
+- `Template-G1-Upper-Mobile-v0`：自由底座，Upper控制腰臂与六维下肢指令（速度、高度、骨盆偏移），冻结Lower执行。
 
 
 ## 安装
@@ -51,7 +51,7 @@ uv run --extra isaacsim --extra rerun isaaclab random_agent --task <TASK_NAME> -
 每个任务族拥有自己的 Runner；下肢将模型与实际课程状态保存在同一个检查点中，Phase 2/3 自动继承上一阶段的任务分布。
 目前支持 Torch 环境前端、单进程 RSL-RL `OnPolicyRunner`，无需额外指定 RL 库。
 
-`upper_limb_agent` 提供固定根节点和冻结下肢站立两种 G1 双腕位姿跟踪环境，共用独立 Runner 和标准训练日志。
+`upper_limb_agent` 提供固定根节点和自由底座两种G1双腕位姿跟踪环境，共用独立Runner和标准训练日志。
 固定底座输出到 `logs/rsl_rl/g1_upper/`，冻结下肢版本输出到 `logs/rsl_rl/g1_upper_mobile/`。
 机器人资产与 MDP 模块由上肢任务独立维护。
 `teleop/eval` 本阶段仍只支持下肢任务。任务选择及后续任务的接入方式见 [任务 Runner 说明](docs/TASK_RUNNERS.md)。
@@ -89,20 +89,25 @@ uv run --extra isaacsim python -m g1.rl play --task Template-G1-Upper-v0 --check
 上肢任务已接入 0 kg 空间 Q 先验：位置达标后按目标相对骨盆的位置评分，左右臂共用镜像地图。
 默认奖励权重为零，诊断持续记录；配置、指标和资源归档见 [空间 Q 奖励说明](docs/WORKSPACE_QUALITY.md)。
 
-冻结下肢的移动任务使用21维 Upper 动作（速度命令3维、高度偏置1维、上肢关节17维）和107维观测，输出到 `logs/rsl_rl/g1_upper_mobile/`：
+冻结下肢的移动任务使用23维 Upper 动作（速度3维、高度1维、骨盆平面偏移2维、腰臂17维）和109维观测，输出到 `logs/rsl_rl/g1_upper_mobile/`：
 
 ```bash
 uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-Mobile-v0 --num_envs 512 --viz none physics=isaacsim_physx
 ```
 
-默认下肢模型为 `2026-10-21_22-59-54/model_9999.pt`，权重冻结，腿脚参数跟随最新 Lower 配置。
-初始速度范围为 `vx ±0.3 m/s、vy ±0.1 m/s、ωz ±0.3 rad/s`，高度偏置范围为 `[-0.25, 0.02] m`，零动作保持默认站高。
-`lower_command_rate=-0.10` 保留H2的四维归一化命令变化约束；保持恒定高度时该分量为零。
-`base_vertical_acc=-0.03` 沿用H3B配置，对骨盆世界Z加速度超过4 m/s²的部分施加软惩罚，覆盖全部物理子步。
-幅值与越界惩罚仍只约束速度，权重保留R9C配置。
-Mobile默认混合70%常规目标、30%额外降低5～15 cm的高度目标；第二类整回合保持。
+默认下肢模型为 `2026-11-11_21-45-46_lower_base_p3/model_19997.pt`，权重冻结，腿脚参数跟随最新 Lower 配置。
+初始速度范围为 `vx ±0.10 m/s、vy ±0.03 m/s、ωz ±0.10 rad/s`，高度偏置范围为 `[-0.10, 0.01] m`，零动作保持默认站高。
+`lower_command_rate=-0.10` 按固定物理尺度约束六维有效命令变化；保持恒定高度时该分量为零。
+`lower_command_magnitude=-0.05` 按各子环境本回合的正／负向边界归一化，只约束三维有效速度。
+`base_vertical_acc=-0.12` 对骨盆世界Z加速度超过4 m/s²的部分施加软惩罚，覆盖全部物理子步。
+原始速度动作越界惩罚保持−0.0003。
+Mobile的 `dwell=+0.2` 奖励活动手位姿达到10 mm／0.04 rad且骨盆垂向速度0.1秒RMS≤0.02 m/s的状态。
+Mobile默认混合70%常规目标、30%高度目标，统一课程按位姿联合达标EMA逐级开放动作及目标范围。
+第二类整回合保持，额外高度偏移从−5～−2 cm逐步扩展至−15～−5 cm。
+课程参数、奖励尺度、日志和续训／回放见 [Upper范围课程说明](docs/UPPER_RANGE_CURRICULUM.md)。
+当前schema 4直接按回合范围解码；旧A1的schema 3需在匹配旧实现中回放，新版本从头训练。
 参数、分类指标和续训对照见 [Upper高度目标说明](docs/UPPER_HEIGHT_TARGETS.md)。
-旧 Mobile 的20动作/106观测模型（包括R9C系列）需重新训练或显式迁移。配置、零命令对照、回放及验证见 [冻结下肢控制说明](docs/FROZEN_LOWER_STANDING.md)。
+旧Mobile的21动作/107观测模型（包括H5C）及更早模型需重新训练或显式迁移。冻结模型与验证见 [冻结下肢控制说明](docs/FROZEN_LOWER_STANDING.md)。
 
 ### 首次训练：Phase 1
 

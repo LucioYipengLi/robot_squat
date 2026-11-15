@@ -92,9 +92,9 @@ class CommandsCfg:
         distance_reference_speed=0.08,  # m/s，仅用于计算目标保持时间。
         workspace_quality=mdp.WorkspaceQualityCfg(
             map_path="data/workspace_q0_v1.npz",  # 相对 upper_limb_agent 包目录；也接受绝对路径。
-            position_tolerance_m=0.01,  # 所有活动手均达标后才发放 Q 奖励；单位 m。
+            position_tolerance_m=0.008,  # 8 mm纯位置达标指标与Q门控；课程使用独立容差。
         ),
-        # 位置偏移沿默认骨盆坐标轴（m）；姿态偏移叠加在默认腕部朝向上（rad）。
+        # 单手模式：位置沿默认骨盆轴偏移（m），姿态在该腕默认朝向上扰动（rad）。
         left_offsets=mdp.BimanualPoseCommandCfg.Ranges(
             pos_x=(-0.05, 0.15),
             pos_y=(-0.05, 0.10),
@@ -110,6 +110,19 @@ class CommandsCfg:
             roll=(-0.3, 0.3),
             pitch=(-0.3, 0.3),
             yaw=(-0.3, 0.3),
+        ),
+        # 双手模式：公共中心及朝向 + 受限的三维位置差、相对旋转。
+        dual_targets=mdp.BimanualPoseCommandCfg.DualTargetsCfg(
+            pos_x=(-0.05, 0.15),  # 公共中心相对默认双腕中点的偏移，m。
+            pos_y=(-0.05, 0.05),
+            pos_z=(-0.05, 0.20),
+            roll=(-0.3, 0.3),  # 公共腕朝向扰动，各Euler分量，rad。
+            pitch=(-0.3, 0.3),
+            yaw=(-0.3, 0.3),
+            separation_range=(0.25, 0.40),  # 两腕三维距离，m；Y差根据距离及X/Z差直接求解。
+            relative_pos_x=(-0.05, 0.05),  # 左目标减右目标：前后错位，m。
+            relative_pos_z=(-0.05, 0.05),  # 左目标减右目标：高度差，m。
+            max_relative_angle=0.15,  # 两腕最短相对旋转角上限，rad，约8.6度。
         ),
         debug_vis=False,  # play_mode() 中开启当前腕部与有效目标标记。
     )
@@ -174,16 +187,28 @@ class EventCfg:
 class RewardsCfg:
     """Wrist pose tracking and control regularization."""
 
-    # 双腕位置跟踪
+    # 双腕位置粗细跟踪：tanh粗项保留大误差引导，指数细项加强8 mm附近精度；尺度单位m。
     left_position = RewTerm(
         func=mdp.end_effector_position_tracking,
         weight=1.0,
-        params={"command_name": "wrist_pose", "arm_index": 0, "std": 0.1},
+        params={
+            "command_name": "wrist_pose",
+            "arm_index": 0,
+            "std": 0.1,
+            "sigma_fine": 0.01,
+            "fine_weight": 0.4,
+        },
     )
     right_position = RewTerm(
         func=mdp.end_effector_position_tracking,
         weight=1.0,
-        params={"command_name": "wrist_pose", "arm_index": 1, "std": 0.1},
+        params={
+            "command_name": "wrist_pose",
+            "arm_index": 1,
+            "std": 0.1,
+            "sigma_fine": 0.01,
+            "fine_weight": 0.4,
+        },
     )
 
     # 双尺度四元数朝向奖励（正权重）；e_q = ||vec(q_goal * q_current^-1)||，sigma 无量纲。
@@ -194,8 +219,8 @@ class RewardsCfg:
         params={
             "command_name": "wrist_pose",
             "arm_index": 0,
-            "sigma_coarse": 0.3,
-            "sigma_fine": 0.05,
+            "sigma_coarse": 0.10,
+            "sigma_fine": 0.015,
             "fine_weight": 0.4,
         },
     )
@@ -205,8 +230,8 @@ class RewardsCfg:
         params={
             "command_name": "wrist_pose",
             "arm_index": 1,
-            "sigma_coarse": 0.3,
-            "sigma_fine": 0.05,
+            "sigma_coarse": 0.10,
+            "sigma_fine": 0.015,
             "fine_weight": 0.4,
         },
     )
@@ -214,7 +239,7 @@ class RewardsCfg:
     # Only the seven joints of the inactive arm are encouraged back to their default angles.
     idle_arm_pose = RewTerm(
         func=mdp.idle_arm_default_pose,
-        weight=-1.0,
+        weight=-1.5,
         params={"command_name": "wrist_pose"},
     )
 

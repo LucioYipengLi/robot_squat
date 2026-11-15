@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import asdict
 
 import torch
 
@@ -14,8 +15,10 @@ from isaaclab.utils import configclass, replace
 from isaaclab.utils.math import (
     normalize,
     quat_apply,
+    quat_apply_inverse,
     quat_conjugate,
     quat_error_magnitude,
+    quat_from_angle_axis,
     quat_from_euler_xyz,
     quat_mul,
     quat_unique,
@@ -23,17 +26,25 @@ from isaaclab.utils.math import (
 )
 
 from .actions import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
-from .workspace_quality import WorkspaceQualityCfg, WorkspaceQualityMap, WorkspaceQualityState
+from .range_curriculum import RangeCurriculum, RangeCurriculumCfg
+from .workspace_quality import (
+    DEFAULT_POSITION_TOLERANCE_M,
+    WorkspaceQualityCfg,
+    WorkspaceQualityMap,
+    WorkspaceQualityState,
+)
 
 __all__ = ["BimanualPoseCommand", "BimanualPoseCommandCfg"]
 
 
 class BimanualPoseCommand(CommandTerm):
-    """Sample a mode per episode and default-wrist offsets per command interval.
+    """Sample single-wrist offsets or a geometrically constrained pair per interval.
 
     Modes are left-only, right-only and both. World goals are authoritative;
     ``command`` returns their current pelvis-relative poses, left then right.
     Inactive goals have a neutral observation and contribute no tracking reward.
+    Dual goals share a center and a common orientation, with bounded separation,
+    fore/aft and height differences, and a bounded relative rotation.
     Optional height tasks add one episode-wide world-Z shift shared by active
     wrists. Their complete poses can be held until reset, independently of Lower.
     """
@@ -71,6 +82,35 @@ class BimanualPoseCommand(CommandTerm):
         self._idle_deviation_sum = torch.zeros_like(self._position_sum)
         self._metric_steps = torch.zeros(self.num_envs, device=self.device)
         self._position_ready_sum = torch.zeros(self.num_envs, device=self.device)
+        self._pose_ready_sum = torch.zeros_like(self._position_ready_sum)
+        self.range_curriculum = None
+        if cfg.range_curriculum is not None:
+            actions = env.cfg.actions
+            velocity = actions.lower_command
+            ranges = (
+                actions.height_offset.height_offset_range,
+                *velocity.command_ranges,
+                *actions.pelvis_offset.offset_ranges,
+            )
+            probability = cfg.height_task.probability if cfg.height_task is not None else 0.0
+            self.range_curriculum = RangeCurriculum(
+                cfg.range_curriculum,
+                ranges,
+                cfg.height_task.shift_range if cfg.height_task is not None else (0.0, 0.0),
+                (probability < 1, probability > 0),
+                self.num_envs,
+                self.device,
+            )
+            self.range_curriculum.target_contract = {
+                "left_offsets": asdict(cfg.left_offsets),
+                "right_offsets": asdict(cfg.right_offsets),
+                "dual_targets": asdict(cfg.dual_targets),
+                "mode_probabilities": cfg.mode_probabilities,
+                "class_probability": probability,
+                "hold_episode": cfg.height_task.hold_episode if cfg.height_task is not None else False,
+                "resampling_time_range": cfg.resampling_time_range,
+                "distance_reference_speed": cfg.distance_reference_speed,
+            }
         self.workspace_quality_map = None
         self._workspace_sums = None
         if cfg.workspace_quality is not None:
@@ -116,11 +156,28 @@ class BimanualPoseCommand(CommandTerm):
             raise ValueError("distance_reference_speed must be positive [m/s]")
         if len(cfg.body_names) != 2 or cfg.body_names[0] == cfg.body_names[1]:
             raise ValueError("body_names must identify two distinct wrist links, left then right")
-        for ranges in (cfg.left_offsets, cfg.right_offsets):
+        for label, ranges in (
+            ("left_offsets", cfg.left_offsets),
+            ("right_offsets", cfg.right_offsets),
+            ("dual_targets", cfg.dual_targets),
+        ):
             for axis in ("pos_x", "pos_y", "pos_z", "roll", "pitch", "yaw"):
                 bounds = getattr(ranges, axis)
                 if len(bounds) != 2 or not all(math.isfinite(x) for x in bounds) or bounds[0] > bounds[1]:
-                    raise ValueError(f"Invalid wrist offset range: {axis}={bounds}")
+                    raise ValueError(f"Invalid {label} offset range: {axis}={bounds}")
+        dual = cfg.dual_targets
+        for name in ("separation_range", "relative_pos_x", "relative_pos_z"):
+            bounds = getattr(dual, name)
+            if len(bounds) != 2 or not all(math.isfinite(x) for x in bounds) or bounds[0] > bounds[1]:
+                raise ValueError(f"Invalid dual_targets.{name}: {bounds}")
+        if dual.separation_range[0] <= 0:
+            raise ValueError("dual_targets.separation_range must be positive")
+        max_x = max(abs(x) for x in dual.relative_pos_x)
+        max_z = max(abs(x) for x in dual.relative_pos_z)
+        if math.hypot(max_x, max_z) >= dual.separation_range[0]:
+            raise ValueError("dual_targets relative X/Z differences must fit inside the minimum separation")
+        if not math.isfinite(dual.max_relative_angle) or not 0 <= dual.max_relative_angle <= math.pi:
+            raise ValueError("dual_targets.max_relative_angle must be finite and in [0, pi] rad")
 
     def _body_index(self, name):
         ids, _ = self.robot.find_bodies(name)
@@ -205,9 +262,28 @@ class BimanualPoseCommand(CommandTerm):
         if len(ids) == 0:
             return {}
         extras = self._episode_metrics(ids)
+        if self.range_curriculum is not None:
+            terminated = getattr(self._env, "reset_terminated", None)
+            timeouts = getattr(self._env, "reset_time_outs", None)
+            if terminated is not None and timeouts is not None and not getattr(self, "_restoring_ranges", False):
+                completed = (terminated[ids] | timeouts[ids]) & (self._env.episode_length_buf[ids] > 0)
+                ended = ids[completed]
+                self.range_curriculum.complete(
+                    ended,
+                    self.height_task_mask[ended].long(),
+                    self._pose_ready_sum[ended] / self._metric_steps[ended].clamp_min(1),
+                    terminated[ended],
+                    self._env.common_step_counter,
+                )
+            self._env.extras.setdefault("log", {}).update(self.range_curriculum.logs())
+            self.range_curriculum.begin(ids)
         for buffer in (
-            self._position_sum, self._orientation_sum, self._idle_deviation_sum,
-            self._metric_steps, self._position_ready_sum,
+            self._position_sum,
+            self._orientation_sum,
+            self._idle_deviation_sum,
+            self._metric_steps,
+            self._position_ready_sum,
+            self._pose_ready_sum,
         ):
             buffer[ids] = 0
         if self._workspace_sums is not None:
@@ -231,7 +307,13 @@ class BimanualPoseCommand(CommandTerm):
         else:
             self.height_task_mask[env_ids] = torch.rand(len(env_ids), device=self.device) < height.probability
         ids = env_ids[self.height_task_mask[env_ids]]
-        self.height_shift[ids] = torch.empty(len(ids), device=self.device).uniform_(*height.shift_range)
+        if self.range_curriculum is None:
+            self.height_shift[ids] = torch.empty(len(ids), device=self.device).uniform_(*height.shift_range)
+        else:
+            bounds = self.range_curriculum.height_shift_ranges(ids)
+            self.height_shift[ids] = bounds[:, 0] + torch.rand(len(ids), device=self.device) * (
+                bounds[:, 1] - bounds[:, 0]
+            )
 
     def _capture_default_pose(self, env_ids):
         """Capture each environment once, after default joint reset and before physics steps."""
@@ -242,6 +324,21 @@ class BimanualPoseCommand(CommandTerm):
         self.default_wrist_pose_e[ids] = poses[ids][:, self.body_indices]
         self.default_wrist_pose_e[ids, :, :3] -= self._env.scene.env_origins[ids, None, :]
         self._sampling_quat_w[ids] = poses[ids, self.reference_body_idx, 3:]
+        if self.range_curriculum is not None:
+            # Scaling separation about the authored geometry must keep every
+            # intermediate level inside the same physical pair limits.
+            delta = quat_apply_inverse(
+                self._sampling_quat_w[ids],
+                self.default_wrist_pose_e[ids, 0, :3] - self.default_wrist_pose_e[ids, 1, :3],
+            )
+            dual = self.cfg.dual_targets
+            values = (delta.norm(dim=-1), delta[:, 0], delta[:, 2])
+            bounds = (dual.separation_range, dual.relative_pos_x, dual.relative_pos_z)
+            if (delta[:, 1] <= 0).any() or any(
+                ((value < lo - 1e-5) | (value > hi + 1e-5)).any()
+                for value, (lo, hi) in zip(values, bounds, strict=True)
+            ):
+                raise ValueError("Default wrist geometry must lie inside dual_targets limits for the range curriculum")
         self._reference_initialized[ids] = True
 
     def _resample(self, env_ids):
@@ -266,14 +363,31 @@ class BimanualPoseCommand(CommandTerm):
         self.command_counter[ids] += 1
 
     def _resample_command(self, env_ids):
+        both = self.mode_id[env_ids] == 2
+        self._sample_single_targets(env_ids[~both])
+        self._sample_dual_targets(env_ids[both])
+        # Add after rotation: this is world vertical even if the sampling pelvis
+        # is tilted. Inactive goals keep their original, masked-out poses.
+        self.goal_pose_w[env_ids, :, 2] += self.height_shift[env_ids, None] * self.active_mask[env_ids]
+
+    def _sample_offsets(self, ranges, count):
+        offset = torch.empty(count, 3, device=self.device)
+        angles = torch.empty_like(offset)
+        for axis, name in enumerate(("pos_x", "pos_y", "pos_z")):
+            offset[:, axis].uniform_(*getattr(ranges, name))
+        for axis, name in enumerate(("roll", "pitch", "yaw")):
+            angles[:, axis].uniform_(*getattr(ranges, name))
+        return offset, angles
+
+    def _sample_single_targets(self, env_ids):
         count = len(env_ids)
+        if count == 0:
+            return
         for side, ranges in enumerate((self.cfg.left_offsets, self.cfg.right_offsets)):
-            offset = torch.empty(count, 3, device=self.device)
-            angles = torch.empty_like(offset)
-            for axis, name in enumerate(("pos_x", "pos_y", "pos_z")):
-                offset[:, axis].uniform_(*getattr(ranges, name))
-            for axis, name in enumerate(("roll", "pitch", "yaw")):
-                angles[:, axis].uniform_(*getattr(ranges, name))
+            offset, angles = self._sample_offsets(ranges, count)
+            if self.range_curriculum is not None:
+                offset *= self.range_curriculum.target_scale(env_ids)[:, None]
+                angles *= self.range_curriculum.target_scale(env_ids, orientation=True)[:, None]
             default = self.default_wrist_pose_e[env_ids, side]
             # Position offsets use the default pelvis axes; orientation offsets use the default wrist axes.
             self.goal_pose_w[env_ids, side, :3] = (
@@ -284,9 +398,58 @@ class BimanualPoseCommand(CommandTerm):
             self.goal_pose_w[env_ids, side, 3:] = quat_unique(
                 quat_mul(default[:, 3:], quat_from_euler_xyz(*angles.unbind(-1)))
             )
-        # Add after rotation: this is world vertical even if the sampling pelvis
-        # is tilted. Inactive goals keep their original, masked-out poses.
-        self.goal_pose_w[env_ids, :, 2] += self.height_shift[env_ids, None] * self.active_mask[env_ids]
+
+    def _sample_dual_targets(self, env_ids):
+        """Construct a pair directly; wrist rotations do not rotate its baseline.
+
+        Position differences use the initial pelvis axes. Separation is the
+        Euclidean distance, so Y is solved from sampled distance, X and Z.
+        A random relative rotation is split equally about the common wrist
+        orientation; its shortest angle is bounded independently of Euler axes.
+        """
+        count = len(env_ids)
+        if count == 0:
+            return
+        cfg = self.cfg.dual_targets
+        offset, angles = self._sample_offsets(cfg, count)
+        position_scale = orientation_scale = torch.ones(count, device=self.device)
+        if self.range_curriculum is not None:
+            position_scale = self.range_curriculum.target_scale(env_ids)
+            orientation_scale = self.range_curriculum.target_scale(env_ids, orientation=True)
+        default = self.default_wrist_pose_e[env_ids]
+        frame = self._sampling_quat_w[env_ids]
+        center = (
+            self._env.scene.env_origins[env_ids]
+            + default[..., :3].mean(dim=1)
+            + quat_apply(frame, offset * position_scale[:, None])
+        )
+        default_delta = quat_apply_inverse(frame, default[:, 0, :3] - default[:, 1, :3])
+        distance = torch.lerp(
+            default_delta.norm(dim=-1),
+            torch.empty(count, device=self.device).uniform_(*cfg.separation_range),
+            position_scale,
+        )
+        delta = torch.empty(count, 3, device=self.device)
+        for axis, bounds in ((0, cfg.relative_pos_x), (2, cfg.relative_pos_z)):
+            delta[:, axis] = torch.lerp(
+                default_delta[:, axis], torch.empty(count, device=self.device).uniform_(*bounds), position_scale
+            )
+        delta[:, 1] = (distance.square() - delta[:, 0].square() - delta[:, 2].square()).clamp_min(0).sqrt()
+        half_delta_w = quat_apply(frame, delta) * 0.5
+        self.goal_pose_w[env_ids, 0, :3] = center + half_delta_w
+        self.goal_pose_w[env_ids, 1, :3] = center - half_delta_w
+
+        # Sign-aligned quaternion midpoint gives a symmetric default reference.
+        left, right = default[:, 0, 3:], default[:, 1, 3:]
+        right = torch.where((left * right).sum(-1, keepdim=True) < 0, -right, right)
+        common = quat_mul(
+            normalize(left + right), quat_from_euler_xyz(*(angles * orientation_scale[:, None]).unbind(-1))
+        )
+        axis = normalize(torch.randn(count, 3, device=self.device))
+        relative_angle = torch.rand(count, device=self.device) * cfg.max_relative_angle * orientation_scale
+        half_rotation = quat_from_angle_axis(relative_angle * 0.5, axis)
+        self.goal_pose_w[env_ids, 0, 3:] = quat_unique(quat_mul(common, half_rotation))
+        self.goal_pose_w[env_ids, 1, 3:] = quat_unique(quat_mul(common, quat_conjugate(half_rotation)))
 
     def _update_command(self):
         # World goals stay fixed; command converts to the live pelvis frame on access.
@@ -302,6 +465,12 @@ class BimanualPoseCommand(CommandTerm):
         self._orientation_sum += orientation * active * valid[:, None]
         self._idle_deviation_sum += self.idle_joint_deviation() * ~active * valid[:, None]
         self._metric_steps += valid
+        if self.range_curriculum is not None:
+            cfg = self.range_curriculum.cfg
+            ready = (
+                ((position <= cfg.position_tolerance_m) & (orientation <= cfg.orientation_tolerance_rad)) | ~active
+            ).all(dim=-1) & active.any(dim=-1)
+            self._pose_ready_sum += ready * valid
         if self._workspace_sums is not None:
             state = self.workspace_quality_state()
             target_valid = state.target_valid & active
@@ -323,10 +492,12 @@ class BimanualPoseCommand(CommandTerm):
             )
         if self.cfg.height_task is not None:
             # Reuse Q's readiness gate when enabled. Without Q diagnostics the
-            # same all-active-wrist criterion uses the standard 1 cm tolerance.
-            ready = state.position_ready if self._workspace_sums is not None else (
-                (position <= 0.01) | ~active
-            ).all(dim=-1)
+            # same all-active-wrist criterion uses the default 8 mm tolerance.
+            ready = (
+                state.position_ready
+                if self._workspace_sums is not None
+                else ((position <= DEFAULT_POSITION_TOLERANCE_M) | ~active).all(dim=-1)
+            )
             self._position_ready_sum += ready * valid
 
     def _episode_metrics(self, env_ids):
@@ -367,7 +538,7 @@ class BimanualPoseCommand(CommandTerm):
         means retain the existing pre-terminal sampling convention. Explicit
         resets without a termination/timeout signal are excluded from this group.
         """
-        if self.cfg.height_task is None:
+        if self.cfg.height_task is None and self.range_curriculum is None:
             return {}
         terminated = getattr(self._env, "reset_terminated", None)
         timeouts = getattr(self._env, "reset_time_outs", None)
@@ -392,6 +563,8 @@ class BimanualPoseCommand(CommandTerm):
             extras[f"{prefix}/position_error_m"] = (self._position_sum[ids].sum(-1) / denominator).mean()
             extras[f"{prefix}/orientation_error_rad"] = (self._orientation_sum[ids].sum(-1) / denominator).mean()
             extras[f"{prefix}/position_ready_fraction"] = (self._position_ready_sum[ids] / steps).mean()
+            if self.range_curriculum is not None:
+                extras[f"{prefix}/pose_ready_fraction"] = (self._pose_ready_sum[ids] / steps).mean()
         return extras
 
     def _set_debug_vis_impl(self, debug_vis):
@@ -439,6 +612,8 @@ class BimanualPoseCommandCfg(CommandTermCfg):
     """
     workspace_quality: WorkspaceQualityCfg | None = None
     """Optional spatial prior and diagnostics, independent of its reward weight."""
+    range_curriculum: RangeCurriculumCfg | None = None
+    """Mobile-only episode-owned ability and target ranges; None keeps fixed-base behavior."""
 
     @configclass
     class HeightTaskCfg:
@@ -453,9 +628,9 @@ class BimanualPoseCommandCfg(CommandTermCfg):
 
     height_task: HeightTaskCfg | None = None
     """None retains original sampling. Probability 0 is a regular-only ablation with class diagnostics."""
-    # TODO(curriculum): Update the offset ranges, distance_reference_speed and/or
-    # resampling_time_range through the command's cfg; preserve world goals and
-    # the current interval until the next sample. Keep curriculum policy outside this term.
+    # TODO(goal_timing): When adding distant planar tasks, adapt distance_reference_speed
+    # and resampling_time_range separately. Preserve already published world goals
+    # and hold intervals; the present range curriculum leaves timing unchanged.
 
     @configclass
     class Ranges:
@@ -470,6 +645,23 @@ class BimanualPoseCommandCfg(CommandTermCfg):
 
     left_offsets: Ranges = Ranges()
     right_offsets: Ranges = Ranges(pos_y=(-0.10, 0.05))
+
+    @configclass
+    class DualTargetsCfg(Ranges):
+        """Pair-center offsets and common wrist Euler rotation, plus relative limits.
+
+        Position ranges use the initial pelvis axes. Relative positions are
+        left minus right [m]; positive Y is solved to enforce separation.
+        The relative angle is the full shortest wrist-to-wrist rotation [rad].
+        """
+
+        pos_y: tuple[float, float] = (-0.05, 0.05)
+        separation_range: tuple[float, float] = (0.25, 0.40)
+        relative_pos_x: tuple[float, float] = (-0.05, 0.05)
+        relative_pos_z: tuple[float, float] = (-0.05, 0.05)
+        max_relative_angle: float = 0.15
+
+    dual_targets: DualTargetsCfg = DualTargetsCfg()
     marker_cfg: VisualizationMarkersCfg = replace(FRAME_MARKER_CFG, prim_path="/Visuals/Command/wrist_pose")
 
     def __post_init__(self):

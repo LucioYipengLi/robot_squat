@@ -8,7 +8,14 @@ import torch
 from isaaclab.managers import RewardManager, RewardTermCfg
 
 from g1.tasks.upper_limb_agent.mdp.actions import UpperJointPositionAction
-from g1.tasks.upper_limb_agent.mdp.frozen_lower_actions import FrozenLowerAction, FrozenLowerActionCfg
+from g1.tasks.upper_limb_agent.mdp.frozen_lower_actions import (
+    FrozenLowerAction,
+    FrozenLowerActionCfg,
+    LowerHeightCommandAction,
+    LowerHeightCommandActionCfg,
+    LowerVelocityCommandAction,
+    LowerVelocityCommandActionCfg,
+)
 from g1.tasks.upper_limb_agent.mdp.rewards import (
     base_ang_acc_l2_substeps,
     base_ang_vel_l2_substeps,
@@ -80,8 +87,7 @@ def make_mobile(decimation=2):
     cfg = FrozenLowerActionCfg(asset_name="robot", joint_names=["j0", "j1"], preserve_order=True, scale=0.5)
     UpperJointPositionAction.__init__(action, cfg, env)
     action._base_body_id = 1  # Deliberately not the first link.
-    action._base_motion_sum, action._base_motion_mean = torch.zeros(3, 4), None
-    action._base_vertical_acc_samples = torch.zeros(3, decimation)
+    action._initialize_base_motion_buffers()
     action._motion_sum, action._motion_steps = torch.zeros(3, 9), torch.zeros(3)
     action._update_motion_metrics = lambda: None
     action.lower_command, action.lower_actions = torch.zeros(3, 6), torch.zeros(3, 1)
@@ -105,10 +111,11 @@ def make_mobile(decimation=2):
         _joint_ids=torch.tensor([2]),
         _processed_actions=torch.zeros(3, 1),
     )
-    command = SimpleNamespace(processed_actions=torch.zeros(3, 3))
-    height = SimpleNamespace(processed_actions=torch.zeros(3, 1))
+    command = LowerVelocityCommandAction(LowerVelocityCommandActionCfg(asset_name="robot"), env)
+    height = LowerHeightCommandAction(LowerHeightCommandActionCfg(asset_name="robot"), env)
     terms = {"joint_pos": action, "lower_command": command, "height_offset": height}
     env.action_manager = SimpleNamespace(get_term=terms.__getitem__)
+    env.command_manager = SimpleNamespace(get_term=lambda name: SimpleNamespace(range_curriculum=None))
     return action, calls
 
 
@@ -245,7 +252,7 @@ def test_mobile_retains_velocity_weights_and_enables_only_the_vertical_soft_base
     assert MobileActionsCfg().joint_pos.base_body_name == "pelvis"
     assert mobile.lower_command_rate.weight == -0.10 and mobile.action_rate.weight == -0.03
     assert mobile.base_vertical_acc.func is base_vertical_acc_excess_l2_substeps
-    assert mobile.base_vertical_acc.weight == -0.03
+    assert mobile.base_vertical_acc.weight == -0.12
     assert mobile.base_vertical_acc.params == {"action_name": "joint_pos", "soft_limit": 4.0}
     assert mdp.base_vertical_acc_excess_l2_substeps is base_vertical_acc_excess_l2_substeps
     assert not hasattr(fixed, "base_vertical_acc")
