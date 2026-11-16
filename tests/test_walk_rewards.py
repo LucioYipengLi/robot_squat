@@ -168,7 +168,8 @@ def test_stage_configs_keep_original_vertical_constraints_and_sensor_threshold(c
     assert cfg.rewards.vertical_bounce.weight == -0.5
     assert cfg.rewards.vertical_bounce.func.__name__ == "lin_vel_z_l2"
     assert cfg.rewards.leg_synergy.weight == 0.75 and not hasattr(cfg.rewards, "leg_synergy_walk")
-    assert cfg.rewards.feet_gait_phase.params["walk_modes"] == (3,)
+    # The current committed configuration applies the contact clock in TURN and WALK.
+    assert cfg.rewards.feet_gait_phase.params["walk_modes"] == (2, 3)
     assert cfg.rewards.walk_joint_reference.weight == 2.0
     assert cfg.rewards.walk_joint_reference.params["asset_cfg"].preserve_order
     assert cfg.rewards.walk_joint_reference.params["sensor_cfg"].preserve_order

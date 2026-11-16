@@ -239,7 +239,7 @@ class RewardsCfg:
     # Only the seven joints of the inactive arm are encouraged back to their default angles.
     idle_arm_pose = RewTerm(
         func=mdp.idle_arm_default_pose,
-        weight=-1.5,
+        weight=-1.7,
         params={"command_name": "wrist_pose"},
     )
 
@@ -351,3 +351,13 @@ class UpperLimbAgentEnvCfg(ManagerBasedRLEnvCfg):
     def play_mode(self) -> None:
         super().play_mode()
         self.commands.wrist_pose.debug_vis = True
+
+    def teleop_mode(self) -> None:
+        """Single-robot observation with runtime target control; preserve the checkpoint contract."""
+        self.play_mode()
+        self.scene.num_envs = 1
+        self.sim.default_visualizer_cfg.eye = (2.5, -2.5, 1.8)
+        self.sim.default_visualizer_cfg.lookat = (0.0, 0.0, 0.8)
+        self.terminations.time_out = DoneTerm(
+            func=mdp.task_time_out, time_out=True, params={"command_name": "wrist_pose"}
+        )

@@ -15,6 +15,16 @@ from isaaclab.utils import to_dict
 class UpperLimbOnPolicyRunner(OnPolicyRunner):
     """Keep PPO updates unchanged and archive the configured prior and frozen Lower model."""
 
+    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        manager = getattr(self.env.unwrapped, "command_manager", None)
+        if manager is not None and "wrist_pose" in manager.active_terms:
+            command = manager.get_term("wrist_pose")
+            if getattr(command, "planar_enabled", False):
+                # Preserve the legacy RNG path when planar tasks are off. A
+                # distance-budget episode must start at its real reset time.
+                init_at_random_ep_len = False
+        return super().learn(num_learning_iterations, init_at_random_ep_len=init_at_random_ep_len)
+
     def _range_curriculum(self):
         manager = getattr(self.env.unwrapped, "command_manager", None)
         if manager is not None and "wrist_pose" in manager.active_terms:

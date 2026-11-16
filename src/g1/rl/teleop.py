@@ -32,33 +32,43 @@ def _parse_args(argv):
 
     import g1.tasks  # noqa: F401 - register the downstream tasks before preset parsing
 
-    parser = argparse.ArgumentParser(description="Control a G1 policy with a Kit keyboard or Xbox gamepad.")
+    parser = argparse.ArgumentParser(description="Control Lower commands in Kit or Upper wrist targets in Newton GL.")
     common.add_common_play_args(
         parser, agent_default="rsl_rl_cfg_entry_point", agent_help="Registered RSL-RL agent configuration"
     )
     cli_args_rsl_rl.add_rsl_rl_args(parser)
     add_launcher_args(parser)
-    parser.add_argument("--input", choices=("keyboard", "gamepad", "both"), default="both")
+    parser.add_argument("--input", choices=("keyboard", "gamepad", "both"), default=None)
     parser.add_argument("--show_pelvis", action="store_true", help="Show pelvis and projected foot geometry initially")
     parser.add_argument(
         "--max_steps", type=_positive_int, help="Stop after this many control steps (default: unbounded)"
     )
-    parser.set_defaults(num_envs=1, visualizer="kit", real_time=True, checkpoint="latest")
+    parser.set_defaults(num_envs=1, visualizer=None, real_time=True, checkpoint="latest")
     args, remaining = setup_preset_cli(parser, argv)
     if args.task is None:
         parser.error("--task is required")
-    from .task_registry import require_lower_limb_task
+    from .task_registry import require_lower_limb_task, resolve_task_family
 
     try:
-        require_lower_limb_task("teleop", args.task)
+        args.task_family = resolve_task_family(args.task)
+        if args.task_family == "lower_limb_agent":
+            require_lower_limb_task("teleop", args.task)
     except ValueError as error:
         parser.error(str(error))
     if args.num_envs != 1:
         parser.error("Teleop supports exactly one environment (--num_envs 1)")
     if args.frontend != "torch" or args.train_env_cfg:
         parser.error("Teleop requires the Torch frontend and play_mode() evaluation settings")
-    if args.visualizer not in ("kit", ["kit"]):
-        parser.error("Keyboard/gamepad teleop requires --viz kit")
+    upper = args.task_family == "upper_limb_agent"
+    if args.visualizer is None:
+        args.visualizer = "newton_gl" if upper else "kit"
+    if args.input is None:
+        args.input = "keyboard" if upper else "both"
+    supported = ("newton_gl", ["newton_gl"], "newton", ["newton"]) if upper else ("kit", ["kit"])
+    if args.visualizer not in supported:
+        parser.error("Upper teleop requires --viz newton_gl" if upper else "Keyboard/gamepad teleop requires --viz kit")
+    if upper and (args.input != "keyboard" or args.show_pelvis):
+        parser.error("Upper teleop supports keyboard input and wrist markers; omit --show_pelvis")
     common.set_hydra_args(remaining)
     return args
 
@@ -103,8 +113,6 @@ def run(argv, *, snapshot_path=None):
     from isaaclab_tasks.utils import resolve_task_config
 
     from g1.tasks.lower_limb_agent.runner import create_curriculum_runner
-    from g1.tasks.lower_limb_agent.visualization import PelvisVisualizer
-    from g1.teleop.kit import KitInput
 
     args = _parse_args(argv)
     installed_version = check_rsl_rl_version()
@@ -130,24 +138,42 @@ def run(argv, *, snapshot_path=None):
         raw_env = common.create_isaaclab_env(args.task, env_cfg, args, convert_marl_to_single_agent=False)
         cleanup.callback(common.close_env, raw_env)
         env = RslRlVecEnvWrapper(raw_env, clip_actions=agent_cfg.clip_actions)
-        runner = create_curriculum_runner(
-            env,
-            agent_cfg,
-            log_dir=None,
-            snapshot_path=snapshot_path,
-            evaluation=True,
-        )
+        upper = args.task_family == "upper_limb_agent"
+        if upper:
+            from .runner import create_task_runner
+
+            runner = create_task_runner(env, agent_cfg, evaluation=True, snapshot_path=snapshot_path)
+        else:
+            runner = create_curriculum_runner(
+                env, agent_cfg, log_dir=None, snapshot_path=snapshot_path, evaluation=True
+            )
         if args.deterministic:
             configure_seed(env_cfg.seed, torch_deterministic=True)
         runner.load(checkpoint)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
-        term = env.unwrapped.command_manager.get_term("task_command")
-        controller = CommandController(CommandLimits.from_ranges(term.cfg.ranges), show_pelvis=args.show_pelvis)
-        inputs = KitInput(controller, devices=args.input)
-        cleanup.callback(inputs.close)
-        playback = ManualPolicyPlayback(env, policy, controller)
-        print(HELP_TEXT)
-        logger.info("Loaded %s; teleop ranges: %s", checkpoint, controller.limits.bounds)
+        if upper:
+            from g1.tasks.upper_limb_agent.teleop import UpperPolicyPlayback
+            from g1.teleop.newton import NewtonInput
+            from g1.teleop.wrist_controls import WristController
+
+            controller = WristController()
+            playback = UpperPolicyPlayback(env, policy, controller, checkpoint=checkpoint, seed=agent_cfg.seed)
+            cleanup.callback(playback.close)
+            inputs = NewtonInput(env.unwrapped.sim, controller)
+            logger.info("Loaded %s; Upper teleop keeps checkpoint command ranges", checkpoint)
+        else:
+            from g1.tasks.lower_limb_agent.visualization import PelvisVisualizer
+            from g1.teleop.kit import KitInput
+
+            term = env.unwrapped.command_manager.get_term("task_command")
+            controller = CommandController(CommandLimits.from_ranges(term.cfg.ranges), show_pelvis=args.show_pelvis)
+            inputs = KitInput(controller, devices=args.input)
+            cleanup.callback(inputs.close)
+            playback = ManualPolicyPlayback(env, policy, controller)
+            print(HELP_TEXT)
+            logger.info("Loaded %s; teleop ranges: %s", checkpoint, controller.limits.bounds)
+        if upper:
+            cleanup.callback(inputs.close)
         budget = common.video_playback_steps(args, env_cfg)
         if args.max_steps is not None:
             budget = args.max_steps if budget is None else min(budget, args.max_steps)
@@ -158,16 +184,16 @@ def run(argv, *, snapshot_path=None):
         with suppress(KeyboardInterrupt):
             while env.unwrapped.sim.is_running() and (budget is None or step < budget):
                 start = time.perf_counter()
-                inputs.poll()
+                inputs.poll(env.unwrapped.step_dt) if upper else inputs.poll()
                 playback.step()
-                if controller.show_pelvis:
+                if not upper and controller.show_pelvis:
                     if visualizer is None:
                         visualizer = PelvisVisualizer(env)
                         cleanup.callback(visualizer.clear)
                     visualizer.update()
                 elif visualizer is not None:
                     visualizer.clear()
-                if playback.last_command != last_print and start >= next_print_time:
+                if not upper and playback.last_command != last_print and start >= next_print_time:
                     print(
                         "[CMD] h={:+.3f} vx={:+.3f} vy={:+.3f} wz={:+.3f} pelvis=({:+.3f}, {:+.3f})".format(
                             *playback.last_command

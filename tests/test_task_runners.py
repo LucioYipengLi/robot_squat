@@ -354,16 +354,16 @@ def test_eval_help_keeps_simulator_free_dispatch():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_eval_and_teleop_reject_upper_environment_without_family_flag(upper_task):
+def test_eval_remains_lower_only_and_teleop_dispatches_upper_without_family_flag(upper_task):
     suite = load_suite("g1_core")
     suite["task"] = upper_task
     with pytest.raises(ValueError, match="eval currently supports only"):
         validate_suite(suite)
     from g1.rl.teleop import _parse_args
 
-    with pytest.raises(SystemExit) as error:
-        _parse_args(["--task", upper_task])
-    assert error.value.code == 2
+    args = _parse_args(["--task", upper_task])
+    assert args.task_family == "upper_limb_agent"
+    assert args.visualizer in ("newton_gl", ["newton_gl"])
 
 
 def _agent():

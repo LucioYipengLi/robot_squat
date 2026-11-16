@@ -46,7 +46,7 @@ def main(argv=None):
         "--task-family",
         choices=tuple(TASK_FAMILIES),
         default=None,
-        help="Optional task-family check; train/play infer the family and runner from --task by default",
+        help="Optional task-family check; train/play/teleop infer the family from --task by default",
     )
     parser.add_argument("--curriculum-snapshot", help="Explicit curriculum JSON for a legacy checkpoint only")
     parser.add_argument("--rl_library", choices=("rsl_rl",), default="rsl_rl")
@@ -58,7 +58,7 @@ def main(argv=None):
     selected, remaining = parser.parse_known_args(arguments)
     if "--distributed" in remaining or int(os.environ.get("WORLD_SIZE", "1")) > 1:
         parser.error("Project entrypoints currently support single-process training only")
-    if selected.action in ("teleop", "eval") and selected.task_family not in (None, "lower_limb_agent"):
+    if selected.action == "eval" and selected.task_family not in (None, "lower_limb_agent"):
         parser.error(f"{selected.action} currently supports only --task-family lower_limb_agent")
     if selected.action == "eval":
         if selected.curriculum_snapshot:
@@ -83,6 +83,17 @@ def main(argv=None):
         if "--train_env_cfg" in remaining:
             parser.error("Curriculum playback requires play_mode(); omit --train_env_cfg")
         from .teleop import run
+
+        if not any(arg in remaining for arg in ("--help", "-h")):
+            task_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+            task_parser.add_argument("--task", required=True)
+            task, _ = task_parser.parse_known_args(remaining)
+            try:
+                family = get_task_family(resolve_task_family(task.task, expected=selected.task_family))
+            except ValueError as error:
+                parser.error(str(error))
+            if selected.curriculum_snapshot and not family.curriculum_snapshot:
+                parser.error("Upper teleop restores its checkpoint curriculum; omit --curriculum-snapshot")
 
         original_argv = sys.argv
         try:

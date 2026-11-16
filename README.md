@@ -54,7 +54,7 @@ uv run --extra isaacsim --extra rerun isaaclab random_agent --task <TASK_NAME> -
 `upper_limb_agent` 提供固定根节点和自由底座两种G1双腕位姿跟踪环境，共用独立Runner和标准训练日志。
 固定底座输出到 `logs/rsl_rl/g1_upper/`，冻结下肢版本输出到 `logs/rsl_rl/g1_upper_mobile/`。
 机器人资产与 MDP 模块由上肢任务独立维护。
-`teleop/eval` 本阶段仍只支持下肢任务。任务选择及后续任务的接入方式见 [任务 Runner 说明](docs/TASK_RUNNERS.md)。
+`teleop` 支持下肢指令控制和Upper腕部目标控制；`eval` 仍只支持下肢任务。任务选择及后续任务的接入方式见 [任务 Runner 说明](docs/TASK_RUNNERS.md)。
 
 以下命令统一使用 Isaac Sim PhysX；将引号内的 `<...>` 替换为实际检查点路径。迭代数仅为示例，可按训练计划调整。
 
@@ -85,6 +85,9 @@ uv run --extra isaacsim python -m g1.rl play --task Template-G1-Upper-v0 --check
 默认使用 4096 个环境；可通过 `--num_envs` 调整。回放时显示双腕当前坐标架和有效侧目标。
 目标在默认双腕位姿附近附加偏移采样，刷新时间与目标到骨盆的距离相关。当前观测为 93 维，包含双腕位姿误差，需要重新训练策略；
 模式比例、目标范围、奖励和指标定义见 [任务 Runner 说明](docs/TASK_RUNNERS.md#g1-上肢位姿跟踪结构)。
+
+Upper-Mobile默认启用[平面任务自适应采样](docs/UPPER_RANGE_CURRICULUM.md#平面任务自适应采样)：
+同等级失败频率改善不足时逐步增加平面回合比例，20%起步、40%封顶，晋级后恢复20%。
 
 上肢任务已接入 0 kg 空间 Q 先验：位置达标后按目标相对骨盆的位置评分，左右臂共用镜像地图。
 默认奖励权重为零，诊断持续记录；配置、指标和资源归档见 [空间 Q 奖励说明](docs/WORKSPACE_QUALITY.md)。
@@ -185,6 +188,14 @@ uv run --extra isaacsim python -m g1.rl teleop --task Template-G1-v0 --checkpoin
 
 W/S、A/D 控制平移，Q/E 控制转向，Z/X 控制髋高，I/K、J/L 控制骨盆偏置；SPACE 清零全部输入，C 切换骨盆与双脚几何可视化，H 显示帮助。默认恢复检查点课程范围，保留摔倒自动重置并取消超时。
 原 `scripts/play_teleop.py` 保留为同一入口的薄启动器；参数、输入映射与可视化口径见 [遥操作说明](docs/TELEOP.md)。
+
+Upper遥操作默认使用Newton GL，支持左／右／双腕世界目标编辑、指定任务类型自动采样、同目标重试，以及均值／随机动作对照：
+
+```powershell
+uv run --extra isaacsim python -m g1.rl teleop --task Template-G1-Upper-Mobile-v0 --checkpoint "<upper_model.pt>"
+```
+
+面板、快捷键和记录格式见 [Upper遥操作说明](docs/UPPER_TELEOP.md)。
 
 ### 环境工具
 

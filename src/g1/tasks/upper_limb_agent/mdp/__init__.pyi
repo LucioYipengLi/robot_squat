@@ -6,6 +6,7 @@ from .actions import (
     UpperJointPositionAction,
     UpperJointPositionActionCfg,
 )
+from .adaptive_sampling import AdaptivePlanarSamplingCfg as AdaptivePlanarSamplingCfg
 from .commands import BimanualPoseCommand, BimanualPoseCommandCfg
 from .events import reset_mobile_root, reset_robot_joints
 from .frozen_lower_actions import (
@@ -18,6 +19,7 @@ from .frozen_lower_actions import (
     LowerVelocityCommandAction,
     LowerVelocityCommandActionCfg,
 )
+from .goal_timing import GoalTimingCfg
 from .kinematics import link_origin_linear_acceleration_w, relative_link_linear_acceleration
 from .observations import (
     active_arms,
@@ -36,6 +38,7 @@ from .observations import (
     projected_gravity,
     term_action,
 )
+from .planar_targets import PlanarTaskCfg
 from .range_curriculum import RangeCurriculum, RangeCurriculumCfg
 from .rewards import (
     DwellReward,
@@ -62,5 +65,5 @@ from .rewards import (
     lower_command_rate_l2,
     workspace_quality_bonus,
 )
-from .terminations import bad_orientation, root_height_below_minimum, time_out
+from .terminations import bad_orientation, root_height_below_minimum, task_time_out, time_out
 from .workspace_quality import WorkspaceQualityCfg, WorkspaceQualityMap, WorkspaceQualityState

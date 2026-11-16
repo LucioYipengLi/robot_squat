@@ -58,7 +58,7 @@ single-process RSL-RL `OnPolicyRunner`; no additional RL library option is neede
 
 `upper_limb_agent` provides fixed-base G1 dual wrist pose tracking and its own Runner with standard training logs under
 `logs/rsl_rl/g1_upper/`. It independently owns its robot configuration and MDP modules.
-`teleop/eval` remain lower-limb only. See the
+`teleop` supports Lower commands and Upper wrist targets; `eval` remains lower-limb only. See the
 [task Runner guide](docs/TASK_RUNNERS.md) (Chinese) for selection and new-task integration.
 
 All commands below use Isaac Sim PhysX. Replace each quoted `<...>` placeholder with an actual checkpoint path.
@@ -197,6 +197,15 @@ C toggles pelvis/foot geometry, and H prints help. Checkpoint curriculum ranges 
 the robot automatically and timeout termination is disabled. The original `scripts/play_teleop.py` remains
 a thin launcher for the same workflow. See the [teleoperation guide](docs/TELEOP.md) (Chinese) for options,
 input mappings and visualization semantics.
+
+Upper teleoperation defaults to Newton GL, with manual wrist pose editing, selected task sampling,
+target retry, and deterministic/stochastic action comparison:
+
+```bash
+uv run --extra isaacsim python -m g1.rl teleop --task Template-G1-Upper-Mobile-v0 --checkpoint "<upper_model.pt>"
+```
+
+See the [Upper teleoperation guide](docs/UPPER_TELEOP.md) (Chinese) for controls and session records.
 
 ### Environment tools
 

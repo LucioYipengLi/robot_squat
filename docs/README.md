@@ -12,6 +12,8 @@
 | [模型遥操作](TELEOP.md) | 人工控制、键盘/手柄映射、几何可视化及代码组织。 |
 | [下肢 Sim2Sim 迁移](SIM2SIM_LOWER_LIMB.md) | 模型交付、观测历史、关节与指令协议、部署适配及训练环境参考。 |
 | [Upper高度目标](UPPER_HEIGHT_TARGETS.md) | 常规／高度随机化目标采样、主要参数、分类指标和续训对照。 |
+| [Upper平面目标与计时](UPPER_PLANAR_TARGETS.md) | 第三类空间、距离预算、窗口评分、三类晋级、实际时长日志和启用命令。 |
+| [Upper遥操作](UPPER_TELEOP.md) | Newton GL手动腕部目标、指定类型采样、重试、均值／随机动作与记录。 |
 | [Upper范围课程](UPPER_RANGE_CURRICULUM.md) | 六维下肢接口、联合位姿EMA、奖励物理尺度、课程日志和检查点恢复。 |
 
 运行命令见 [项目 README](../README.md)，目录职责约定见 [STRUCTURE.md](../STRUCTURE.md)。后续审查与检查点说明统一放在本目录；问题解决后从待办移入归档。

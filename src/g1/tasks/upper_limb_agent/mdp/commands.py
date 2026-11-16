@@ -23,9 +23,14 @@ from isaaclab.utils.math import (
     quat_mul,
     quat_unique,
     subtract_frame_transforms,
+    yaw_quat,
 )
 
 from .actions import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
+from .episode_metrics import PoseWindowMetrics, failure_per_10s, simultaneous_pose_ready
+from .goal_timing import budget_steps
+from .planar_targets import PlanarTaskCfg, sample_station
+from .pose_override import PoseOverride, validate_pose
 from .range_curriculum import RangeCurriculum, RangeCurriculumCfg
 from .workspace_quality import (
     DEFAULT_POSITION_TOLERANCE_M,
@@ -51,6 +56,7 @@ class BimanualPoseCommand(CommandTerm):
 
     cfg: BimanualPoseCommandCfg
     MODE_NAMES = ("left_only", "right_only", "both")
+    _teleop: PoseOverride | None = None
 
     def __init__(self, cfg: BimanualPoseCommandCfg, env):
         self._validate_cfg(cfg)
@@ -70,10 +76,18 @@ class BimanualPoseCommand(CommandTerm):
         self.mode_id = torch.full((self.num_envs,), 2, device=self.device, dtype=torch.long)
         self._mode_masks = torch.tensor([[True, False], [False, True], [True, True]], device=self.device)
         self.height_task_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.planar_task_mask = torch.zeros_like(self.height_task_mask)
         self.height_shift = torch.zeros(self.num_envs, device=self.device)
         self.goal_pose_w = torch.zeros(self.num_envs, 2, 7, device=self.device)
         self.goal_pose_w[..., 6] = 1.0
         self.default_wrist_pose_e = self.goal_pose_w.clone()
+        self._default_pelvis_pos_e = torch.zeros(self.num_envs, 3, device=self.device)
+        self.planar_station_w = torch.zeros_like(self._default_pelvis_pos_e)
+        self.planar_distance_m = torch.zeros_like(self.height_shift)
+        self.planar_heading_rad = torch.zeros_like(self.height_shift)
+        self._episode_start_step = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.evaluation_start_steps = torch.zeros_like(self._episode_start_step)
+        self.episode_deadline_steps = torch.zeros_like(self._episode_start_step)
         self._sampling_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
         self._sampling_quat_w[:, 3] = 1.0
         self._reference_initialized = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -83,6 +97,7 @@ class BimanualPoseCommand(CommandTerm):
         self._metric_steps = torch.zeros(self.num_envs, device=self.device)
         self._position_ready_sum = torch.zeros(self.num_envs, device=self.device)
         self._pose_ready_sum = torch.zeros_like(self._position_ready_sum)
+        self._pose_window = PoseWindowMetrics(self.num_envs, self.device)
         self.range_curriculum = None
         if cfg.range_curriculum is not None:
             actions = env.cfg.actions
@@ -93,15 +108,22 @@ class BimanualPoseCommand(CommandTerm):
                 *actions.pelvis_offset.offset_ranges,
             )
             probability = cfg.height_task.probability if cfg.height_task is not None else 0.0
+            planar_probability = cfg.planar_task.probability if cfg.planar_task is not None else 0.0
             self.range_curriculum = RangeCurriculum(
                 cfg.range_curriculum,
                 ranges,
                 cfg.height_task.shift_range if cfg.height_task is not None else (0.0, 0.0),
-                (probability < 1, probability > 0),
+                (
+                    (1 - planar_probability) * (1 - probability) > 0,
+                    (1 - planar_probability) * probability > 0,
+                    planar_probability > 0,
+                ),
                 self.num_envs,
                 self.device,
+                planar_probability=planar_probability,
             )
             self.range_curriculum.target_contract = {
+                "pose_scoring": "near_episode_mean_and_planar_fixed_window_v1",
                 "left_offsets": asdict(cfg.left_offsets),
                 "right_offsets": asdict(cfg.right_offsets),
                 "dual_targets": asdict(cfg.dual_targets),
@@ -111,6 +133,14 @@ class BimanualPoseCommand(CommandTerm):
                 "resampling_time_range": cfg.resampling_time_range,
                 "distance_reference_speed": cfg.distance_reference_speed,
             }
+        if self.planar_enabled:
+            self._validate_planar_environment()
+            if self.range_curriculum is not None:
+                self.range_curriculum.target_contract.update(
+                    planar_task=asdict(cfg.planar_task),
+                    timing_control_dt=env.step_dt,
+                    timing_hard_limit_s=env.cfg.episode_length_s,
+                )
         self.workspace_quality_map = None
         self._workspace_sums = None
         if cfg.workspace_quality is not None:
@@ -121,6 +151,8 @@ class BimanualPoseCommand(CommandTerm):
 
     @staticmethod
     def _validate_cfg(cfg):
+        if cfg.planar_task is not None:
+            cfg.planar_task.validate_parameters()
         if cfg.height_task is not None:
             height = cfg.height_task
             if not math.isfinite(height.probability) or not 0 <= height.probability <= 1:
@@ -184,6 +216,136 @@ class BimanualPoseCommand(CommandTerm):
         if len(ids) != 1:
             raise ValueError(f"Expected exactly one link matching {name!r}, got {len(ids)}")
         return ids[0]
+
+    @property
+    def planar_enabled(self):
+        forced = self._teleop is not None and self._teleop.source == "auto" and self._teleop.category == "planar"
+        return self.cfg.planar_task is not None and (self.cfg.planar_task.probability > 0 or forced)
+
+    @property
+    def teleop_source(self):
+        return self._teleop.source if self._teleop is not None else None
+
+    def set_teleop(self, source, category="regular", arm_mode=2, *, replay=None):
+        """Install runtime selection before reset; leave the saved training contract intact."""
+        if source not in ("manual", "auto") or category not in ("regular", "height_shifted", "planar", "mixed"):
+            raise ValueError("Unknown teleop source or task category")
+        if arm_mode not in (None, 0, 1, 2) or (source == "manual" and arm_mode is None):
+            raise ValueError("Manual teleop requires left/right/both; auto also supports sampled arms")
+        if source == "auto" and category == "height_shifted" and self.cfg.height_task is None:
+            raise ValueError("This environment has no height target sampler")
+        if source == "auto" and category == "planar" and self.cfg.planar_task is None:
+            raise ValueError("Planar targets require the Mobile task")
+        previous = self._teleop
+        self._teleop = PoseOverride(source, category, arm_mode, replay=replay)
+        try:
+            if self.planar_enabled:
+                self._validate_planar_environment()
+        except Exception:
+            self._teleop = previous
+            raise
+
+    def set_manual_targets(self, poses_w, arm_mode):
+        """Queue world targets for the next normal command update, once per control step."""
+        if self.teleop_source != "manual" or arm_mode not in (0, 1, 2):
+            raise ValueError("Select manual teleop and an active arm mode first")
+        poses = validate_pose(poses_w, self.goal_pose_w.shape, self.device)
+        self._teleop.arm_mode = arm_mode
+        self._teleop.pending = poses, arm_mode
+
+    def teleop_snapshot(self):
+        return PoseOverride.snapshot(self)
+
+    def clear_teleop(self):
+        """Return to configured sampling on the next reset."""
+        self._teleop = None
+
+    def _validate_planar_environment(self):
+        """Validate all levels before physics, rather than shortening a sampled window."""
+        if not hasattr(self._env.cfg.actions, "lower_command") or not self._env.cfg.actions.lower_command.enabled:
+            raise ValueError("planar_task requires the Mobile Lower velocity interface to be enabled")
+        course = self.range_curriculum
+        cfg, dt = self.cfg.planar_task, self._env.step_dt
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("planar_task requires a positive finite control dt")
+        hard_steps = math.ceil(self._env.cfg.episode_length_s / dt - 1e-9)
+        near_steps = math.ceil(cfg.timing.near_episode_s / dt - 1e-9)
+        required = near_steps
+        levels = range(course.cfg.num_levels) if course is not None else (0,)
+        for level in levels:
+            progress = level / (course.cfg.num_levels - 1) if course is not None else 1.0
+            bounds = (
+                torch.lerp(course.initial_ranges, course.final_ranges, progress).detach().cpu()[1:4]
+                if course is not None
+                else torch.tensor(self._env.cfg.actions.lower_command.command_ranges)
+            )
+            forward, yaw = bounds[0, 1], bounds[2].abs().amin()
+            if forward <= 0 or yaw <= 0:
+                raise ValueError("planar_task requires positive forward and bidirectional yaw limits at every level")
+            extent = cfg.initial_half_extent_m + progress * (cfg.half_extent_m - cfg.initial_half_extent_m)
+            angle = cfg.initial_bearing_rad + progress * (cfg.bearing_rad - cfg.initial_bearing_rad)
+            _, deadline = budget_steps(
+                torch.tensor(math.sqrt(2) * extent), torch.tensor(angle), forward, yaw, cfg.timing, dt
+            )
+            required = max(required, int(deadline))
+        if hard_steps < required:
+            raise ValueError(
+                f"planar_task needs env.episode_length_s >= {required * dt:.3f}s for a complete evaluation window; "
+                "35s is recommended for the default ranges"
+            )
+
+    def episode_age_steps(self):
+        """Actual control periods since reset, independent of PPO's episode buffer."""
+        return self._env.common_step_counter - self._episode_start_step
+
+    def evaluation_window_mask(self):
+        """Read-only half-open timing gate; precision never changes window timing."""
+        age = self.episode_age_steps()
+        return self.planar_task_mask & (age >= self.evaluation_start_steps) & (age < self.episode_deadline_steps)
+
+    @property
+    def task_ids(self):
+        return torch.where(self.planar_task_mask, 2, self.height_task_mask.long())
+
+    def elapsed_seconds(self, env_ids):
+        steps = self.episode_age_steps() if hasattr(self._env, "common_step_counter") else self._env.episode_length_buf
+        return steps[env_ids].float() * self._env.step_dt
+
+    def collect_window_metrics(self, env_ids=None, position=None, orientation=None):
+        """Collect once per physical control frame, including the pre-reset boundary.
+
+        The Mobile environment calls before reset events alter the robot state.
+        Ordinary command updates reuse already computed errors. Failed terminal
+        frames and absent future time never contribute readiness or error samples.
+        """
+        if not self.planar_enabled or not hasattr(self._env, "reset_terminated"):
+            return
+        ids = self._env_ids[slice(None) if env_ids is None else env_ids]
+        if len(ids) == 0:
+            return
+        if position is None:
+            position, orientation = self.pose_error()
+        position, orientation, active = position[ids], orientation[ids], self.active_mask[ids]
+        cfg = self.range_curriculum.cfg if self.range_curriculum is not None else RangeCurriculumCfg()
+        ready = simultaneous_pose_ready(
+            position, orientation, active, cfg.position_tolerance_m, cfg.orientation_tolerance_rad
+        )
+        tolerance = (
+            self.cfg.workspace_quality.position_tolerance_m
+            if self.cfg.workspace_quality is not None
+            else DEFAULT_POSITION_TOLERANCE_M
+        )
+        position_ready = ((position <= tolerance) | ~active).all(-1) & active.any(-1)
+        valid = self.evaluation_window_mask()[ids] & ~self._env.reset_terminated[ids]
+        self._pose_window.record(
+            ids, self._env.common_step_counter, valid, position, orientation, active, ready, position_ready
+        )
+
+    def episode_quality(self, ids):
+        near = self._pose_ready_sum[ids] / self._metric_steps[ids].clamp_min(1)
+        window_steps = self.episode_deadline_steps[ids] - self.evaluation_start_steps[ids]
+        planar = self._pose_window.quality(ids, window_steps)
+        return torch.where(self.planar_task_mask[ids], planar, near)
 
     @property
     def active_mask(self) -> torch.Tensor:
@@ -270,10 +432,11 @@ class BimanualPoseCommand(CommandTerm):
                 ended = ids[completed]
                 self.range_curriculum.complete(
                     ended,
-                    self.height_task_mask[ended].long(),
-                    self._pose_ready_sum[ended] / self._metric_steps[ended].clamp_min(1),
+                    self.task_ids[ended],
+                    self.episode_quality(ended),
                     terminated[ended],
                     self._env.common_step_counter,
+                    self.elapsed_seconds(ended),
                 )
             self._env.extras.setdefault("log", {}).update(self.range_curriculum.logs())
             self.range_curriculum.begin(ids)
@@ -288,21 +451,50 @@ class BimanualPoseCommand(CommandTerm):
             buffer[ids] = 0
         if self._workspace_sums is not None:
             self._workspace_sums[ids] = 0
+        self._pose_window.reset(ids)
         self._capture_default_pose(ids)
-        probabilities = torch.tensor(self.cfg.mode_probabilities, device=self.device, dtype=torch.float32)
-        self.mode_id[ids] = torch.multinomial(probabilities, len(ids), replacement=True)
-        self._sample_height_task(ids)
+        if self._teleop is None:
+            probabilities = torch.tensor(self.cfg.mode_probabilities, device=self.device, dtype=torch.float32)
+            self.mode_id[ids] = torch.multinomial(probabilities, len(ids), replacement=True)
+            self._sample_task_kind(ids)
+        else:
+            self._teleop.prepare_reset(self, ids)
         super().reset(ids)
         return extras
 
-    def _sample_height_task(self, env_ids):
+    def _sample_task_kind(self, ids):
+        self.planar_task_mask[ids] = False
+        self.height_task_mask[ids] = False
+        self.height_shift[ids] = 0
+        self._episode_start_step[ids] = getattr(self._env, "common_step_counter", 0)
+        if not self.planar_enabled:
+            self._sample_height_task(ids)  # Preserve RNG and legacy timing when the module is off.
+            return
+        probability = (
+            self.range_curriculum.planar_probability
+            if self.range_curriculum is not None
+            else self.cfg.planar_task.probability
+        )
+        self.planar_task_mask[ids] = (
+            True if probability == 1 else torch.rand(len(ids), device=self.device) < probability
+        )
+        self.evaluation_start_steps[ids] = 0
+        self.episode_deadline_steps[ids] = math.ceil(
+            self.cfg.planar_task.timing.near_episode_s / self._env.step_dt - 1e-9
+        )
+        self.planar_station_w[ids] = 0
+        self.planar_distance_m[ids] = 0
+        self.planar_heading_rad[ids] = 0
+        self._sample_height_task(ids[~self.planar_task_mask[ids]])
+
+    def _sample_height_task(self, env_ids, *, force=False):
         """Sample only at reset; disabling height tasks preserves the old RNG sequence."""
         self.height_task_mask[env_ids] = False
         self.height_shift[env_ids] = 0
         height = self.cfg.height_task
-        if height is None or height.probability == 0:
+        if height is None or (height.probability == 0 and not force):
             return
-        if height.probability == 1:
+        if height.probability == 1 or force:
             self.height_task_mask[env_ids] = True
         else:
             self.height_task_mask[env_ids] = torch.rand(len(env_ids), device=self.device) < height.probability
@@ -324,6 +516,7 @@ class BimanualPoseCommand(CommandTerm):
         self.default_wrist_pose_e[ids] = poses[ids][:, self.body_indices]
         self.default_wrist_pose_e[ids, :, :3] -= self._env.scene.env_origins[ids, None, :]
         self._sampling_quat_w[ids] = poses[ids, self.reference_body_idx, 3:]
+        self._default_pelvis_pos_e[ids] = poses[ids, self.reference_body_idx, :3] - self._env.scene.env_origins[ids]
         if self.range_curriculum is not None:
             # Scaling separation about the authored geometry must keep every
             # intermediate level inside the same physical pair limits.
@@ -344,11 +537,16 @@ class BimanualPoseCommand(CommandTerm):
     def _resample(self, env_ids):
         """Keep height-task poses for the episode; regular goals use distance-based intervals."""
         ids = self._env_ids[env_ids]
+        if self._teleop is not None:
+            self._teleop.resample(self, ids)
+            return
         height = self.cfg.height_task
+        held = self.planar_task_mask[ids]
         if height is not None and height.hold_episode:
-            held = self.height_task_mask[ids] & (self.command_counter[ids] > 0)
-            self.time_left[ids[held]] = torch.inf
-            ids = ids[~held]
+            held = held | self.height_task_mask[ids]
+        held &= self.command_counter[ids] > 0
+        self.time_left[ids[held]] = torch.inf
+        ids = ids[~held]
         if len(ids) == 0:
             return
         self._resample_command(ids)
@@ -360,6 +558,7 @@ class BimanualPoseCommand(CommandTerm):
             # A lifecycle marker, never an observation or scalar metric. Avoid
             # floating-point timer expiry just before an episode timeout.
             self.time_left[ids[self.height_task_mask[ids]]] = torch.inf
+        self.time_left[ids[self.planar_task_mask[ids]]] = torch.inf
         self.command_counter[ids] += 1
 
     def _resample_command(self, env_ids):
@@ -369,6 +568,41 @@ class BimanualPoseCommand(CommandTerm):
         # Add after rotation: this is world vertical even if the sampling pelvis
         # is tilted. Inactive goals keep their original, masked-out poses.
         self.goal_pose_w[env_ids, :, 2] += self.height_shift[env_ids, None] * self.active_mask[env_ids]
+        self._apply_planar_targets(env_ids[self.planar_task_mask[env_ids]])
+
+    def _apply_planar_targets(self, ids):
+        if len(ids) == 0:
+            return
+        cfg = self.cfg.planar_task
+        course = self.range_curriculum
+        progress = (
+            course.episode_levels[ids].float() / (course.cfg.num_levels - 1)
+            if course is not None
+            else torch.ones(len(ids), device=self.device)
+        )
+        anchor = self._env.scene.env_origins[ids] + self._default_pelvis_pos_e[ids]
+        local = self.goal_pose_w[ids, :, :3] - anchor[:, None]
+        radius = (local.norm(dim=-1) * self.active_mask[ids]).amax(-1)
+        shift, heading = sample_station(progress, radius, cfg)
+        displacement = torch.cat((shift, torch.zeros(len(ids), 1, device=self.device)), dim=-1)
+        station = anchor + quat_apply(yaw_quat(self._sampling_quat_w[ids]), displacement)
+        zeros = torch.zeros_like(heading)
+        rotation = quat_from_euler_xyz(zeros, zeros, heading)[:, None].expand(-1, 2, -1)
+        self.goal_pose_w[ids, :, :3] = station[:, None] + quat_apply(rotation, local)
+        self.goal_pose_w[ids, :, 3:] = quat_unique(quat_mul(rotation, self.goal_pose_w[ids, :, 3:]))
+        bounds = (
+            course.lower_ranges[ids, 1:4]
+            if course is not None
+            else torch.tensor(self._env.cfg.actions.lower_command.command_ranges, device=self.device).expand(
+                len(ids), -1, -1
+            )
+        )
+        self.evaluation_start_steps[ids], self.episode_deadline_steps[ids] = budget_steps(
+            shift.norm(dim=-1), heading, bounds[:, 0, 1], bounds[:, 2].abs().amin(-1), cfg.timing, self._env.step_dt
+        )
+        self.planar_station_w[ids] = station
+        self.planar_distance_m[ids] = shift.norm(dim=-1)
+        self.planar_heading_rad[ids] = heading
 
     def _sample_offsets(self, ranges, count):
         offset = torch.empty(count, 3, device=self.device)
@@ -453,7 +687,8 @@ class BimanualPoseCommand(CommandTerm):
 
     def _update_command(self):
         # World goals stay fixed; command converts to the live pelvis frame on access.
-        pass
+        if self._teleop is not None:
+            self._teleop.apply_pending(self)
 
     def _update_metrics(self):
         # Auto-reset happens before command updates. Exclude freshly reset frames;
@@ -467,10 +702,11 @@ class BimanualPoseCommand(CommandTerm):
         self._metric_steps += valid
         if self.range_curriculum is not None:
             cfg = self.range_curriculum.cfg
-            ready = (
-                ((position <= cfg.position_tolerance_m) & (orientation <= cfg.orientation_tolerance_rad)) | ~active
-            ).all(dim=-1) & active.any(dim=-1)
+            ready = simultaneous_pose_ready(
+                position, orientation, active, cfg.position_tolerance_m, cfg.orientation_tolerance_rad
+            )
             self._pose_ready_sum += ready * valid
+        self.collect_window_metrics(position=position, orientation=orientation)
         if self._workspace_sums is not None:
             state = self.workspace_quality_state()
             target_valid = state.target_valid & active
@@ -490,7 +726,7 @@ class BimanualPoseCommand(CommandTerm):
                 )
                 * valid[:, None]
             )
-        if self.cfg.height_task is not None:
+        if self.cfg.height_task is not None or self.range_curriculum is not None or self.planar_enabled:
             # Reuse Q's readiness gate when enabled. Without Q diagnostics the
             # same all-active-wrist criterion uses the default 8 mm tolerance.
             ready = (
@@ -546,14 +782,21 @@ class BimanualPoseCommand(CommandTerm):
             return {}
         completed = (terminated[env_ids] | timeouts[env_ids]) & (self._env.episode_length_buf[env_ids] > 0)
         extras = {}
-        for shifted, name in ((False, "regular"), (True, "height_shifted")):
-            ids = env_ids[completed & (self.height_task_mask[env_ids] == shifted)]
+        for category, name in enumerate(RangeCurriculum.CLASS_NAMES):
+            if category == 2 and not self.planar_enabled:
+                continue
+            ids = env_ids[completed & (self.task_ids[env_ids] == category)]
             prefix = f"task/{name}"
             extras[f"{prefix}/episodes"] = torch.tensor(float(len(ids)), device=self.device)
             if len(ids) == 0:
                 continue
             extras[f"{prefix}/failure_rate"] = terminated[ids].float().mean()
-            if shifted:
+            seconds = self.elapsed_seconds(ids)
+            extras[f"{prefix}/failure_per_10s"] = failure_per_10s(terminated[ids].sum(), seconds.sum())
+            if category == 2:
+                extras.update(self._planar_metrics(ids, prefix))
+                continue
+            if category == 1:
                 extras[f"{prefix}/height_shift_mean_m"] = self.height_shift[ids].mean()
             ids = ids[self._metric_steps[ids] > 0]
             if len(ids) == 0:
@@ -566,6 +809,23 @@ class BimanualPoseCommand(CommandTerm):
             if self.range_curriculum is not None:
                 extras[f"{prefix}/pose_ready_fraction"] = (self._pose_ready_sum[ids] / steps).mean()
         return extras
+
+    def _planar_metrics(self, ids, prefix):
+        sums = self._pose_window.sums[ids]
+        expected = self.episode_deadline_steps[ids] - self.evaluation_start_steps[ids]
+        result = {
+            "eval_pose_ready_fraction": self.episode_quality(ids).mean(),
+            "eval_position_ready_fraction": (sums[:, 1] / expected).mean(),
+            "eval_coverage_fraction": (sums[:, 4] / expected).mean(),
+            "initial_distance_m": self.planar_distance_m[ids].mean(),
+            "eval_start_s": (self.evaluation_start_steps[ids].float() * self._env.step_dt).mean(),
+            "episode_budget_s": (self.episode_deadline_steps[ids].float() * self._env.step_dt).mean(),
+        }
+        observed = sums[:, 4] > 0
+        if observed.any():
+            result["eval_position_error_m"] = (sums[observed, 2] / sums[observed, 4]).mean()
+            result["eval_orientation_error_rad"] = (sums[observed, 3] / sums[observed, 4]).mean()
+        return {f"{prefix}/{name}": value for name, value in result.items()}
 
     def _set_debug_vis_impl(self, debug_vis):
         if debug_vis and not hasattr(self, "goal_visualizers"):
@@ -620,7 +880,7 @@ class BimanualPoseCommandCfg(CommandTermCfg):
         """Episode-level target randomization, independent of Lower's command limits."""
 
         probability: float = 0.3
-        """Probability of selecting the height-shifted target class at episode reset."""
+        """Height-task probability among non-planar episodes; unchanged when planar tasks are off."""
         shift_range: tuple[float, float] = (-0.15, -0.05)
         """Additional world-Z target shift [m], shared by active wrists; positive shifts are allowed."""
         hold_episode: bool = True
@@ -628,9 +888,12 @@ class BimanualPoseCommandCfg(CommandTermCfg):
 
     height_task: HeightTaskCfg | None = None
     """None retains original sampling. Probability 0 is a regular-only ablation with class diagnostics."""
-    # TODO(goal_timing): When adding distant planar tasks, adapt distance_reference_speed
-    # and resampling_time_range separately. Preserve already published world goals
-    # and hold intervals; the present range curriculum leaves timing unchanged.
+    planar_task: PlanarTaskCfg | None = None
+    """Optional Mobile planar tasks; height probability applies to the remaining episodes.
+
+    Probability zero preserves the old distribution, RNG and timeout. Planar
+    quality uses the full assigned window; all sampled classes gate progression.
+    """
 
     @configclass
     class Ranges:

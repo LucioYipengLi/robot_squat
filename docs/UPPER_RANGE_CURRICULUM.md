@@ -71,7 +71,7 @@ uv run python -m g1.rl play --task Template-G1-Upper-Mobile-v0 --checkpoint "<23
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `initial_level` / `num_levels` | 0 / 11 | 0～10级，共10次扩展 |
-| `advance` | true | false冻结课程等级；仍可恢复检查点等级 |
+| `advance` | true | false固定等级，仍更新诊断；play冻结推进 |
 | `initial_lower_ranges` | 上表等级0六组范围 | 顺序为高度、vx、vy、yaw、骨盆X、Y |
 | `initial_position_scale` | 0.50 | 初始腕部位置偏移范围系数，最终为1 |
 | `initial_orientation_scale` | 0.50 | 初始腕部Euler偏移范围系数，最终为1 |
@@ -79,16 +79,18 @@ uv run python -m g1.rl play --task Template-G1-Upper-Mobile-v0 --checkpoint "<23
 | `position_tolerance_m` | 0.015 m | 课程联合达标位置容差 |
 | `orientation_tolerance_rad` | 0.10 rad | 最短旋转角误差容差 |
 | `pose_ready_gate` | 0.80 | 联合达标EMA推进门槛 |
-| `failure_rate_limit` | 0.01 | 每个所需类别的窗口失败率上限 |
+| `failure_rate_limit` | 0.01 | 每个所需类别、每10机器人秒的窗口失败次数上限 |
 | `ema_alpha` | 0.20 | 每个有效窗口更新一次 |
-| `check_period_steps` | 1200 | 最短检查间隔，在回合结算时判断；当前24步PPO下约50轮，模拟时间20秒 |
+| `check_period_steps` | 3600 | 最短检查间隔，在回合结算时判断；当前24步PPO下约150轮，模拟时间60秒 |
 | `min_episodes_per_class` | 512 | 每个窗口、每个所需类别的最低完成回合数 |
 | `reset_on_load` | false | true显式重建课程及统计，保留网络／优化器恢复 |
 
-每级按k/10插值起止范围。常规／高度目标仍为70%／30%，左右单手／双手仍为33%／33%／34%。
+每级按k/10插值起止范围。非平面回合按常规／高度70%／30%选择，左右单手／双手仍为33%／33%／34%。
 常规目标按2～4秒刷新，高度目标完整位姿保持一回合，上限10秒；生成后的世界目标保持固定。
 单手使用`left_offsets/right_offsets`，双手使用`dual_targets`；
-双手几何参数见[任务说明](TASK_RUNNERS.md#g1-上肢位姿跟踪结构)。第三类水平迁移目标、负载和Q奖励启用属于后续实验。
+双手几何参数见[任务说明](TASK_RUNNERS.md#g1-上肢位姿跟踪结构)。
+[第三类平面目标、窗口评分与日志](UPPER_PLANAR_TARGETS.md)默认以20%基础概率参与统一课程；
+训练中的自适应比例见下节。远场奖励、负载和Q奖励启用属于后续实验。
 
 双手公共中心偏移按位置系数缩放；距离、前后错位和高度差围绕默认双腕几何缩放变化量：
 
@@ -110,8 +112,9 @@ dy = sqrt(d² - dx² - dz²)，取正值
 EMA = 0.8 × 旧EMA + 0.2 × 当前窗口分数
 ```
 
-首个样本充足窗口直接初始化EMA。常规和高度类别分别统计，所有实际采样类别均需满足
-样本量、EMA及失败率条件；仅启用一个类别时只检查该类。满足后每个检查窗口最多升一级。
+首个样本充足窗口直接初始化EMA。常规／高度类别按整个回合有效步比例统计；第三类以完整评价窗口为分母，
+缺失和失败时间按未达标计入。所有实际采样类别均需满足样本量、EMA及按存活时长计算的失败保护条件。
+仅启用一个类别时只检查该类。满足后每个检查窗口最多升一级。
 样本不足的窗口不更新该类EMA，窗口计数重新开始。首步失败且无位姿采样的回合以零质量计入，
 人工重置和初始重置排除。位姿统计沿用现有约定，排除刚重置帧及终止物理步。
 
@@ -193,6 +196,63 @@ RMS历史仅用于奖励与诊断，不改变动作／观测布局、Lower推理
 最大误差约7.5e−9 m/s；局部重置、正奖励路径和冻结Lower权重检查通过。该核验用于验证采样与接口，
 稳定性改善由正式训练对照评估。可用 `G1_DWELL_SMOKE=1` 运行 `tests/test_dwell_physics.py` 复查。
 
+## 平面任务自适应采样
+
+范围课程保持原晋级门槛，采样调度只改变新回合的任务类别概率。配置位于
+`MobileCommandsCfg.wrist_pose.range_curriculum.planar_sampling`，Mobile默认启用。
+
+同一等级下保留最近4个连续、样本足够的平面统计窗口，前2个与后2个比较。
+每段用`10 × 总失败数 / 总存活秒数`计算失败频率，不对单窗口比值简单平均。
+当前每窗口3600控制步、PPO每轮24步，对应约150轮检查一次，前300轮与后300轮比较。
+如改变PPO rollout长度，观察轮数为`history_windows × check_period_steps / num_steps_per_env`。
+
+```text
+relative_improvement = (previous_failure - recent_failure) / max(previous_failure, failure_rate_limit, 1e-9)
+```
+
+历史已满、最近一次平面窗口仍超过失败门槛、前后改善不足10%时，提高5个百分点。
+20%→25%→30%→35%→40%，达到上限后继续统计。改善明显时保持当前比例。
+调整后的下一个窗口只暂停增加比例，照常更新滑动历史和范围课程；再下个检查点即可继续判断。
+历史不足或样本不足不加码，样本不足会打断连续历史。
+
+范围晋级优先于采样调度：升到下一级时恢复配置基础概率20%，清空旧等级历史、冷却和等级内调整次数。
+已经运行的回合保留原任务，新比例从之后的回合重置开始生效。
+`advance=false`只冻结等级，训练时采样仍可调节；play／teleop冻结调度，使用恢复出的概率。
+纯平面或关闭平面的配置（概率1或0）不运行自适应调度。
+
+| 参数（`planar_sampling.*`） | 默认值 | 用途 |
+|---|---:|---|
+| `enabled` | true | false使用配置中的固定基础概率，适合固定比例对照 |
+| `history_windows` | 4 | 必须为至少2的偶数；默认约600轮 |
+| `minimum_relative_improvement` | 0.10 | 低于该改善幅度判定下降不足；负数表示退化 |
+| `probability_step` | 0.05 | 单次增加5个百分点 |
+| `maximum_probability` | 0.40 | 上限，须不小于配置基础概率且小于1 |
+| `cooldown_windows` | 1 | 每次增加后跳过的调整检查次数；期间仍收集数据 |
+
+基础概率仍由`planar_task.probability`唯一配置。非平面回合的高度条件概率保持0.3：
+当平面概率为p时，常规与高度分别为`0.7(1-p)`和`0.3(1-p)`，左右手比例保持原配置。
+这些是回合概率，实际训练步数占比还受回合长度和提前失败影响。
+
+调度状态保存在schema 2课程状态的可选`planar_sampling`字段，包含独立版本、配置、概率、历史和冷却。
+已有schema 2检查点在其余契约匹配时可直接续训：保留等级与课程统计，从20%和空采样历史开始。
+同设置恢复新检查点时完整恢复调度；采样参数变更时只重建采样调度，课程等级与统计保留。
+该规则适用于`planar_sampling.*`；基础概率、目标范围等原有参数仍按原课程契约校验。
+`range_curriculum.reset_on_load=true`仍表示重建整个课程，包含采样调度。
+
+新增TensorBoard分组`Curriculum/upper_sampling`：
+
+| 标签后缀 | 含义 |
+|---|---|
+| `planar_probability` | 下一次回合采样使用的平面概率 |
+| `history_windows` | 已收集的有效连续窗口数，满4才比较 |
+| `previous_failure_per_10s` / `recent_failure_per_10s` | 前、后半段累计失败频率；历史满后写入 |
+| `relative_improvement` | 前后相对改善，低于0.10且最近窗口未达标时允许增加 |
+| `cooldown_remaining` | 之后还需暂停增加的窗口数 |
+| `level_adjustments` | 当前等级内已经增加比例的次数，晋级清零 |
+
+先同时查看概率、相对改善与现有平面`window_failure_per_10s`，再看level和其他两类表现。
+功能核验使用受控统计验证触发和恢复；采样增强对稳定性的收益由正式训练对照判断。
+
 ## 日志与判断
 
 | TensorBoard标签 | 含义／用法 |
@@ -205,6 +265,7 @@ RMS历史仅用于奖励与诊断，不改变动作／观测布局、Lower推理
 | `.../*/window_episodes` | 最近检查窗口的真实完成回合数 |
 | `.../*/window_pose_ready_fraction` | 最近窗口的回合等权联合位姿达标比例 |
 | `.../*/window_failure_rate` | 最近窗口失败回合数／完成回合数 |
+| `.../*/window_failure_per_10s` | 10×失败次数／实际存活秒数；课程失败保护使用此值 |
 | `.../sample_ready`、`quality_ready`、`failure_ready` | 最近窗口三个推进条件，结合checked_level看 |
 | `Metrics/wrist_pose/task/{regular,height_shifted}/pose_ready_fraction` | 1.5 cm＋0.10 rad联合达标时间比例，回合后记录 |
 | `.../position_ready_fraction` | 所有活动手同时满足8 mm位置误差的时间比例，与Q门控共用容差 |
@@ -226,13 +287,13 @@ RSL-RL批次平均，课程自身直接聚合回合计数，推进不依赖Tenso
 
 ## 保存、续训与固定条件回放
 
-检查点 `infos.g1_upper_ranges` 保存等级、EMA、计数、检查时钟和课程契约；
+检查点 `infos.g1_upper_ranges`（schema 2）保存等级、三类EMA、计数、实际存活时间、检查时钟和课程契约；
 `infos.g1_control_interface` 保存23／109布局、物理映射及奖励尺度。
 当前控制契约为schema 4、action_mapping=episode_range，并记录三项动作的课程来源。
 新增 `velocity_magnitude_normalization=episode_range` 标识幅值公式；
 `velocity_reward_reference` 继续记录固定的速度变化率尺度。
 奖励公式变化不改变控制接口。新增双手几何配置属于目标分布变更，
-A2～A4B等旧采样检查点可复用网络／优化器，需使用下述`reset_on_load=true`重建课程统计。
+A2～A4B以及本次修改前schema 1课程检查点可复用网络／优化器，需使用下述`reset_on_load=true`重建课程统计。
 旧A1的schema 3在项目train/play入口恢复权重前被拒绝，避免相同维数掩盖动作含义变化。
 标准续训恢复统计和时钟，但仿真从新回合开始，未完成回合不续接；冻结Lower权重不会更新。
 `play`恢复保存等级并冻结课程推进。
@@ -278,3 +339,8 @@ env.commands.wrist_pose.range_curriculum.reset_on_load=true
 模块及总体review完成，330项CPU回归通过；2项真实PhysX集成验证覆盖固定基座／Mobile短训、
 play、Mobile保存续训与策略导出。测试强制双手模式，在实际GPU目标上校验三维间距、位置差及相对角上限。
 几何参数纳入课程契约，旧采样检查点需要显式重建课程统计；完整任务收益由正式训练评估。
+
+2026-11-16窗口评分与三类课程：第三类以完整分配窗口评分，缺失和失败时间保留在分母中；
+三类分别积累EMA，失败保护使用每10机器人秒发生率，默认检查间隔3600步。
+Mobile奖励贡献日志改为按各结束回合的实际存活时长归一化，训练奖励本身保持原样。
+课程状态升至schema 2；385项CPU回归通过，真实混合回合核验覆盖提前失败和三类推进。

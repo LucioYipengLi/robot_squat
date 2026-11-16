@@ -64,6 +64,6 @@ def resolve_task_family(task_id: str, expected: str | None = None) -> str:
 
 
 def require_lower_limb_task(action: str, task_id: str) -> None:
-    """Keep the current teleop/eval boundary explicit, including simulator-free planning."""
+    """Validate operations restricted to the registered Lower Phase 1/2/3 tasks."""
     if task_id not in LOWER_LIMB_TASK_IDS:
         raise ValueError(f"{action} currently supports only the registered lower-limb Phase 1/2/3 tasks")

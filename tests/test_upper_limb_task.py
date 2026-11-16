@@ -60,6 +60,7 @@ def pose_command():
     env = SimpleNamespace(
         num_envs=count,
         device="cpu",
+        step_dt=1 / 60,
         scene=scene,
         episode_length_buf=torch.ones(count, dtype=torch.long),
         sim=SimpleNamespace(vis_marker_registry=SimpleNamespace(clear_debug_vis_callback=lambda obj: None)),

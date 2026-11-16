@@ -83,6 +83,24 @@ class MobileCommandsCfg(CommandsCfg):
             shift_range=(-0.15, -0.05),  # 世界Z额外偏移，m；独立于Lower能力和高度命令范围。
             hold_episode=True,  # 第二类整个位姿保持一回合；常规目标仍按原间隔刷新。
         ),
+        planar_task=mdp.PlanarTaskCfg(
+            probability=0.2,  # 三类评分/课程已接入；远场奖励完成前保持显式启用。
+            initial_half_extent_m=0.25,
+            half_extent_m=2.5,  # 作业站位相对初始盆骨的5 m × 5 m空间。
+            initial_bearing_rad=0.5235987755982988,  # ±30°，随回合等级扩到全方向。
+            bearing_rad=3.141592653589793,
+            max_goal_distance_m=5.0,  # 各活动腕目标相对初始盆骨的三维距离上限。
+            timing=mdp.GoalTimingCfg(
+                linear_speed=0.4,
+                linear_acceleration=0.3,
+                angular_speed=0.4,
+                angular_acceleration=0.4,
+                ability_fraction=0.8,
+                settle_s=2.0,
+                evaluation_s=10.0,
+                near_episode_s=10.0,
+            ),
+        ),
         range_curriculum=mdp.RangeCurriculumCfg(
             initial_level=0,
             num_levels=11,
@@ -100,10 +118,18 @@ class MobileCommandsCfg(CommandsCfg):
             position_tolerance_m=0.015,
             orientation_tolerance_rad=0.10,
             pose_ready_gate=0.80,
-            failure_rate_limit=0.01,
+            failure_rate_limit=0.01,  # 每10机器人秒的失败次数上限。
             ema_alpha=0.20,
-            check_period_steps=1200,
+            check_period_steps=3600,  # 60秒，覆盖长回合并收集每类足量样本。
             min_episodes_per_class=512,
+            planar_sampling=mdp.AdaptivePlanarSamplingCfg(
+                enabled=True,
+                history_windows=4,  # 当前每150轮检查一次：前300轮对比后300轮。
+                minimum_relative_improvement=0.10,
+                probability_step=0.05,
+                maximum_probability=0.40,
+                cooldown_windows=1,  # 加码后下一窗口只统计，随后恢复判断。
+            ),
         ),
     )
 
@@ -184,6 +210,7 @@ class MobileRewardsCfg(RewardsCfg):
 
 @configclass
 class MobileTerminationsCfg(TerminationsCfg):
+    time_out = DoneTerm(func=mdp.task_time_out, time_out=True, params={"command_name": "wrist_pose"})
     fallen = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 0.8})
     low_height = DoneTerm(func=mdp.root_height_below_minimum, params={"minimum_height": 0.25})
     base_contact = DoneTerm(
@@ -213,6 +240,7 @@ class UpperLimbMobileEnvCfg(UpperLimbAgentEnvCfg):
         from g1.tasks.lower_limb_agent.config.g1.env_cfg import LowerLimbAgentEnvCfg
 
         lower = LowerLimbAgentEnvCfg()
+        self.episode_length_s = 35.0
         self.sim.dt = lower.sim.dt
         self.decimation = lower.decimation
         self.sim.render_interval = self.decimation

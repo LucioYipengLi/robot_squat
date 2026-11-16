@@ -8,12 +8,16 @@ here. Counts are episode-weighted, independent of TensorBoard log reductions.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import asdict
 
 import torch
 
 from isaaclab.utils import configclass
+
+from .adaptive_sampling import AdaptivePlanarSampling, AdaptivePlanarSamplingCfg
+from .episode_metrics import failure_per_10s
 
 __all__ = ["RangeCurriculumCfg", "RangeCurriculum"]
 
@@ -41,19 +45,20 @@ class RangeCurriculumCfg:
     position_tolerance_m: float = 0.015
     orientation_tolerance_rad: float = 0.10
     pose_ready_gate: float = 0.80
-    failure_rate_limit: float = 0.01
+    failure_rate_limit: float = 0.01  # Failures per ten aggregate robot-seconds.
     ema_alpha: float = 0.20
-    check_period_steps: int = 1200
+    check_period_steps: int = 3600
     min_episodes_per_class: int = 512
+    planar_sampling: AdaptivePlanarSamplingCfg | None = None
 
 
 class RangeCurriculum:
     """One global progression level; each running episode keeps its assigned level."""
 
-    CLASS_NAMES = ("regular", "height_shifted")
+    CLASS_NAMES = ("regular", "height_shifted", "planar")
     AXES = ("height", "vx", "vy", "yaw", "pelvis_x", "pelvis_y")
 
-    def __init__(self, cfg, final_ranges, height_shift, required_classes, num_envs, device):
+    def __init__(self, cfg, final_ranges, height_shift, required_classes, num_envs, device, *, planar_probability=0.0):
         self.cfg = cfg
         self.final_ranges = torch.tensor(final_ranges, device=device, dtype=torch.float32)
         self.initial_ranges = torch.tensor(cfg.initial_lower_ranges, device=device, dtype=torch.float32)
@@ -85,19 +90,23 @@ class RangeCurriculum:
         ):
             raise ValueError("Invalid curriculum height shifts")
         self.required = torch.tensor(required_classes, device=device, dtype=torch.bool)
-        if self.required.shape != (2,) or not self.required.any():
+        if self.required.ndim != 1 or not 1 <= len(self.required) <= len(self.CLASS_NAMES) or not self.required.any():
             raise ValueError("At least one curriculum target class is required")
+        self.class_names = self.CLASS_NAMES[: len(self.required)]
         self.level = cfg.initial_level
         self.episode_levels = torch.full((num_envs,), self.level, device=device, dtype=torch.long)
         self.lower_ranges = self.final_ranges.expand(num_envs, -1, -1).clone()
-        self.counts = torch.zeros(2, device=device, dtype=torch.long)
-        self.score_sums = torch.zeros(2, device=device)
-        self.failures = torch.zeros(2, device=device, dtype=torch.long)
-        self.ema = torch.zeros(2, device=device)
-        self.initialized = torch.zeros(2, device=device, dtype=torch.bool)
+        self.counts = torch.zeros(len(self.required), device=device, dtype=torch.long)
+        self.score_sums = torch.zeros_like(self.counts, dtype=torch.float32)
+        self.failures = torch.zeros_like(self.counts)
+        self.elapsed_s = torch.zeros_like(self.score_sums)
+        self.ema = torch.zeros_like(self.score_sums)
+        self.initialized = torch.zeros_like(self.counts, dtype=torch.bool)
         self.window_counts = self.counts.clone()
         self.window_failure_rate = self.score_sums.clone()
         self.window_scores = self.score_sums.clone()
+        self.window_elapsed_s = self.elapsed_s.clone()
+        self.window_failure_per_10s = self.score_sums.clone()
         self.sample_ready = False
         self.quality_ready = False
         self.failure_ready = False
@@ -106,7 +115,17 @@ class RangeCurriculum:
         self.clock_offset = 0
         self.evaluation = False
         self.target_contract = None
+        self.base_planar_probability = planar_probability
+        self.planar_sampling = None
+        if cfg.planar_sampling is not None and cfg.planar_sampling.enabled and 0 < planar_probability < 1:
+            if len(self.required) != 3 or not bool(self.required[2]):
+                raise ValueError("Adaptive planar sampling requires the planar task class")
+            self.planar_sampling = AdaptivePlanarSampling(cfg.planar_sampling, planar_probability)
         self.begin(slice(None))
+
+    @property
+    def planar_probability(self):
+        return self.planar_sampling.probability if self.planar_sampling is not None else self.base_planar_probability
 
     def begin(self, ids):
         self.episode_levels[ids] = self.level
@@ -121,16 +140,21 @@ class RangeCurriculum:
             "counts",
             "score_sums",
             "failures",
+            "elapsed_s",
             "ema",
             "initialized",
             "window_counts",
             "window_failure_rate",
             "window_scores",
+            "window_elapsed_s",
+            "window_failure_per_10s",
         ):
             getattr(self, name).zero_()
         self.clock_offset = -int(step)
         self.last_check = 0
         self.sample_ready = self.quality_ready = self.failure_ready = False
+        if self.planar_sampling is not None:
+            self.planar_sampling.reset()
         self.begin(slice(None))
 
     def target_scale(self, ids, *, orientation=False):
@@ -141,16 +165,17 @@ class RangeCurriculum:
         p = self.episode_levels[ids].float()[:, None] / (self.cfg.num_levels - 1)
         return self.initial_shift + p * (self.final_shift - self.initial_shift)
 
-    def complete(self, ids, categories, scores, failed, step):
+    def complete(self, ids, categories, scores, failed, step, elapsed_s):
         """Accept natural completions only; missing pose samples receive quality zero."""
-        if self.evaluation or not self.cfg.advance:
+        if self.evaluation:
             return
         current = self.episode_levels[ids] == self.level
-        for c in range(2):
+        for c in range(len(self.required)):
             mask = current & (categories == c)
             self.counts[c] += mask.sum()
             self.score_sums[c] += scores[mask].sum()
             self.failures[c] += failed[mask].sum()
+            self.elapsed_s[c] += elapsed_s[mask].sum()
         now = int(step) + self.clock_offset
         if now - self.last_check < self.cfg.check_period_steps:
             return
@@ -159,6 +184,8 @@ class RangeCurriculum:
         self.window_counts.copy_(self.counts)
         self.window_scores.copy_(self.score_sums / self.counts.clamp_min(1))
         self.window_failure_rate.copy_(self.failures / self.counts.clamp_min(1))
+        self.window_elapsed_s.copy_(self.elapsed_s)
+        self.window_failure_per_10s.copy_(failure_per_10s(self.failures, self.elapsed_s))
         eligible = self.counts >= self.cfg.min_episodes_per_class
         # Update EMA only from sufficiently sampled windows, once per window.
         self.ema[eligible] = torch.where(
@@ -169,14 +196,28 @@ class RangeCurriculum:
         self.initialized |= eligible
         self.sample_ready = bool(eligible[self.required].all())
         self.quality_ready = bool((self.initialized & (self.ema >= self.cfg.pose_ready_gate))[self.required].all())
-        self.failure_ready = bool((self.window_failure_rate <= self.cfg.failure_rate_limit)[self.required].all())
+        self.failure_ready = bool((self.window_failure_per_10s <= self.cfg.failure_rate_limit)[self.required].all())
+        sampling_window = None
+        if self.planar_sampling is not None:
+            sampling_window = (int(self.failures[2]), float(self.elapsed_s[2]), bool(eligible[2]))
         self.counts.zero_()
         self.score_sums.zero_()
         self.failures.zero_()
-        if self.sample_ready and self.quality_ready and self.failure_ready and self.level < self.cfg.num_levels - 1:
+        self.elapsed_s.zero_()
+        if (
+            self.cfg.advance
+            and self.sample_ready
+            and self.quality_ready
+            and self.failure_ready
+            and self.level < self.cfg.num_levels - 1
+        ):
             self.level += 1
             self.ema.zero_()
             self.initialized.zero_()
+            if self.planar_sampling is not None:
+                self.planar_sampling.reset()
+        elif sampling_window is not None:
+            self.planar_sampling.observe(*sampling_window, self.cfg.failure_rate_limit)
 
     def logs(self):
         result = {
@@ -197,19 +238,26 @@ class RangeCurriculum:
         )
         for i, name in enumerate(self.AXES):
             result[f"range/{name}_min"], result[f"range/{name}_max"] = ranges[i]
-        for c, name in enumerate(self.CLASS_NAMES):
+        for c, name in enumerate(self.class_names):
+            if not self.required[c]:
+                continue
             result[f"{name}/ema"] = self.ema[c].clone()
             result[f"{name}/ema_valid"] = self.initialized[c].clone().float()
             result[f"{name}/window_episodes"] = self.window_counts[c].clone().float()
             result[f"{name}/window_failure_rate"] = self.window_failure_rate[c].clone()
+            result[f"{name}/window_failure_per_10s"] = self.window_failure_per_10s[c].clone()
             result[f"{name}/window_pose_ready_fraction"] = self.window_scores[c].clone()
-        return {f"Curriculum/upper_ranges/{k}": v for k, v in result.items()}
+        logs = {f"Curriculum/upper_ranges/{k}": v for k, v in result.items()}
+        if self.planar_sampling is not None:
+            logs.update(self.planar_sampling.logs(self.cfg.failure_rate_limit))
+        return logs
 
     def contract(self):
         cfg = asdict(self.cfg)
-        for k in ("advance", "reset_on_load"):
+        for k in ("advance", "reset_on_load", "planar_sampling"):
             cfg.pop(k)
         contract = {
+            "failure_measure": "failures_per_10_robot_seconds",
             "cfg": cfg,
             "final_ranges": self.final_ranges.cpu().tolist(),
             "height_shift": self.final_shift.cpu().tolist(),
@@ -220,29 +268,33 @@ class RangeCurriculum:
 
     def state_dict(self, step):
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "contract": self.contract(),
             "level": self.level,
             "control_steps": int(step) + self.clock_offset,
             "last_check": self.last_check,
             "checked_level": self.checked_level,
+            "planar_sampling": self.planar_sampling.state_dict() if self.planar_sampling is not None else None,
             **{
                 k: getattr(self, k).detach().cpu().clone()
                 for k in (
                     "counts",
                     "score_sums",
                     "failures",
+                    "elapsed_s",
                     "ema",
                     "initialized",
                     "window_counts",
                     "window_failure_rate",
                     "window_scores",
+                    "window_elapsed_s",
+                    "window_failure_per_10s",
                 )
             },
         }
 
     def load_state_dict(self, state, step):
-        if state.get("schema_version") != 1 or state.get("contract") != self.contract():
+        if state.get("schema_version") != 2 or state.get("contract") != self.contract():
             raise ValueError("Upper range curriculum differs from checkpoint; use range_curriculum.reset_on_load=true")
         level = state["level"]
         if not isinstance(level, int) or not 0 <= level < self.cfg.num_levels:
@@ -252,14 +304,17 @@ class RangeCurriculum:
             "counts",
             "score_sums",
             "failures",
+            "elapsed_s",
             "ema",
             "initialized",
             "window_counts",
             "window_failure_rate",
             "window_scores",
+            "window_elapsed_s",
+            "window_failure_per_10s",
         ):
             value = torch.as_tensor(state[k], device=self.counts.device)
-            if value.shape != (2,) or not torch.isfinite(value).all() or (value < 0).any():
+            if value.shape != self.counts.shape or not torch.isfinite(value).all() or (value < 0).any():
                 raise ValueError(f"Invalid saved Upper curriculum {k}")
             buffers[k] = value
         if (
@@ -276,4 +331,6 @@ class RangeCurriculum:
             getattr(self, k).copy_(value)
         self.clock_offset = int(state["control_steps"]) - int(step)
         self.last_check = int(state["last_check"])
+        if self.planar_sampling is not None and not self.planar_sampling.load_state_dict(state.get("planar_sampling")):
+            logging.getLogger(__name__).info("Started fresh adaptive sampling history; restored range level %s", level)
         self.begin(slice(None))

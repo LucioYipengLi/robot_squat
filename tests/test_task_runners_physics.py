@@ -14,15 +14,16 @@ import yaml
 @pytest.mark.integration
 @pytest.mark.skipif(os.environ.get("G1_TRAIN_PLAY_SMOKE") != "1", reason="Opt-in: launches Isaac Sim and uses a GPU")
 @pytest.mark.parametrize(
-    "task,family",
+    "task,family,planar",
     [
-        ("Template-G1-v0", "lower_limb_agent"),
-        ("Template-G1-Upper-v0", "upper_limb_agent"),
-        ("Template-G1-Upper-Mobile-v0", "upper_limb_agent"),
+        ("Template-G1-v0", "lower_limb_agent", False),
+        ("Template-G1-Upper-v0", "upper_limb_agent", False),
+        ("Template-G1-Upper-Mobile-v0", "upper_limb_agent", False),
+        ("Template-G1-Upper-Mobile-v0", "upper_limb_agent", True),
     ],
-    ids=["lower_limb", "upper_g1", "upper_mobile"],
+    ids=["lower_limb", "upper_g1", "upper_mobile", "upper_mobile_planar"],
 )
-def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
+def test_headless_train_and_play_use_task_runner(tmp_path, task, family, planar):
     project = Path(__file__).resolve().parents[1]
 
     def invoke(args, name):
@@ -73,6 +74,24 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
     if task == "Template-G1-Upper-Mobile-v0":
         # Guarantee coverage of episode-held targets even with only four envs.
         common.append("env.commands.wrist_pose.height_task.probability=1.0")
+        if not planar:
+            # Explicitly exercise the legacy branch now that training defaults enable planar tasks.
+            common.append("env.commands.wrist_pose.planar_task.probability=0.0")
+    if planar:
+        common.extend(
+            [
+                "env.episode_length_s=35",
+                "env.commands.wrist_pose.planar_task.probability=1.0",
+                "env.commands.wrist_pose.range_curriculum.advance=true",
+                "env.commands.wrist_pose.planar_task.initial_half_extent_m=0.000001",
+                "env.commands.wrist_pose.planar_task.half_extent_m=0.000001",
+                "env.commands.wrist_pose.planar_task.initial_bearing_rad=0",
+                "env.commands.wrist_pose.planar_task.bearing_rad=0",
+                "env.commands.wrist_pose.planar_task.timing.settle_s=0.01",
+                "env.commands.wrist_pose.planar_task.timing.evaluation_s=0.05",
+                "env.commands.wrist_pose.planar_task.timing.near_episode_s=0.05",
+            ]
+        )
     invoke(
         [
             "-m",
@@ -145,19 +164,41 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family):
         if task == "Template-G1-Upper-Mobile-v0":
             prefix = "Metrics/wrist_pose/task/height_shifted/"
             for metric in (
-                "episodes",
-                "failure_rate",
-                "position_error_m",
-                "orientation_error_rad",
-                "position_ready_fraction",
-                "height_shift_mean_m",
+                ()
+                if planar
+                else (
+                    "episodes",
+                    "failure_rate",
+                    "position_error_m",
+                    "orientation_error_rad",
+                    "position_ready_fraction",
+                    "height_shift_mean_m",
+                )
             ):
                 assert prefix + metric in tags
                 assert all(math.isfinite(row.value) for row in events.Scalars(prefix + metric))
-            assert all(-0.050001 <= row.value <= -0.019999 for row in events.Scalars(prefix + "height_shift_mean_m"))
-            assert prefix + "pose_ready_fraction" in tags
+            if not planar:
+                assert all(
+                    -0.050001 <= row.value <= -0.019999 for row in events.Scalars(prefix + "height_shift_mean_m")
+                )
+                assert prefix + "pose_ready_fraction" in tags
             assert "Curriculum/upper_ranges/level" in tags
             assert infos["g1_upper_ranges"]["level"] == 0
+            if planar:
+                contract = infos["g1_upper_ranges"]["contract"]["target"]
+                assert contract["planar_task"]["probability"] == 1 and contract["timing_hard_limit_s"] == 35
+                state = infos["g1_upper_ranges"]
+                assert state["schema_version"] == 2 and state["counts"].shape == (3,)
+                assert state["counts"][2] > 0 and not state["counts"][:2].any()
+                for name in (
+                    "eval_pose_ready_fraction",
+                    "eval_coverage_fraction",
+                    "eval_position_error_m",
+                    "failure_per_10s",
+                ):
+                    tag = f"Metrics/wrist_pose/task/planar/{name}"
+                    assert tag in tags and all(math.isfinite(row.value) for row in events.Scalars(tag))
+                assert events.Scalars("Metrics/wrist_pose/task/planar/eval_coverage_fraction")[-1].value == 1.0
             dual = infos["g1_upper_ranges"]["contract"]["target"]["dual_targets"]
             assert dual["separation_range"] == [0.25, 0.4] and dual["max_relative_angle"] == 0.15
             vertical_tag = "Episode_Reward/base_vertical_acc"
@@ -294,8 +335,16 @@ def checked_factory(env, *args, **kwargs):
         pair_angle = quat_error_magnitude(command.goal_pose_w[:, 0, 3:], command.goal_pose_w[:, 1, 3:])
         assert (pair_angle <= dual_cfg.max_relative_angle * angle_scales + 1e-5).all()
         if mobile:
-            assert command.height_task_mask.all() and torch.isinf(command.time_left).all()
-            assert ((command.height_shift >= -0.05) & (command.height_shift <= -0.02)).all()
+            assert torch.isinf(command.time_left).all()
+            if command.planar_enabled:
+                assert command.planar_task_mask.all() and not command.height_task_mask.any()
+                assert (command.episode_age_steps() == 0).all()
+                assert ((command.episode_deadline_steps - command.evaluation_start_steps) == 3).all()
+                assert (command.episode_deadline_steps <= raw_env.max_episode_length).all()
+                assert not command.evaluation_window_mask().any()
+            else:
+                assert command.height_task_mask.all()
+                assert ((command.height_shift >= -0.05) & (command.height_shift <= -0.02)).all()
         else:
             assert command.cfg.height_task is None and not command.height_task_mask.any()
         assert torch.isfinite(command.pose_error()[0]).all()
@@ -341,7 +390,7 @@ def short_playback(step, **kwargs):
                 command = raw_env.command_manager.get_term('wrist_pose')
                 goal = command.goal_pose_w.clone()
                 length = raw_env.episode_length_buf.clone()
-                shifted = command.height_task_mask.clone()
+                shifted = (command.height_task_mask | command.planar_task_mask).clone()
             step()
             if raw_env.cfg.task_family == 'upper_limb_agent' and command.cfg.height_task is not None:
                 held = shifted & (raw_env.episode_length_buf > length)

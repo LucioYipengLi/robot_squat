@@ -17,7 +17,7 @@ gym.register(
 
 gym.register(
     id="Template-G1-Upper-Mobile-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point="g1.tasks.upper_limb_agent.env:UpperLimbMobileEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.mobile_env_cfg:UpperLimbMobileEnvCfg",

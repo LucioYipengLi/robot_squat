@@ -35,7 +35,7 @@ def test_task_registrations():
             "rsl_rl_cfg_entry_point": "g1.tasks.upper_limb_agent.config.g1.agents.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
         "Template-G1-Upper-Mobile-v0": {
-            "entry_point": "isaaclab.envs:ManagerBasedRLEnv",
+            "entry_point": "g1.tasks.upper_limb_agent.env:UpperLimbMobileEnv",
             "env_cfg_entry_point": "g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg:UpperLimbMobileEnvCfg",
             "default_agent": "rsl_rl",
             "rsl_rl_cfg_entry_point": (

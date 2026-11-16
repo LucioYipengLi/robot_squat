@@ -49,35 +49,46 @@ def test_levels_are_episode_owned_and_targets_interpolate():
 def test_gates_require_each_class_samples_quality_and_low_failure():
     c = state(min_episodes_per_class=1, check_period_steps=10)
     ids, categories = torch.tensor([0, 1]), torch.tensor([0, 1])
-    c.complete(ids, categories, torch.tensor([1.0, 0.5]), torch.zeros(2, dtype=torch.bool), 10)
+    c.complete(ids, categories, torch.tensor([1.0, 0.5]), torch.zeros(2, dtype=torch.bool), 10, torch.full((2,), 10.0))
     assert c.level == 0 and not c.quality_ready
-    c.complete(ids, categories, torch.ones(2), torch.tensor([False, True]), 20)
+    c.complete(ids, categories, torch.ones(2), torch.tensor([False, True]), 20, torch.full((2,), 10.0))
     assert c.level == 0 and not c.failure_ready
     for t in range(30, 100, 10):
-        c.complete(ids, categories, torch.ones(2), torch.zeros(2, dtype=torch.bool), t)
+        c.complete(ids, categories, torch.ones(2), torch.zeros(2, dtype=torch.bool), t, torch.full((2,), 10.0))
         if c.level:
             break
     assert c.level == 1 and not c.initialized.any()
     # Already-running level-0 episodes cannot advance level 1.
-    c.complete(ids, categories, torch.ones(2), torch.zeros(2, dtype=torch.bool), t + 10)
+    c.complete(ids, categories, torch.ones(2), torch.zeros(2, dtype=torch.bool), t + 10, torch.full((2,), 10.0))
     assert c.level == 1 and not c.sample_ready
     c.begin(ids)
-    c.complete(ids, categories, torch.ones(2), torch.zeros(2, dtype=torch.bool), t + 20)
+    c.complete(ids, categories, torch.ones(2), torch.zeros(2, dtype=torch.bool), t + 20, torch.full((2,), 10.0))
     assert c.level == 2
 
 
 def test_insufficient_samples_and_evaluation_do_not_advance():
     c = state(min_episodes_per_class=2, check_period_steps=10)
-    c.complete(torch.tensor([0]), torch.tensor([0]), torch.ones(1), torch.zeros(1, dtype=torch.bool), 10)
+    c.complete(
+        torch.tensor([0]), torch.tensor([0]), torch.ones(1), torch.zeros(1, dtype=torch.bool), 10, torch.tensor([10.0])
+    )
     assert not c.initialized.any() and c.level == 0
     c.evaluation = True
-    c.complete(torch.arange(4), torch.tensor([0, 0, 1, 1]), torch.ones(4), torch.zeros(4, dtype=torch.bool), 20)
+    c.complete(
+        torch.arange(4),
+        torch.tensor([0, 0, 1, 1]),
+        torch.ones(4),
+        torch.zeros(4, dtype=torch.bool),
+        20,
+        torch.full((4,), 10.0),
+    )
     assert not c.counts.any() and c.level == 0
 
 
 def test_state_restores_window_clock_and_rejects_changed_contract():
     c = state(check_period_steps=100)
-    c.complete(torch.tensor([0]), torch.tensor([0]), torch.tensor([0.75]), torch.tensor([True]), 40)
+    c.complete(
+        torch.tensor([0]), torch.tensor([0]), torch.tensor([0.75]), torch.tensor([True]), 40, torch.tensor([10.0])
+    )
     saved = c.state_dict(40)
     restored = state(check_period_steps=100)
     restored.load_state_dict(saved, 3)
@@ -90,6 +101,7 @@ def test_state_restores_window_clock_and_rejects_changed_contract():
         torch.tensor([]),
         torch.tensor([], dtype=torch.bool),
         63,
+        torch.tensor([]),
     )
     assert restored.last_check == 100
     with pytest.raises(ValueError, match="differs"):

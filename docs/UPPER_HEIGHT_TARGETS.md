@@ -1,6 +1,8 @@
 # Upper：常规目标与高度随机化目标
 
 `Template-G1-Upper-Mobile-v0` 默认在每回合开始选择目标类别：70%常规目标、30%高度随机化目标。
+[平面迁移目标与计时](UPPER_PLANAR_TARGETS.md)目前显式启用；开启后高度概率作用于非平面回合，
+例如平面概率20%、高度概率30%对应56%常规、24%高度、20%平面。
 左手、右手、双手模式仍按原概率独立选择；Upper继续自主输出速度、高度和腰臂动作。
 固定基座 `Template-G1-Upper-v0` 使用相同的单手／双手几何采样，不添加额外高度任务。
 Mobile现已接入 [统一范围课程](UPPER_RANGE_CURRICULUM.md)，本文范围表是最终等级配置。
@@ -98,7 +100,8 @@ env.commands.wrist_pose.range_curriculum.reset_on_load=true
 ## TensorBoard分类指标
 
 标签位于 `Metrics/wrist_pose/task/regular/` 和 `Metrics/wrist_pose/task/height_shifted/`。
-仅按两类拆分，不再与三种手臂模式交叉展开。
+本文介绍常规／高度两类；启用第三类时另外输出`task/planar/`，见[窗口评分说明](UPPER_PLANAR_TARGETS.md#窗口评分)。
+类别与三种手臂模式分别统计，不交叉展开。
 
 | 指标后缀 | 定义与观察方法 |
 | --- | --- |
@@ -108,6 +111,7 @@ env.commands.wrist_pose.range_curriculum.reset_on_load=true
 | `position_ready_fraction` | 每回合所有活动手同时满足位置容差的时间比例，再对回合求平均；越高越好 |
 | `pose_ready_fraction` | 当前Mobile课程容差下，所有活动手位置与朝向同时达标的时间比例；默认1.5 cm与0.10 rad |
 | `failure_rate` | 本次重置批次内该类非超时终止回合数／该类结束回合数；越低越好 |
+| `failure_per_10s` | 10×批次失败次数／累计实际存活秒数；课程使用独立聚合的同口径窗口指标 |
 | `height_shift_mean_m` | 仅第二类：结束回合所使用的额外高度偏移均值，m；用于核对采样范围 |
 
 位置达标容差沿用 `workspace_quality.position_tolerance_m`，默认8 mm；关闭Q诊断时使用8 mm。
