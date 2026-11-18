@@ -204,7 +204,21 @@ def create_upper_limb_runner(env, agent_cfg, log_dir=None, *, snapshot_path=None
         raise ValueError("Upper-limb training currently supports OnPolicyRunner only")
     if snapshot_path is not None:
         raise ValueError("upper_limb_agent does not support --curriculum-snapshot")
-    runner = UpperLimbOnPolicyRunner(env, to_dict(agent_cfg), log_dir=log_dir, device=agent_cfg.device)
+    cfg = to_dict(agent_cfg)
+    if cfg.pop("mirror_augmentation", False) and not evaluation:
+        from isaaclab_rl.rsl_rl import RslRlSymmetryCfg
+
+        from .symmetry import augment_mobile_batch, validate_mobile_mirror_interface
+
+        if cfg["algorithm"].get("symmetry_cfg") is not None:
+            raise ValueError("Choose either agent.mirror_augmentation or an explicit PPO symmetry_cfg")
+        validate_mobile_mirror_interface(env)
+        cfg["algorithm"]["symmetry_cfg"] = to_dict(
+            RslRlSymmetryCfg(
+                use_data_augmentation=True, use_mirror_loss=False, data_augmentation_func=augment_mobile_batch
+            )
+        )
+    runner = UpperLimbOnPolicyRunner(env, cfg, log_dir=log_dir, device=agent_cfg.device)
     curriculum = runner._range_curriculum()
     if curriculum is not None:
         curriculum.evaluation = evaluation

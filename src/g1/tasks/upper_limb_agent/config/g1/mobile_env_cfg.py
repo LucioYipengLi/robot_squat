@@ -152,7 +152,7 @@ class MobileCommandsCfg(CommandsCfg):
                 minimum_relative_improvement=0.10,
                 probability_step=0.05,
                 maximum_probability=0.30,
-                other_tasks_pose_ready_gate=0.85,  # 常规/高度任务EMA均达标且当前窗样本足够，才允许加码。
+                other_tasks_pose_ready_gate=0.85,  # 常规/高度任务还须分别通过当前窗口的样本量和失败频率门槛。
                 cooldown_windows=1,  # 加码后下一窗口只统计，随后恢复判断。
             ),
         ),

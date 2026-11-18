@@ -88,7 +88,7 @@ class CommandsCfg:
         # 每回合选择模式：左手、右手、双手；三项概率之和为 1。
         mode_probabilities=(0.33, 0.33, 0.34),
         # 保持时间 = clamp(最远有效目标到骨盆的距离 / 距离时间参数, 时间下限, 时间上限)。
-        resampling_time_range=(2.0, 4.0),  # s
+        resampling_time_range=(2.0, 3.0),  # s
         distance_reference_speed=0.08,  # m/s，仅用于计算目标保持时间。
         workspace_quality=mdp.WorkspaceQualityCfg(
             map_path="data/workspace_q0_v1.npz",  # 相对 upper_limb_agent 包目录；也接受绝对路径。

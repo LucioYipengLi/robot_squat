@@ -11,9 +11,12 @@ import pytest
 import torch
 
 from g1.rl.failures.cli import parse_args
+from g1.rl.failures.pairs import PairedSwitchSummary
 from g1.rl.failures.recording import FailureMiner, FailureRecorderTerm, force_category
 from g1.rl.failures.storage import FailureArchive, TensorHistory, contact_statistics, write_json
+from g1.rl.failures.switches import RegularSwitchTracker
 from g1.rl.failures.viewer import read_index, sample_payload
+from g1.tasks.upper_limb_agent.mdp.contacts import ARM_CONTACT_BODY_PATHS
 
 
 def test_ring_wrap_and_partial_reset_keep_each_episode_separate():
@@ -41,7 +44,7 @@ def test_statistics_keep_substep_impulse_and_force_cancellation_visible():
     assert stats["partners"][0]["contact_onsets"] == 2
 
 
-def make_miner(tmp_path, *, episodes=10, max_failures=10):
+def make_miner(tmp_path, *, episodes=10, max_failures=10, switches=False):
     n = 2
     proxy = lambda value: SimpleNamespace(torch=value)  # noqa: E731
     poses = torch.zeros(n, 3, 7)
@@ -56,9 +59,16 @@ def make_miner(tmp_path, *, episodes=10, max_failures=10):
     goal = poses[:, :2].clone()
     term = SimpleNamespace(
         goal_pose_w=goal,
+        command_counter=torch.ones(n, dtype=torch.long),
         mode_id=torch.tensor([0, 2]),
         task_ids=torch.tensor([2, 0]),
-        range_curriculum=SimpleNamespace(episode_levels=torch.tensor([0, 0])),
+        active_mask=torch.tensor([[True, False], [True, True]]),
+        _sampling_quat_w=poses[:, 0, 3:].clone(),
+        cfg=SimpleNamespace(resampling_time_range=(0.2, 0.4)),
+        range_curriculum=SimpleNamespace(
+            episode_levels=torch.tensor([0, 0]),
+            cfg=SimpleNamespace(position_tolerance_m=0.015, orientation_tolerance_rad=0.10),
+        ),
         evaluation_start_steps=torch.tensor([10, 0]),
         episode_deadline_steps=torch.tensor([20, 20]),
         planar_distance_m=torch.tensor([0.2, 0]),
@@ -66,6 +76,7 @@ def make_miner(tmp_path, *, episodes=10, max_failures=10):
         age=torch.ones(n, dtype=torch.long),
     )
     term.episode_age_steps = lambda: term.age
+    term.pose_error = lambda: ((goal[..., :3] - poses[:, :2, :3]).norm(dim=-1), torch.zeros(n, 2))
     pair = torch.zeros(n, 3, 1, 2, 3)
     pair[:, :, 0, 0, 0] = torch.tensor([3.0, 2.0, 1.0])
     net = pair.sum(dim=-2)
@@ -82,10 +93,17 @@ def make_miner(tmp_path, *, episodes=10, max_failures=10):
 
     sensor.find_bodies = lambda _: ([0], ["torso_link"])
     scene = Scene(robot=robot, torso_contacts=sensor, contact_forces=sensor)
+    arm_pair = torch.zeros(n, 3, 1, len(ARM_CONTACT_BODY_PATHS), 3)
+    scene["torso_contact_pairs"] = SimpleNamespace(
+        data=SimpleNamespace(
+            normal_force_matrix_w_history=proxy(arm_pair), net_normal_forces_w_history=proxy(arm_pair.sum(-2))
+        )
+    )
     ended, timeout = torch.zeros(n, dtype=torch.bool), torch.zeros(n, dtype=torch.bool)
     env = SimpleNamespace(
         cfg=SimpleNamespace(sim=SimpleNamespace(dt=0.01), decimation=2),
         step_dt=0.02,
+        max_episode_length=100,
         num_envs=n,
         scene=scene,
         command_manager=SimpleNamespace(get_term=lambda _: term),
@@ -100,9 +118,18 @@ def make_miner(tmp_path, *, episodes=10, max_failures=10):
         ),
     )
     manifest = {"partners": ["left_elbow", "ground"], "physics_dt": 0.01, "control_dt": 0.02}
+    tracker = RegularSwitchTracker(env, term, 20.0) if switches else None
+    if tracker is not None:
+        manifest["regular_switch_evaluation"] = tracker.settings()
     archive = FailureArchive(tmp_path / "archive", manifest)
     miner = FailureMiner(
-        env, archive, manifest["partners"], history_s=0.1, episodes=episodes, max_failures=max_failures
+        env,
+        archive,
+        manifest["partners"],
+        history_s=0.1,
+        episodes=episodes,
+        max_failures=max_failures,
+        switch_tracker=tracker,
     )
     env.failure_miner = miner
     recorder = FailureRecorderTerm.__new__(FailureRecorderTerm)
@@ -148,6 +175,107 @@ def test_successes_have_target_summaries_but_no_failure_clip(tmp_path):
     assert rows[0]["category"] == "regular" and not rows[0]["failed"]
     assert rows[0]["reasons"] == ["time_out"] and "goal_pose" in rows[0]
     assert archive.completed == 1 and archive.saved == 0
+
+
+def test_pair_recorder_ignores_unassigned_environment_and_labels_failure_clip(tmp_path):
+    miner, recorder, env, term, archive = make_miner(tmp_path, switches=True)
+    archive.pair_summary = PairedSwitchSummary([{"id": "one", "group": "in_up"}])
+    miner.fixed_pairs = SimpleNamespace(
+        trial_ids=torch.tensor([-1, 1]),
+        metadata=lambda _: {"pair_id": "one", "pair_group": "in_up", "pair_side": "right"},
+    )
+    term.mode_id[1] = 1
+    env.reset_terminated[:] = True
+    recorder.record_post_step()
+    archive.progress("interrupted")
+    archive.close()
+
+    assert archive.completed == archive.saved == 1
+    sample = read_index(archive.directory)["samples"][0]
+    assert (sample["env_id"], sample["pair_id"], sample["pair_side"]) == (1, "one", "right")
+    report = json.loads((archive.directory / "summary.json").read_text())["switch_pair_evaluation"]["overall"]
+    assert report["incomplete"] == report["right"]["failed_before_switch"] == 1
+
+
+def test_regular_switch_denominator_includes_success_and_early_terminated_contacts(tmp_path):
+    _, recorder, env, term, archive = make_miner(tmp_path, switches=True)
+    poses = env.scene["robot"].data.body_link_pose_w.torch
+    force = env.scene["torso_contact_pairs"].data.normal_force_matrix_w_history.torch
+    # Initial regular goal is not a switch. This contact also precedes the new goal assignment.
+    force[1, :, 0, 0, 0] = 7
+    recorder.record_post_step()
+    force.zero_()
+    term.command_counter[1] += 1
+    term.goal_pose_w[1, :, 0] -= 0.10
+    for step in range(2, 13):
+        term.age[1] = step
+        if step == 11:
+            poses[1, :2] = term.goal_pose_w[1]
+            force[1, 0, 0, 0, 0] = 1.0  # Last physics substep at exactly 0.2 s.
+        if step == 12:
+            force[1, :, 0, 0, 0] = 8  # 0.21–0.22 s after refresh, outside the early window.
+            env.reset_time_outs[1] = True
+        recorder.record_post_step()
+
+    recorder.reset([1])
+    env.reset_time_outs[1] = False
+    force.zero_()
+    term.command_counter[1] = 1
+    term.age[1] = 1
+    recorder.record_post_step()
+    term.command_counter[1] = 2
+    term.age[1] = 2
+    term.goal_pose_w[1, :, 0] -= 0.10
+    force[1, 1, 0, :2, 0] = torch.tensor([12.0, -12.0])
+    env.reset_terminated[1] = True
+    recorder.record_post_step()
+    archive.progress("episodes")
+    archive.close()
+
+    rows = [json.loads(line) for line in (archive.directory / "switches.jsonl").read_text().splitlines()]
+    assert len(rows) == 2 and [row["episode_id"] for row in rows] == [0, 1]
+    safe, failed = rows
+    assert [row["switch_index"] for row in rows] == [1, 1]
+    assert all(row["direction"] == "retract" and row["position_jump_bin"] == "8_to_12cm" for row in rows)
+    assert safe["switch_time_s"] == pytest.approx(0.02)
+    assert safe["pre_switch_contact"] and safe["pre_switch_ready"]
+    assert safe["peak_arm_force_0p2s_n"] == 1.0 and safe["contact_over_1n"] is False
+    assert safe["new_goal_reach_time_s"] == pytest.approx(0.2)
+    assert failed["contact_observed_s"] == pytest.approx(0.02)
+    assert failed["peak_arm_force_0p2s_n"] == pytest.approx(24.0) and failed["contact_over_hard_threshold"]
+    assert failed["terminated_within_1s"] and failed["new_goal_reached_within_1s"] is False
+    summary = json.loads((archive.directory / "summary.json").read_text())
+    summary = summary["regular_switches"]
+    groups = summary["by_group"]
+    assert groups[0]["direction"] == "retract" and groups[0]["arm_mode"] == "both"
+    assert [group["pre_switch_contact"] for group in groups] == [False, True]
+    assert summary["overall"]["contact_over_hard_threshold"] == {"count": 1, "assessed": 2, "rate": 0.5}
+    assert read_index(archive.directory)["samples"][0]["episode_id"] == failed["episode_id"]
+
+
+def test_short_timeout_is_censored_and_initial_goal_failures_are_separate(tmp_path):
+    _, recorder, env, term, archive = make_miner(tmp_path, switches=True)
+    recorder.record_post_step()
+    term.command_counter[1] = 2
+    term.age[1] += 1
+    term.goal_pose_w[1, :, 1] += 0.10
+    env.reset_time_outs[1] = True
+    recorder.record_post_step()
+    recorder.reset([1])
+    term.command_counter[1] = 1
+    term.age[1] = 1
+    env.reset_time_outs[1] = False
+    env.reset_terminated[1] = True
+    recorder.record_post_step()
+    archive.progress("episodes")
+    archive.close()
+    row = json.loads((archive.directory / "switches.jsonl").read_text())
+    assert row["direction"] == "lateral" and row["contact_over_1n"] is None
+    assert row["new_goal_reached_within_1s"] is None
+    summary = json.loads((archive.directory / "summary.json").read_text())["regular_switches"]
+    assert summary["overall"]["switches"] == 1
+    assert summary["overall"]["contact_over_1n"]["assessed"] == 0
+    assert summary["regular_episodes_without_switch"] == summary["regular_failures_before_first_switch"] == 1
 
 
 @pytest.mark.parametrize("limit", ["episodes", "max_failures"])
@@ -233,7 +361,7 @@ def test_invalid_mining_budgets_are_rejected(option, value):
 
 def test_mining_launch_boundary_has_no_usd_import(tmp_path):
     checkpoint = tmp_path / "model.pt"
-    checkpoint.touch()
+    torch.save({}, checkpoint)
     script = """
 import sys
 class UsdGuard:
@@ -291,6 +419,7 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
     cfg = UpperLimbMobileEnvCfg()
     cfg.sim.dt, cfg.decimation = 0.01, 2
     raw.cfg = cfg
+    term.cfg = cfg.commands.wrist_pose
     raw.device = "cpu"
     raw.scene["robot"].body_names = ["pelvis", "torso_link", "left_elbow_link"]
     raw.scene["robot"].joint_names = ["joint0", "joint1", "joint2"]
@@ -333,6 +462,7 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
     agent_cfg = SimpleNamespace(clip_actions=None, seed=0, device="cpu")
 
     def load(path):
+        assert term.cfg.resampling_time_range == (2.0, 4.0)
         calls.append("loaded")
         term.range_curriculum.level = 3
 
@@ -356,7 +486,8 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
     monkeypatch.setattr(mine, "write_json", write_json)
     # The real YAML writer exercises config serialization; the runner has no learning method.
     checkpoint = tmp_path / "model.pt"
-    checkpoint.write_bytes(b"fixture checkpoint")
+    saved_target = {"resampling_time_range": [2.0, 4.0]}
+    torch.save({"infos": {"g1_upper_ranges": {"contract": {"target": saved_target}}}}, checkpoint)
     output = tmp_path / "mined"
     args = parse_args(
         [
@@ -375,6 +506,7 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
             "cpu",
         ]
         + (["--level", str(requested_level)] if requested_level is not None else [])
+        + (["--category", "regular", "--regular_refresh_s", "2", "3"] if requested_level == 1 else [])
     )
     if requested_level == 11:
         with pytest.raises(ValueError, match="--level must be between 0 and 10"):
@@ -395,5 +527,10 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
     assert index["run"]["level"] == expected_level
     assert index["run"]["checkpoint_level"] == 3
     assert index["run"]["requested_level"] == requested_level
+    assert index["run"]["checkpoint_regular_refresh_s"] == [2.0, 4.0]
+    assert index["run"]["regular_refresh_s"] == ([2.0, 3.0] if requested_level == 1 else [2.0, 4.0])
+    if requested_level == 1:
+        assert summary["regular_switches"]["regular_episodes_without_switch"] == 1
+        assert (output / "switches.jsonl").is_file()
     assert index["samples"][0]["level"] == expected_level
     assert term.range_curriculum.level == expected_level

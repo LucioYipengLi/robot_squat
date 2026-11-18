@@ -31,9 +31,6 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
         obs_normalization=False,
     )
-    # TODO(symmetry): 研究 RslRlSymmetryCfg 的左右镜像数据增强，之后独立评估 mirror loss。
-    # 同步变换双腕目标/实际位姿、任务掩码、关节状态及当前/历史动作，按模型轴向核对符号。
-    # 验证镜像两次还原、运动学与奖励一致性，并通过对照训练评估样本效率和实际耗时。
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,

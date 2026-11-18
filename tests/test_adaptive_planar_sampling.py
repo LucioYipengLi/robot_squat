@@ -90,13 +90,15 @@ def course(advance=True, required=(True, True, True)):
     return RangeCurriculum(cfg, FINAL, (-0.15, -0.05), required, 300, "cpu", planar_probability=0.2)
 
 
-def complete(c, failures=3, scores=(1.0, 1.0, 1.0), counts=(100, 100, 100)):
+def complete(c, failures=3, scores=(1.0, 1.0, 1.0), counts=(100, 100, 100), *, other_failures=(0, 0)):
     categories = torch.arange(3).repeat_interleave(torch.tensor(counts))
     ids = torch.arange(len(categories))
     c.begin(ids)
     failed = torch.zeros(len(ids), dtype=torch.bool)
-    start = sum(counts[:2])
-    failed[start : start + failures] = True
+    start = 0
+    for count, num_failed in zip(counts, (*other_failures, failures), strict=True):
+        failed[start : start + num_failed] = True
+        start += count
     step = c.last_check + c.cfg.check_period_steps - c.clock_offset
     c.complete(ids, categories, torch.tensor(scores)[categories], failed, step, torch.full((len(ids),), 10.0))
 
@@ -113,6 +115,24 @@ def test_each_other_task_must_meet_ema_gate_and_exact_threshold_allows_sampling(
     scores[category] = 0.85
     complete(c, scores=scores)
     assert c.planar_probability == 0.25
+    assert c.logs()["Curriculum/upper_sampling/other_tasks_quality_ready"] == 1
+
+
+@pytest.mark.parametrize("category", [0, 1])
+def test_each_other_task_must_meet_failure_gate_before_planar_sampling_increases(category):
+    c = course()
+    other_failures = [0, 0]
+    other_failures[category] = 2  # 0.02 for this class, 0.01 pooled across the two classes.
+    for _ in range(4):
+        complete(c, other_failures=other_failures)
+    assert c.sample_ready and c.quality_ready
+    assert c.planar_probability == 0.2
+    assert c.logs()["Curriculum/upper_sampling/other_tasks_quality_ready"] == 0
+
+    other_failures[category] = 1  # Exactly 0.01 for this class; planar is still at 0.03.
+    complete(c, other_failures=other_failures)
+    assert c.planar_probability == 0.25 and c.level == 0
+    assert not c.failure_ready
     assert c.logs()["Curriculum/upper_sampling/other_tasks_quality_ready"] == 1
 
 

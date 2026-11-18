@@ -26,7 +26,7 @@ uv run python -m g1.rl failures mine \
 
 使用`--policy_output sample`检查训练随机动作，另选输出目录，例如`planar_sample`。
 `--category regular|height_shifted|mixed`可采集其他类别；`mixed`采用恢复的任务比例。
-所有类别保留训练的原始采样时序，常规目标仍在回合中刷新，不采用teleop的一回合一目标覆盖。
+默认使用检查点保存的常规目标刷新范围。常规目标仍在回合中按距离刷新。
 课程等级和采样调度从检查点恢复并冻结；碰撞、失败阈值、奖励和冻结Lower保持当前配置，策略不执行学习更新。
 省略`--level`时使用检查点保存的当前等级。例如`2026-11-17_17-40-41/model_7999.pt`保存的是level 3，
 默认整个采集过程固定在level 3，不受检查点中上一完整统计窗口`checked_level=2`影响。
@@ -63,6 +63,55 @@ uv run python -m g1.rl failures view --run outputs/failures/planar_mean
 
 默认打开`http://127.0.0.1:8765`。通过远程IDE使用时转发8765端口，并加`--no_browser`；
 `--port 8766`可以更改端口。服务只绑定本机地址，Ctrl+C关闭服务。
+
+## Regular 切换评估
+
+`--category regular` 和 `--category mixed` 自动统计已接收回合中的每次常规目标切换，含安全完成的切换。
+以下示例使用3万轮小网络的Level 2检查点。评估两个模型时，更换checkpoint和输出目录，其余条件取相同值。
+
+```bash
+uv run python -m g1.rl failures mine \
+  --checkpoint logs/rsl_rl/g1_upper_mobile/2026-11-18_00-02-25/model_29999.pt \
+  --level 2 --category regular --policy_output mean --seed 42 \
+  --regular_refresh_s 2 4 --num_envs 256 --episodes 5000 --max_failures 5000 \
+  --output outputs/failures/regular_switch_0002_l2
+```
+
+`--regular_refresh_s 2 4`指定距离计时的评估下限和上限。加载时先使用checkpoint课程里保存的训练范围和同目录`params/agent.yaml`，再应用评估覆盖。`run.json`记录训练与评估范围。省略开关时沿用checkpoint的刷新范围。正式对照建议检查`summary.json`中的`status`为`episodes`，两次采集均达到所需回合数。
+
+- `switches.jsonl`逐次记录新旧目标、切换时间、方向、活动手最大位移、切换前一帧的到位与接触状态、换目标后 0.2 秒内的峰值臂躯接触力，以及 1 秒内能否达到新目标。位姿达标沿用当前课程容差，默认 15 mm 和 0.1 rad。
+- `summary.json`的`regular_switches.overall`给出整体计数与比例，`by_group`按单双手、方向、跳变距离、切换前到位和接触状态分组。优先比较`arm_mode=both`、`pre_switch_ready=true`、`pre_switch_contact=false`且位移档相同的`retract`、`forward`与`lateral`。比例`rate`乘100即每百次切换的事件数。也可用`episode_id`关联原有的失败回放。
+- 方向使用初始骨盆轴。任一活动手向后移动至少 3 cm 归为`retract`，其余中任一手向前移动至少 3 cm 归为`forward`。其余情况下，任一手的侧移达到 3 cm 且不少于该手的高度变化时归为`lateral`。位移分档用活动手中最大的三维目标跳变量。
+- 接触统计使用切换后物理子步上的逐臂/手通道法向力模长之和，分别报告大于 1 N 和大于硬终止阈值的比例。窗口提前结束时，已观察到的事件进入分子和分母，其他观察不足的结果记为`null`。新目标到位统计把 1 秒内到位前物理终止计作失败，提前超时且尚未到位的结果记为`null`。各比例的分母见`assessed`。
+- 回合起始目标单独计数。`regular_failures_before_first_switch`表示首次换目标前就终止的 regular 回合数。整体每10机器人秒的失败频率仍在`failure_per_10s_by_category.regular`。
+
+## 左右镜像切换短评估
+
+先从已有 regular 切换记录生成固定用例。此命令可以在无 GPU 的环境运行。
+
+```bash
+uv run python -m g1.rl failures pairs \
+  --run outputs/failures/regular_com_v5_l1 \
+  --output outputs/failures/v5_l1_switch_pairs.json
+```
+
+默认从 **8–12 cm** 右单手切换中抽取 100 对「向内 + 抬高」、20 对「向外 + 抬高」、20 对「向内、少抬高」。主组和对照组按几何分组后随机抽取。主组未抽到的已知早期硬碰撞可加入独立 `known_failure` 组。可通过 `--in_up`、`--controls`、`--regressions`、`--seed` 调整；`--regressions 0`关闭额外回归用例。套件保存原始目标对和来源记录编号。
+
+再在训练机运行 headless 配对评估。
+
+```bash
+uv run python -m g1.rl failures mine \
+  --checkpoint logs/rsl_rl/g1_upper_mobile/2026-11-18_12-24-35/model_7999.pt \
+  --category regular --policy_output mean --seed 42 \
+  --switch_pairs outputs/failures/v5_l1_switch_pairs.json --num_envs 256 \
+  --output outputs/failures/v5_l1_switch_paired
+```
+
+每个用例左右各运行一次，等级取自套件。左侧目标在初始骨盆平面镜像位置和姿态扰动，并用左腕默认坐标轴表达。每个回合从标称重置姿态开始，前 **4 秒**跟踪旧目标，随后切换一次并观察 **1 秒**。臂躯硬终止用 **20 N**。该模式按套件用例数完成评估，`--max_steps`仍可设总控制步上限。正式对照使用同一套件、种子和环境数，并检查两次均以`status=episodes`结束。
+
+- `summary.json` 中先看 `switch_pair_evaluation.by_group.in_up`。`right_only_contact`、`left_only_contact`、`both_contact`、`neither_contact`统计两侧均可比较的目标对，碰撞窗口为切换后 0.2 秒。开始切换前失败、未到位、已接触或碰撞窗口观察不足的目标对保留为 `not_comparable`；未跑满两侧标为 `incomplete`。
+- 各组 `left` 和 `right` 给出切换前失败数、早期硬碰撞和 1 秒内到位的分子和分母。`by_pair`给出两侧的 `episode_id`，可与 `failures.jsonl` 的失败片段关联。原套件另存为 `switch_pairs.json`。
+- 回放沿用 `uv run python -m g1.rl failures view --run outputs/failures/v5_l1_switch_paired`。
 
 ## 查看内容
 
@@ -102,6 +151,7 @@ uv run python -m g1.rl failures view --run outputs/failures/planar_mean
 | `geometry.json` | 一次性导出的机器人可视网格、刚体名称与连接关系 |
 | `episodes.jsonl` | 每个已接收完成回合的类别、目标、时长和全部终止原因，包含成功回合 |
 | `failures.jsonl` | 失败索引、片段路径、阶段和逐对象接触统计 |
+| `switches.jsonl` | regular 或 mixed 采集时写出的逐次常规目标切换摘要 |
 | `clips/000000.npz` | 时间、刚体位姿、关节位置/速度、目标、原始动作、有效Lower命令、接触力/位置和原终止历史 |
 | `summary.json` | 进度/停止原因、完成数、失败数、按类别汇总的存活时长和失败频率 |
 

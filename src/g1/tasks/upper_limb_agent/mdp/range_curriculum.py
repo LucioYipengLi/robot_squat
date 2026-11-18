@@ -128,13 +128,14 @@ class RangeCurriculum:
         return self.planar_sampling.probability if self.planar_sampling is not None else self.base_planar_probability
 
     def _other_tasks_quality_ready(self):
-        """Protect enabled non-planar classes using this level's EMA and fresh sample counts."""
+        """Require enough samples, pose readiness and safe failure rates in non-planar classes."""
         if self.planar_sampling is None or self.checked_level != self.level:
             return False
         ready = (
             (self.window_counts[:2] >= self.cfg.min_episodes_per_class)
             & self.initialized[:2]
             & (self.ema[:2] >= self.planar_sampling.cfg.other_tasks_pose_ready_gate)
+            & (self.window_failure_per_10s[:2] <= self.cfg.failure_rate_limit)
         )
         return bool(ready[self.required[:2]].all())
 

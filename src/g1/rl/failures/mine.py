@@ -10,6 +10,22 @@ from uuid import uuid4
 from .storage import FailureArchive, write_json
 
 
+def configure_checkpoint(env_cfg, agent_cfg, checkpoint):
+    """Match the saved network and restore its command timing contract before loading."""
+    import torch
+
+    from isaaclab.utils.io import load_yaml
+
+    agent_path = checkpoint.parent / "params/agent.yaml"
+    if agent_path.is_file():
+        agent_cfg.from_dict(load_yaml(str(agent_path)))
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    course = (saved.get("infos") or {}).get("g1_upper_ranges") or {}
+    target = course.get("contract", {}).get("target") or {}
+    if "resampling_time_range" in target:
+        env_cfg.commands.wrist_pose.resampling_time_range = tuple(target["resampling_time_range"])
+
+
 def run_mining(args):
     import torch
 
@@ -26,7 +42,10 @@ def run_mining(args):
 
     from ..runner import create_task_runner
     from .geometry import contact_filters, export_geometry
+    from .paired_recording import FixedSwitchPairs
+    from .pairs import load_switch_pairs
     from .recording import FailureMiner, force_category, prepare_recording
+    from .switches import RegularSwitchTracker
 
     checkpoint = args.checkpoint.resolve(strict=True)
     directory = args.output or Path("outputs/failures") / (
@@ -34,6 +53,15 @@ def run_mining(args):
     )
     if directory.exists():
         raise FileExistsError(f"Choose a new output directory: {directory}")
+    suite = load_switch_pairs(args.switch_pairs) if args.switch_pairs is not None else None
+    level = args.level
+    episodes, max_failures, num_envs = args.episodes, args.max_failures, args.num_envs
+    if suite is not None:
+        if level is not None and level != suite["level"]:
+            raise ValueError("--level must match the switch-pair suite level")
+        level = suite["level"]
+        episodes = max_failures = 2 * len(suite["pairs"])
+        num_envs = min(num_envs, episodes)
     configure_logging(save_logs_to_file=False)
     configure_seed(args.seed)
     version = check_rsl_rl_version()
@@ -41,12 +69,13 @@ def run_mining(args):
         args.task, "rsl_rl_cfg_entry_point", play_mode=True, overrides=["physics=isaacsim_physx"]
     )
     num_levels = env_cfg.commands.wrist_pose.range_curriculum.num_levels
-    if args.level is not None and not 0 <= args.level < num_levels:
+    if level is not None and not 0 <= level < num_levels:
         raise ValueError(f"--level must be between 0 and {num_levels - 1}, got {args.level}")
+    configure_checkpoint(env_cfg, agent_cfg, checkpoint)
     env_cfg.seed = agent_cfg.seed = args.seed
     env_cfg.sim.device = agent_cfg.device = args.device
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, version)
-    prepare_recording(env_cfg, args.num_envs)
+    prepare_recording(env_cfg, num_envs)
     launch_args = {"headless": True, "visualizer": None, "device": args.device}
     with launch_simulation(env_cfg, launch_args):
         import isaaclab.sim as sim_utils
@@ -68,14 +97,29 @@ def run_mining(args):
             policy = runner.get_inference_policy(device=raw.device)
             term = raw.command_manager.get_term("wrist_pose")
             checkpoint_level = term.range_curriculum.level
-            if args.level is not None:
+            checkpoint_refresh_s = env_cfg.commands.wrist_pose.resampling_time_range
+            if args.regular_refresh_s is not None:
+                term.cfg.resampling_time_range = tuple(args.regular_refresh_s)
+                env_cfg.commands.wrist_pose.resampling_time_range = term.cfg.resampling_time_range
+            if level is not None:
                 # Override after checkpoint restoration, before reset assigns
                 # episode-owned target and Lower command ranges. Evaluation
                 # mode keeps both the course and sampling scheduler frozen.
-                term.range_curriculum.level = args.level
-            force_category(term, args.category)
+                term.range_curriculum.level = level
+            fixed_pairs = None
+            if suite is None:
+                force_category(term, args.category)
+            else:
+                if raw.termination_manager.get_term_cfg("base_contact").params["threshold"] != 20.0:
+                    raise ValueError("Fixed switch-pair evaluation requires the 20 N arm/torso termination threshold")
+                fixed_pairs = FixedSwitchPairs(term, suite)
+                term._teleop = fixed_pairs
             obs, _ = env.reset()
             policy.reset()
+            switch_tracker = None
+            if args.category in ("regular", "mixed"):
+                hard_threshold = raw.termination_manager.get_term_cfg("base_contact").params["threshold"]
+                switch_tracker = RegularSwitchTracker(raw, term, hard_threshold)
             print(
                 f"[failures] checkpoint_level={checkpoint_level} collection_level={term.range_curriculum.level} "
                 f"category={args.category} policy_output={args.policy_output}",
@@ -98,8 +142,18 @@ def run_mining(args):
                     "level": term.range_curriculum.level,
                     "checkpoint_level": checkpoint_level,
                     "requested_level": args.level,
+                    "checkpoint_regular_refresh_s": checkpoint_refresh_s,
+                    "regular_refresh_s": env_cfg.commands.wrist_pose.resampling_time_range if suite is None else None,
+                    "regular_switch_evaluation": switch_tracker.settings() if switch_tracker is not None else None,
+                    "switch_pair_evaluation": {
+                        "cases": [{"id": pair["id"], "group": pair["group"]} for pair in fixed_pairs.pairs],
+                        "switch_time_s": fixed_pairs.switch_step * raw.step_dt,
+                        "trial_duration_s": fixed_pairs.end_step * raw.step_dt,
+                    }
+                    if fixed_pairs is not None
+                    else None,
                     "history_s": args.history_s,
-                    "limits": {k: getattr(args, k) for k in ("episodes", "max_failures", "max_steps")},
+                    "limits": {"episodes": episodes, "max_failures": max_failures, "max_steps": args.max_steps},
                     "partners": partners,
                     "filter_paths": filters,
                     "body_names": body_names,
@@ -121,12 +175,21 @@ def run_mining(args):
                     },
                 },
             )
+            if suite is not None:
+                write_json(archive.directory / "switch_pairs.json", suite)
             robot_prim = sim_utils.get_current_stage().GetPrimAtPath("/World/envs/env_0/Robot")
             write_json(archive.directory / "geometry.json", export_geometry(robot_prim, body_names), indent=None)
             dump_yaml(str(archive.directory / "effective_env.yaml"), env_cfg)
             dump_yaml(str(archive.directory / "effective_agent.yaml"), agent_cfg)
             miner = FailureMiner(
-                raw, archive, partners, history_s=args.history_s, episodes=args.episodes, max_failures=args.max_failures
+                raw,
+                archive,
+                partners,
+                history_s=args.history_s,
+                episodes=episodes,
+                max_failures=max_failures,
+                switch_tracker=switch_tracker,
+                fixed_pairs=fixed_pairs,
             )
             raw.failure_miner = miner
             started = time.perf_counter()
@@ -143,25 +206,29 @@ def run_mining(args):
                         if step % 100 == 0 or miner.done:
                             archive.progress("mining", control_steps=steps)
                             print(
-                                f"[failures] steps={steps} episodes={archive.completed}/{args.episodes} "
-                                f"failures={archive.saved}/{args.max_failures}",
+                                f"[failures] steps={steps} episodes={archive.completed}/{episodes} "
+                                f"failures={archive.saved}/{max_failures}",
                                 flush=True,
                             )
                         if miner.done:
-                            status = "max_failures" if archive.saved >= args.max_failures else "episodes"
+                            status = (
+                                "max_failures" if fixed_pairs is None and archive.saved >= max_failures else "episodes"
+                            )
                             break
             except KeyboardInterrupt:
                 status = "interrupted"
             finally:
                 raw.failure_miner = None
+                ages = term.episode_age_steps()
+                unfinished = ages > 0 if fixed_pairs is None else (fixed_pairs.trial_ids >= 0) & (ages > 0)
                 archive.progress(
                     status,
                     control_steps=steps,
                     wall_seconds=time.perf_counter() - started,
                     sampled_robot_seconds=miner.elapsed_robot_s,
                     unrecorded_final_step_completions=miner.unrecorded_completions,
-                    unfinished_episodes=int((term.episode_age_steps() > 0).sum()),
-                    unfinished_robot_seconds=float(term.elapsed_seconds(slice(None)).sum()),
+                    unfinished_episodes=int(unfinished.sum()),
+                    unfinished_robot_seconds=float((ages * unfinished).sum()) * raw.step_dt,
                 )
             print(f"[failures] Saved {archive.saved} clips to {archive.directory.resolve()}")
             return 0

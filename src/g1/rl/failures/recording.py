@@ -9,6 +9,8 @@ from isaaclab.managers.recorder_manager import DatasetExportMode, RecorderManage
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
+from g1.tasks.upper_limb_agent.mdp.contacts import torso_force_samples
+
 from .storage import TensorHistory, contact_statistics
 
 CATEGORIES = ("regular", "height_shifted", "planar")
@@ -24,7 +26,7 @@ class FailureRecorderTerm(RecorderTerm):
     def reset(self, env_ids=None):
         miner = getattr(self._env, "failure_miner", None)
         if miner is not None:
-            miner.history.reset(slice(None) if env_ids is None else env_ids)
+            miner.reset(slice(None) if env_ids is None else env_ids)
         return {}
 
 
@@ -68,7 +70,9 @@ def force_category(term, category):
 
 
 class FailureMiner:
-    def __init__(self, env, archive, partners, *, history_s, episodes, max_failures):
+    def __init__(
+        self, env, archive, partners, *, history_s, episodes, max_failures, switch_tracker=None, fixed_pairs=None
+    ):
         self.env, self.archive, self.partners = env, archive, partners
         self.term = env.command_manager.get_term("wrist_pose")
         self.robot = env.scene["robot"]
@@ -82,12 +86,19 @@ class FailureMiner:
         self.substeps = env.cfg.decimation
         self.episodes, self.max_failures = episodes, max_failures
         self.history = TensorHistory(math.ceil(history_s / env.step_dt), env.num_envs)
+        self.switch_tracker = switch_tracker
+        self.fixed_pairs = fixed_pairs
         self.elapsed_robot_s = 0.0
         self.unrecorded_completions = 0
 
     @property
     def done(self):
         return self.archive.completed >= self.episodes or self.archive.saved >= self.max_failures
+
+    def reset(self, ids):
+        self.history.reset(ids)
+        if self.switch_tracker is not None:
+            self.switch_tracker.reset(ids)
 
     def capture(self):
         if self.done:
@@ -119,8 +130,14 @@ class FailureMiner:
             "contact_pos": data.contact_pos_w.torch[:, 0] - origin[:, None],
         }
         self.history.push(frame)
+        if self.switch_tracker is not None:
+            arm_force, _ = torso_force_samples(env, None)
+            self.switch_tracker.observe(goals, arm_force[:, : self.substeps].flip(1), env.reset_terminated)
         self.elapsed_robot_s += env.num_envs * env.step_dt
-        ids = torch.nonzero(env.reset_terminated | env.reset_time_outs).flatten().tolist()
+        ended = env.reset_terminated | env.reset_time_outs
+        if self.fixed_pairs is not None:
+            ended &= self.fixed_pairs.trial_ids >= 0
+        ids = ended.nonzero().flatten().tolist()
         accepted = 0
         for index in ids:
             if self.done:
@@ -149,6 +166,8 @@ class FailureMiner:
                 if int(term.episode_age_steps()[index]) >= int(term.evaluation_start_steps[index])
                 else "execution",
             }
+            if self.fixed_pairs is not None:
+                episode.update(self.fixed_pairs.metadata(index))
             trace = self.history.extract(index) if failed else None
             if trace is not None:
                 episode["contacts"] = contact_statistics(trace, self.partners, self.physics_dt)
@@ -156,6 +175,11 @@ class FailureMiner:
                     torch.as_tensor(trace["termination_force_history"][-1]).norm(dim=-1).max()
                 )
                 episode["clip_start_s"] = float(trace["time"][0])
-            self.archive.add_episode(episode, trace)
+            switches = (
+                self.switch_tracker.episode(index, episode["arm_mode"])
+                if self.switch_tracker is not None and episode["category"] == "regular"
+                else ()
+            )
+            self.archive.add_episode(episode, trace, switches=switches)
             accepted += 1
         self.unrecorded_completions += len(ids) - accepted

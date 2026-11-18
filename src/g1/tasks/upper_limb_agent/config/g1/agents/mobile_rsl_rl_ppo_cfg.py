@@ -8,3 +8,5 @@ from .rsl_rl_ppo_cfg import PPORunnerCfg
 @configclass
 class MobilePPORunnerCfg(PPORunnerCfg):
     experiment_name = "g1_upper_mobile"
+    # Opt in for a controlled training comparison against the same checkpoint.
+    mirror_augmentation: bool = False

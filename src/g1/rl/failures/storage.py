@@ -97,10 +97,21 @@ class FailureArchive:
         self.failed_classes, self.elapsed_classes = Counter(), Counter()
         self._episodes = (self.directory / "episodes.jsonl").open("w", encoding="utf-8", buffering=1)
         self._failures = (self.directory / "failures.jsonl").open("w", encoding="utf-8", buffering=1)
+        self._switches = self.switch_summary = None
+        self.pair_summary = None
+        if (paired := manifest.get("switch_pair_evaluation")) is not None:
+            from .pairs import PairedSwitchSummary
+
+            self.pair_summary = PairedSwitchSummary(paired["cases"])
+        if manifest.get("regular_switch_evaluation") is not None:
+            from .switches import SwitchSummary
+
+            self._switches = (self.directory / "switches.jsonl").open("w", encoding="utf-8", buffering=1)
+            self.switch_summary = SwitchSummary()
         write_json(self.directory / "run.json", self.manifest)
         self.progress("starting")
 
-    def add_episode(self, episode, trace=None):
+    def add_episode(self, episode, trace=None, *, switches=()):
         episode = {"episode_id": self.completed, **episode}
         if trace is not None:
             sample_id = f"{self.saved:06d}"
@@ -113,6 +124,15 @@ class FailureArchive:
             self._failures.write(json.dumps(plain(sample), ensure_ascii=False, allow_nan=False) + "\n")
             self.saved += 1
         self._episodes.write(json.dumps(plain(episode), ensure_ascii=False, allow_nan=False) + "\n")
+        if self._switches is not None and episode["category"] == "regular":
+            self._switches.writelines(
+                json.dumps(plain({"episode_id": self.completed, "level": episode["level"], **row}), allow_nan=False)
+                + "\n"
+                for row in switches
+            )
+            self.switch_summary.add_episode(switches, episode["failed"])
+        if self.pair_summary is not None:
+            self.pair_summary.add(episode, switches)
         self.completed += 1
         self.failed += int(episode["failed"])
         self.classes[episode["category"]] += 1
@@ -121,6 +141,10 @@ class FailureArchive:
         self.reasons.update(episode["reasons"])
 
     def progress(self, status, **extra):
+        if self.switch_summary is not None:
+            extra["regular_switches"] = self.switch_summary.report()
+        if self.pair_summary is not None:
+            extra["switch_pair_evaluation"] = self.pair_summary.report()
         write_json(
             self.directory / "summary.json",
             {
@@ -142,3 +166,5 @@ class FailureArchive:
     def close(self):
         self._episodes.close()
         self._failures.close()
+        if self._switches is not None:
+            self._switches.close()

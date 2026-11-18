@@ -28,6 +28,24 @@ uv run python -m g1.rl play --task Template-G1-Upper-Mobile-v0 --checkpoint "<23
 达到最终等级所需轮数由训练结果决定。首训示例沿用A1的seed=1217707953，
 先检查300／600／1300轮的贴边调用、跟踪和冲击，再决定后续预算。训练入口仍默认随机种子。
 
+## PPO 左右镜像增强
+
+`agent.mirror_augmentation=true` 在 Mobile 训练时接入 RSL-RL 数据增强，默认关闭。
+每个 PPO 小批次包含原样本和镜像样本。镜像交换左右腕目标、实际位姿、误差和活动掩码，按 G1 关节轴变换双臂、腰部及历史动作，并反射基座运动和 Lower 的侧向、转向指令。Actor 和 Critic 使用原有 109 维观测和 23 维动作，`mirror loss` 保持关闭。TensorBoard 的 `Loss/symmetry` 是镜像动作不一致程度的诊断值。
+
+从 v5 续训 1200 轮的示例。固定 Level 1 和平面基础采样比例，便于做同条件对照。
+
+```bash
+uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 \
+  --checkpoint logs/rsl_rl/g1_upper_mobile/2026-11-18_12-24-35/model_7999.pt \
+  --num_envs 4096 --seed 1217707953 --max_iterations 1200 --viz none physics=isaacsim_physx \
+  env.commands.wrist_pose.range_curriculum.advance=false \
+  env.commands.wrist_pose.range_curriculum.planar_sampling.enabled=false \
+  agent.mirror_augmentation=true agent.run_name=v5_mirror
+```
+
+对照组使用同一条命令，设 `agent.mirror_augmentation=false agent.run_name=v5_control`。两组完成后用同一份 [Level 1 左右目标对](UPPER_FAILURE_MINING.md#左右镜像切换短评估) 复测右手「向内 + 抬高」的 0.2 秒硬碰撞率和 1 秒到位率，同时核对左手和双手的表现。冻结 Lower 是学习策略，左右响应近似对称，镜像增强的实际收益以这组对照为准。
+
 ## 六维命令与物理语义
 
 网络原始动作依次为 `[vx, vy, yaw, height, pelvis_x, pelvis_y, upper_joints × 17]`。
@@ -279,13 +297,13 @@ RMS历史仅用于奖励与诊断，不改变动作／观测布局、Lower推理
 relative_improvement = (previous_failure - recent_failure) / max(previous_failure, failure_rate_limit, 1e-9)
 ```
 
-历史已满、最近一次平面窗口仍超过失败门槛、前后改善不足10%，并且其他启用任务的质量达标时，
-提高5个百分点。其他任务指常规和高度任务：二者在当前窗口的回合数均须达到
-`min_episodes_per_class`（默认512），且当前等级的位姿达标EMA均须不低于
-`other_tasks_pose_ready_gate`（默认0.85）。关闭的任务类别不参与该保护判断。
-20%→25%→30%，达到上限后继续统计。改善明显或其他任务质量／样本不足时保持当前比例。
-质量保护只暂停加码，仍照常收集有效平面历史；质量恢复后无需重新等待4个窗口。
-已经增加的比例不会因质量回落而自动降低。
+历史已满、最近一次平面窗口仍超过失败门槛、前后改善不足10%，并且其他启用任务达标时，
+提高5个百分点。常规和高度任务须各自满足三项条件：当前窗口回合数达到
+`min_episodes_per_class`（默认512），当前等级的位姿达标EMA不低于
+`other_tasks_pose_ready_gate`（默认0.85），当前窗口的`window_failure_per_10s`不高于
+课程的`failure_rate_limit`（默认每10机器人秒0.01次）。关闭的任务类别不参与该保护判断。
+20%→25%→30%，达到上限后继续统计。改善明显或其他任务任一条件未达标时保持当前比例，
+同时继续收集有效平面历史。其他任务恢复达标后可用已有历史判断是否加码。
 调整后的下一个窗口只暂停增加比例，照常更新滑动历史和范围课程；再下个检查点即可继续判断。
 历史不足或平面样本不足不加码，平面样本不足会打断连续历史。
 
@@ -326,7 +344,7 @@ relative_improvement = (previous_failure - recent_failure) / max(previous_failur
 | `relative_improvement` | 前后相对改善，低于0.10且最近窗口未达标时允许增加 |
 | `cooldown_remaining` | 之后还需暂停增加的窗口数 |
 | `level_adjustments` | 当前等级内已经增加比例的次数，晋级清零 |
-| `other_tasks_quality_ready` | 其他启用任务的当前窗口样本充分且EMA均≥0.85时为1；初始化或升级后、样本不足或质量未达标时为0 |
+| `other_tasks_quality_ready` | 常规和高度中启用的类别各自满足当前等级的样本量、位姿EMA和失败频率要求时为1，否则为0 |
 
 先同时查看概率、相对改善、`other_tasks_quality_ready`与现有平面`window_failure_per_10s`，
 再看level和其他两类表现。
