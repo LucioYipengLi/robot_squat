@@ -12,9 +12,13 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab_newton.sim.schemas import NewtonArticulationCfg
 from isaaclab_physx.sim.schemas import PhysxArticulationCfg, PhysxRigidBodyCfg
 
+from .collisions import spawn_g1_with_arm_collisions
+
 G1_29DOF_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
+        func=spawn_g1_with_arm_collisions,
         usd_path=str(f"{ISAAC_NUCLEUS_DIR}/Robots/Unitree/G1/g1.usd"),
+        variants={"Physics": "SimplifiedPhysX"},
         activate_contact_sensors=True,
         rigid_props=PhysxRigidBodyCfg(
             disable_gravity=False,

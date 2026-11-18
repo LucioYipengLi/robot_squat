@@ -160,7 +160,7 @@ def test_target_speed_rejects_invalid_soft_limits(limit):
         joint_target_speed_excess_l2(SimpleNamespace(), soft_limit=limit)
 
 
-@pytest.mark.parametrize("weight", [0.0, -1e-4])
+@pytest.mark.parametrize("weight", [0.0, -1e-4, -2e-3])
 def test_target_speed_reward_applies_weight_and_time_once_and_keeps_velocity_when_disabled(weight):
     action, _ = make_action()
     env = action._env
@@ -176,6 +176,33 @@ def test_target_speed_reward_applies_weight_and_time_once_and_keeps_velocity_whe
     torch.testing.assert_close(manager.compute(env.step_dt), expected)
     torch.testing.assert_close(action.joint_target_velocity, velocity)
     torch.testing.assert_close(manager.reset()["Episode_Reward/target_speed"], expected.mean() / 10)
+
+
+@pytest.mark.parametrize("move_steps,expected", [(1, -0.0352666667), (2, -0.0161333333), (6, -0.0036), (30, 0.0)])
+def test_shorter_same_displacement_costs_more_and_later_hold_keeps_the_penalty(move_steps, expected):
+    from g1.tasks.upper_limb_agent.config.g1.env_cfg import RewardsCfg
+
+    action, _ = make_action()
+    env = action._env
+    env.action_manager = SimpleNamespace(get_term=lambda name: action)
+    env.max_episode_length_s = 10.0
+    env.sim.is_playing = lambda: True
+    cfg = RewardsCfg().target_speed
+    manager = RewardManager({"target_speed": cfg}, env)
+    accumulated = torch.zeros(env.num_envs)
+    # Both selected joints move by 1 rad. Spread the same displacement over
+    # 1, 2, 6 or 30 control steps, then hold exactly the same final target.
+    for step in range(1, move_steps + 1):
+        action.process_actions(torch.full((3, 2), step / move_steps / action.cfg.scale))
+        accumulated += manager.compute(env.step_dt)
+    torch.testing.assert_close(accumulated, torch.full((3,), expected), atol=1e-7, rtol=1e-5)
+    for _ in range(60):
+        action.process_actions(torch.full((3, 2), 1.0 / action.cfg.scale))
+        torch.testing.assert_close(manager.compute(env.step_dt), torch.zeros(3), atol=1e-10, rtol=0)
+    # The scalar log divides by episode length; holding never refunds the
+    # dt-integrated spike cost that the learner received at movement time.
+    log = manager.reset()["Episode_Reward/target_speed"]
+    torch.testing.assert_close(log * env.max_episode_length_s, accumulated.mean(), atol=1e-7, rtol=1e-5)
 
 
 def run_period(action, samples):

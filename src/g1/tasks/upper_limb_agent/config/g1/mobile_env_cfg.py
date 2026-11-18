@@ -1,5 +1,7 @@
 """Free-base wrist tracking with six Lower commands and an episode-owned range curriculum."""
 
+import math
+
 from isaaclab.envs.mdp import illegal_contact
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -28,6 +30,12 @@ class MobileSceneCfg(UpperLimbAgentSceneCfg):
     robot = mobile_robot_cfg()
     robot.prim_path = "{ENV_REGEX_NS}/Robot"
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", update_period=1 / 120, history_length=3)
+    torso_contact_pairs = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+        update_period=1 / 120,
+        history_length=3,
+        filter_prim_paths_expr=[f"{{ENV_REGEX_NS}}/Robot/{path}" for path in mdp.ARM_CONTACT_BODY_PATHS],
+    )
 
 
 @configclass
@@ -85,10 +93,26 @@ class MobileCommandsCfg(CommandsCfg):
         ),
         planar_task=mdp.PlanarTaskCfg(
             probability=0.2,  # 三类评分/课程已接入；远场奖励完成前保持显式启用。
-            initial_half_extent_m=0.25,
+            initial_half_extent_m=0.10,
             half_extent_m=2.5,  # 作业站位相对初始盆骨的5 m × 5 m空间。
-            initial_bearing_rad=0.5235987755982988,  # ±30°，随回合等级扩到全方向。
-            bearing_rad=3.141592653589793,
+            initial_bearing_rad=math.radians(10),
+            bearing_rad=math.pi,
+            curriculum_knots=tuple(
+                (level / 10, extent, math.radians(bearing))
+                for level, extent, bearing in (
+                    (0, 0.10, 10),
+                    (1, 0.15, 15),
+                    (2, 0.20, 20),
+                    (3, 0.25, 30),
+                    (4, 0.40, 45),
+                    (5, 0.65, 65),
+                    (6, 1.00, 90),
+                    (7, 1.35, 115),
+                    (8, 1.75, 140),
+                    (9, 2.10, 160),
+                    (10, 2.50, 180),
+                )
+            ),
             max_goal_distance_m=5.0,  # 各活动腕目标相对初始盆骨的三维距离上限。
             timing=mdp.GoalTimingCfg(
                 linear_speed=0.4,
@@ -127,7 +151,8 @@ class MobileCommandsCfg(CommandsCfg):
                 history_windows=4,  # 当前每150轮检查一次：前300轮对比后300轮。
                 minimum_relative_improvement=0.10,
                 probability_step=0.05,
-                maximum_probability=0.40,
+                maximum_probability=0.30,
+                other_tasks_pose_ready_gate=0.85,  # 常规/高度任务EMA均达标且当前窗样本足够，才允许加码。
                 cooldown_windows=1,  # 加码后下一窗口只统计，随后恢复判断。
             ),
         ),
@@ -206,6 +231,16 @@ class MobileRewardsCfg(RewardsCfg):
     )
     # Failure affects Upper's return; the frozen Lower actor receives no optimizer updates.
     termination = RewTerm(func=mdp.is_terminated, weight=-10.0)
+    torso_contact = RewTerm(
+        func=mdp.TorsoContactPenalty,
+        weight=-2.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("torso_contact_pairs"),
+            "soft_threshold": 1.0,
+            "hard_threshold": 20.0,
+            "contact_cost": 0.25,
+        },
+    )
 
 
 @configclass
@@ -214,8 +249,8 @@ class MobileTerminationsCfg(TerminationsCfg):
     fallen = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 0.8})
     low_height = DoneTerm(func=mdp.root_height_below_minimum, params={"minimum_height": 0.25})
     base_contact = DoneTerm(
-        func=illegal_contact,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso_link"), "threshold": 1.0},
+        func=mdp.torso_contact_termination,
+        params={"sensor_cfg": SceneEntityCfg("torso_contact_pairs"), "threshold": 20.0, "other_threshold": 1.0},
     )
     knee_contact = DoneTerm(
         func=illegal_contact,

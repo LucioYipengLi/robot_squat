@@ -692,7 +692,7 @@ def quality_command(pose_command):
 def test_eight_mm_readiness_uses_all_active_wrists_with_and_without_quality(quality_command, with_quality):
     term = quality_command
     term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0)
-    assert term.cfg.workspace_quality.position_tolerance_m == 0.008
+    assert term.cfg.workspace_quality.position_tolerance_m == 0.05
     if not with_quality:
         term.cfg.workspace_quality = None
         term.workspace_quality_map = None
@@ -701,13 +701,13 @@ def test_eight_mm_readiness_uses_all_active_wrists_with_and_without_quality(qual
     term._update_metrics()
     torch.testing.assert_close(term._position_ready_sum, torch.tensor([1.0, 0.0, 0.0]))
     if with_quality:
-        torch.testing.assert_close(term._workspace_sums[:, 4], term._position_ready_sum)
+        torch.testing.assert_close(term._workspace_sums[:, 4], torch.ones(3))
     term.goal_pose_w[2, 1, 0] -= 0.001
     term._update_metrics()
     torch.testing.assert_close(term._position_ready_sum, torch.tensor([2.0, 0.0, 1.0]))
 
 
-def test_task_readiness_reuses_workspace_position_tolerance_and_joint_active_gate(quality_command):
+def test_task_readiness_keeps_eight_mm_precision_when_workspace_gate_is_looser(quality_command):
     term, env = quality_command, quality_command._env
     term.cfg.height_task = BimanualPoseCommandCfg.HeightTaskCfg(probability=0)
     term.cfg.workspace_quality.position_tolerance_m = 0.02
@@ -716,7 +716,8 @@ def test_task_readiness_reuses_workspace_position_tolerance_and_joint_active_gat
     env.reset_time_outs = torch.ones(3, dtype=torch.bool)
     term._update_metrics()
     logs = term._episode_metrics(torch.arange(3))
-    assert logs["task/regular/position_ready_fraction"] == logs["workspace_quality/position_ready_fraction"] == 1
+    assert logs["task/regular/position_ready_fraction"] == 0
+    assert logs["workspace_quality/position_ready_fraction"] == 1
 
 
 def test_workspace_reward_uses_fresh_world_goals_masks_idle_and_ignores_orientation(quality_command):
@@ -727,8 +728,8 @@ def test_workspace_reward_uses_fresh_world_goals_masks_idle_and_ignores_orientat
     term.goal_pose_w[1, 0, :3] += 100  # Idle left target has no influence.
     term.goal_pose_w[..., 3:] = torch.tensor([1.0, 0.0, 0.0, 0.0])
     torch.testing.assert_close(workspace_quality_bonus(term._env), original)
-    term.goal_pose_w[0, 0, 0] += 0.02
-    term.goal_pose_w[2, 1, 0] += 0.02
+    term.goal_pose_w[0, 0, 0] += 0.051
+    term.goal_pose_w[2, 1, 0] += 0.051
     result = workspace_quality_bonus(term._env)
     assert result[0] == result[2] == 0
     torch.testing.assert_close(result[1], original[1])

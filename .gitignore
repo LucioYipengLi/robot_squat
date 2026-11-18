@@ -12,6 +12,7 @@ logs/
 outputs/
 videos/
 wandb/
+reports/
 
 .vscode/settings.json
 .vscode/launch.json

@@ -23,6 +23,9 @@ def main():
     cfg.seed = 42
     cfg.episode_length_s = 0.12
     cfg.commands.wrist_pose.resampling_time_range = (100.0, 100.0)
+    cfg.rewards.workspace_quality.weight = 0.0  # This check explicitly exercises disabled -> enabled rewards.
+    if cfg.commands.wrist_pose.planar_task is not None:
+        cfg.commands.wrist_pose.planar_task.probability = 0.0
     with launch_simulation(cfg, {"headless": True, "device": "cuda:0", "visualizer": None}):
         import gymnasium as gym
 
@@ -57,7 +60,7 @@ def main():
                 term.mode_id[:] = torch.tensor([0, 1, 2, 2], device=env.device)
                 term.goal_pose_w.copy_(robot.data.body_link_pose_w.torch[:, term.body_indices])
                 term.goal_pose_w[0, 1, :3] += 100  # Idle target is excluded.
-                term.goal_pose_w[3, 1, 0] += 0.02
+                term.goal_pose_w[3, 1, 0] += 0.06
                 term.goal_pose_w[..., 3:] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device)
                 raw_state = [
                     robot.data.joint_pos.torch,
@@ -100,7 +103,7 @@ def main():
                     obs, _, terminated, truncated, info = env.step(
                         torch.zeros(4, env.action_manager.total_action_dim, device=env.device)
                     )
-                    assert obs["policy"].shape == (4, 107 if mobile else 93)
+                    assert obs["policy"].shape == (4, 109 if mobile else 93)
                     assert torch.isfinite(obs["policy"]).all()
                     if step == 5:
                         # Metrics remain active throughout the zero-weight stage.

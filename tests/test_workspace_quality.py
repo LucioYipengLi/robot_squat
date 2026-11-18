@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from g1.tasks.upper_limb_agent.mdp.workspace_quality import WorkspaceQualityMap
+from g1.tasks.upper_limb_agent.mdp.workspace_quality import WorkspaceQualityCfg, WorkspaceQualityMap
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
@@ -103,6 +103,17 @@ def test_score_uses_target_position_and_inactive_episode_has_zero_reward(tmp_pat
     assert (state.actual_scores < state.target_scores).all()
     active.zero_()
     assert not field.evaluate(targets, actual, torch.zeros(3, 2), active, 0.01).reward.any()
+
+
+def test_default_five_cm_gate_checks_each_active_wrist(tmp_path):
+    field = write_map(tmp_path / "map.npz")
+    tolerance = WorkspaceQualityCfg().position_tolerance_m
+    assert tolerance == 0.05
+    errors = torch.tensor([[0.049, 100], [100, 0.051], [0.049, 0.051]])
+    active = torch.tensor([[True, False], [False, True], [True, True]])
+    state = field.evaluate(bimanual_targets(), bimanual_targets(), errors, active, tolerance)
+    assert state.position_ready.tolist() == [True, False, False]
+    torch.testing.assert_close(state.reward, torch.tensor([0.4, 0, 0]))
 
 
 @pytest.mark.parametrize("tolerance", [0.0, -0.1, float("nan"), float("inf")])

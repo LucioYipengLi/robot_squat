@@ -41,7 +41,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="G1 training/playback/teleop and fixed-condition evaluation", add_help=False, allow_abbrev=False
     )
-    parser.add_argument("action", choices=("train", "play", "teleop", "eval"))
+    parser.add_argument("action", choices=("train", "play", "teleop", "eval", "failures"))
     parser.add_argument(
         "--task-family",
         choices=tuple(TASK_FAMILIES),
@@ -58,6 +58,12 @@ def main(argv=None):
     selected, remaining = parser.parse_known_args(arguments)
     if "--distributed" in remaining or int(os.environ.get("WORLD_SIZE", "1")) > 1:
         parser.error("Project entrypoints currently support single-process training only")
+    if selected.action == "failures":
+        if selected.curriculum_snapshot or selected.task_family not in (None, "upper_limb_agent"):
+            parser.error("failures supports Upper Mobile checkpoints without --curriculum-snapshot")
+        from .failures.cli import run
+
+        return run(remaining)
     if selected.action == "eval" and selected.task_family not in (None, "lower_limb_agent"):
         parser.error(f"{selected.action} currently supports only --task-family lower_limb_agent")
     if selected.action == "eval":

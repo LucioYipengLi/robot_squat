@@ -185,9 +185,9 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-v0 --viz 
 | `left_position` / `right_position` | 有效侧 `2/n × [0.6 (1 - tanh(e_p / 0.1 m)) + 0.4 exp(-e_p² / (0.01 m)²)]`，`n` 为有效手臂数 | 各 `1.0` |
 | `left_orientation` / `right_orientation` | 有效侧 `2/n × [0.6 G(e_q, 0.10) + 0.4 G(e_q, 0.015)]`，`e_q` 为单位误差四元数的虚部范数 | 各 `+0.3` |
 | `idle_arm_pose` | 闲置臂 7 个关节偏离默认角度的平方均值，单位 rad²；双手模式为 0 | `-1.0` |
-| `workspace_quality` | 所有活动腕部位置达标且目标受地图覆盖时，取目标相对骨盆的归一化 Q 均值 | `0.0`，默认只记录诊断 |
+| `workspace_quality` | 所有活动腕部位置误差≤5 cm且目标受地图覆盖时，取目标相对骨盆的归一化 Q 均值 | `1.2` |
 | `action_rate` | 原始策略动作的一阶差分平方和，使用 `action_rate_l2` | `-0.03` |
-| `target_speed` | 关节目标变化速度超过 2.5 rad/s 的归一化平方代价 | `0.0`，默认关闭 |
+| `target_speed` | 关节目标变化速度超过 2.5 rad/s 的归一化平方代价 | `−0.002`，默认启用；[权重推导](UPPER_TARGET_SPEED.md) |
 | `joint_vel` | 17 个受控关节的实际速度平方和，使用 `joint_vel_l2` | `-1e-4` |
 | `joint_acc` | 17 个受控关节的加速度平方和，对全部物理子步取均值 | `-1e-7` |
 | `end_effector_acc` | 双腕 link 原点在骨盆坐标系中的相对线加速度平方和，对全部物理子步取均值 | `-1e-5` |
@@ -195,7 +195,7 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-v0 --viz 
 | `torque_limits` | 17 个受控关节超过各自物理力矩上限 80% 的力矩绝对值超出量之和 | `-1e-3` |
 | `joint_limits` | 惩罚受控关节超出软位置限制 | `-1.0` |
 
-空间 Q 使用左臂 0 kg、5 cm 网格，右臂镜像查询；默认位置阈值为 8 mm。
+空间 Q 使用左臂 0 kg、5 cm 网格，右臂镜像查询；Q奖励的位置启用阈值为5 cm。
 数据定义、五项诊断和启用方式见 [空间 Q 奖励说明](WORKSPACE_QUALITY.md)。
 
 `action_rate` 惩罚 `sum((a_t - a_{t-1})²)`，不除以控制步长；当前动作只有 17 个受控关节，因此覆盖范围与动作一致。
@@ -243,8 +243,8 @@ position = (1 - fine_weight) × coarse + fine_weight × fine
 参数在左右位置项中显式配置；支持 `0 < sigma_fine <= std < inf`、`fine_weight ∈ [0,1]`。
 沿用 `Episode_Reward/left_position`、`right_position`，粗细项在函数内部混合。
 
-纯位置达标指标 `position_ready_fraction` 采用8 mm阈值，与Q门控共用
-`commands.wrist_pose.workspace_quality.position_tolerance_m`；关闭Q诊断时仍使用默认8 mm。
+任务纯位置达标指标 `position_ready_fraction` 采用8 mm阈值，独立于Q门控的
+`commands.wrist_pose.workspace_quality.position_tolerance_m`（5 cm）。Q自身的同名诊断表示其启用比例。
 它衡量所有活动手同时达标的时间比例，不包含朝向要求。课程联合位姿门槛仍是15 mm／0.10 rad。
 位置奖励没有8 mm死区，达到指标阈值后仍会提供继续减小误差的收益。
 

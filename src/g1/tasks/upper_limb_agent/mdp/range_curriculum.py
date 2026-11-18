@@ -127,6 +127,17 @@ class RangeCurriculum:
     def planar_probability(self):
         return self.planar_sampling.probability if self.planar_sampling is not None else self.base_planar_probability
 
+    def _other_tasks_quality_ready(self):
+        """Protect enabled non-planar classes using this level's EMA and fresh sample counts."""
+        if self.planar_sampling is None or self.checked_level != self.level:
+            return False
+        ready = (
+            (self.window_counts[:2] >= self.cfg.min_episodes_per_class)
+            & self.initialized[:2]
+            & (self.ema[:2] >= self.planar_sampling.cfg.other_tasks_pose_ready_gate)
+        )
+        return bool(ready[self.required[:2]].all())
+
     def begin(self, ids):
         self.episode_levels[ids] = self.level
         p = self.level / (self.cfg.num_levels - 1)
@@ -217,7 +228,11 @@ class RangeCurriculum:
             if self.planar_sampling is not None:
                 self.planar_sampling.reset()
         elif sampling_window is not None:
-            self.planar_sampling.observe(*sampling_window, self.cfg.failure_rate_limit)
+            self.planar_sampling.observe(
+                *sampling_window,
+                self.cfg.failure_rate_limit,
+                other_tasks_quality_ready=self._other_tasks_quality_ready(),
+            )
 
     def logs(self):
         result = {
@@ -250,6 +265,7 @@ class RangeCurriculum:
         logs = {f"Curriculum/upper_ranges/{k}": v for k, v in result.items()}
         if self.planar_sampling is not None:
             logs.update(self.planar_sampling.logs(self.cfg.failure_rate_limit))
+            logs["Curriculum/upper_sampling/other_tasks_quality_ready"] = float(self._other_tasks_quality_ready())
         return logs
 
     def contract(self):

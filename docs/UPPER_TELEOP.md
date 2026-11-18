@@ -20,6 +20,27 @@ Isaac Sim物理运行时仍会启动，Kit图形窗口不参与遥操作。
 选用`--video`时复用现有录像流程。Upper首版使用键盘，原下肢Kit／手柄teleop继续按
 [下肢说明](TELEOP.md)使用。
 
+## 手臂碰撞模型
+
+Upper固定基座与Mobile任务在训练、play和teleop中使用同一修复：保留G1的
+`Physics=SimplifiedPhysX`，恢复左右肩部三个link、肘部、`wrist_roll`与`wrist_pitch`
+共12个原本被停用的碰撞子树。标准资产的有效碰撞体由31个增至43个；下肢保留原简化碰撞几何，
+Lower任务本身的资产配置保持原样。自碰撞开关继续启用。
+
+恢复发生在机器人生成后、接触报告注册与环境复制之前，因此并行训练的每个环境均生效。
+USD spawner、`pxr`及复制装饰器在生成机器人时才加载；启动前解析配置不会提前导入USD运行库，
+由`SimulationApp`先初始化Kit的USD环境。
+原始USD和缓存文件不被改写；缺少预期碰撞节点或有效碰撞体时会报告资产错误。
+实现见[`utils/collisions.py`](../src/g1/tasks/upper_limb_agent/config/g1/utils/collisions.py)。
+
+更新代码后，请退出并重新启动现有teleop进程，以加载恢复后的碰撞几何。
+旧checkpoint保持动作与观测接口兼容；已有策略可能使用过穿模路径，恢复碰撞后的成功率需重新评估，
+必要时在新碰撞条件下微调。`base_contact`仍表示`torso_link`的接触终止，该刚体包含躯干与头部碰撞体。
+
+CPU/USD回归位于`tests/test_upper_arm_collisions.py`，覆盖实例化几何恢复、环境复制、接触报告、
+资产错误和固定基座／Mobile／teleop配置。设置`G1_COLLISION_ASSET_PATH`为已解析的本地G1 USD路径，
+可另外运行真实资产的31→43碰撞体核验。真实PhysX／Newton GL回放沿用下文的显式GPU测试。
+
 ## Newton面板
 
 展开左侧Simulation中的 **Upper wrist teleop**。默认手动双手模式，初始目标为重置后的实际腕部位姿。
@@ -93,6 +114,9 @@ WASD/QE、方向键保留给Newton相机，Space继续暂停，Escape关闭窗�
 手动模式持续保持目标，取消超时，倾倒、低高度、躯干与膝接触等物理终止继续生效。
 
 ## 诊断与记录
+
+需要批量寻找失败目标时，使用[无窗口失败挖掘与本地三维回放](UPPER_FAILURE_MINING.md)。
+该模式并行推理并保存重置前的动作与接触片段，之后通过浏览器时间轴查看，无需重新随机复现。
 
 面板显示当前回合、课程等级、实际任务类别、执行／评价阶段、剩余时间，以及有效腕的位置和最短角误差。
 Mobile另显示实际送给冻结Lower的`h/vx/vy/wz/px/py`，单位依次为m、m/s、m/s、rad/s、m、m。

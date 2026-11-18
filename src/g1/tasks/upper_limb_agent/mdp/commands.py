@@ -29,7 +29,7 @@ from isaaclab.utils.math import (
 from .actions import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
 from .episode_metrics import PoseWindowMetrics, failure_per_10s, simultaneous_pose_ready
 from .goal_timing import budget_steps
-from .planar_targets import PlanarTaskCfg, sample_station
+from .planar_targets import PlanarTaskCfg, sample_station, station_limits
 from .pose_override import PoseOverride, validate_pose
 from .range_curriculum import RangeCurriculum, RangeCurriculumCfg
 from .workspace_quality import (
@@ -133,6 +133,13 @@ class BimanualPoseCommand(CommandTerm):
                 "resampling_time_range": cfg.resampling_time_range,
                 "distance_reference_speed": cfg.distance_reference_speed,
             }
+            base_contact = getattr(getattr(env.cfg, "terminations", None), "base_contact", None)
+            if base_contact is not None and base_contact.func.__name__ == "torso_contact_termination":
+                self.range_curriculum.target_contract["torso_contact"] = {
+                    "self_force_measure": "sum_filtered_arm_normal_force_magnitudes",
+                    "threshold_n": base_contact.params["threshold"],
+                    "other_threshold_n": base_contact.params["other_threshold"],
+                }
         if self.planar_enabled:
             self._validate_planar_environment()
             if self.range_curriculum is not None:
@@ -282,10 +289,9 @@ class BimanualPoseCommand(CommandTerm):
             forward, yaw = bounds[0, 1], bounds[2].abs().amin()
             if forward <= 0 or yaw <= 0:
                 raise ValueError("planar_task requires positive forward and bidirectional yaw limits at every level")
-            extent = cfg.initial_half_extent_m + progress * (cfg.half_extent_m - cfg.initial_half_extent_m)
-            angle = cfg.initial_bearing_rad + progress * (cfg.bearing_rad - cfg.initial_bearing_rad)
+            extent, angle = station_limits(progress, cfg)
             _, deadline = budget_steps(
-                torch.tensor(math.sqrt(2) * extent), torch.tensor(angle), forward, yaw, cfg.timing, dt
+                torch.as_tensor(math.sqrt(2) * extent), torch.as_tensor(angle), forward, yaw, cfg.timing, dt
             )
             required = max(required, int(deadline))
         if hard_steps < required:
@@ -330,12 +336,7 @@ class BimanualPoseCommand(CommandTerm):
         ready = simultaneous_pose_ready(
             position, orientation, active, cfg.position_tolerance_m, cfg.orientation_tolerance_rad
         )
-        tolerance = (
-            self.cfg.workspace_quality.position_tolerance_m
-            if self.cfg.workspace_quality is not None
-            else DEFAULT_POSITION_TOLERANCE_M
-        )
-        position_ready = ((position <= tolerance) | ~active).all(-1) & active.any(-1)
+        position_ready = ((position <= DEFAULT_POSITION_TOLERANCE_M) | ~active).all(-1) & active.any(-1)
         valid = self.evaluation_window_mask()[ids] & ~self._env.reset_terminated[ids]
         self._pose_window.record(
             ids, self._env.common_step_counter, valid, position, orientation, active, ready, position_ready
@@ -727,13 +728,8 @@ class BimanualPoseCommand(CommandTerm):
                 * valid[:, None]
             )
         if self.cfg.height_task is not None or self.range_curriculum is not None or self.planar_enabled:
-            # Reuse Q's readiness gate when enabled. Without Q diagnostics the
-            # same all-active-wrist criterion uses the default 8 mm tolerance.
-            ready = (
-                state.position_ready
-                if self._workspace_sums is not None
-                else ((position <= DEFAULT_POSITION_TOLERANCE_M) | ~active).all(dim=-1)
-            )
+            # Tracking precision remains 8 mm even when the Q reward gate is looser.
+            ready = ((position <= DEFAULT_POSITION_TOLERANCE_M) | ~active).all(dim=-1) & active.any(-1)
             self._position_ready_sum += ready * valid
 
     def _episode_metrics(self, env_ids):

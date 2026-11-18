@@ -88,6 +88,18 @@ def test_position_readiness_is_recorded_when_height_task_is_disabled():
     torch.testing.assert_close(term._position_ready_sum, torch.ones(3))
 
 
+def test_planar_precision_window_keeps_eight_mm_gate_independent_of_q_reward_gate():
+    from g1.tasks.upper_limb_agent.mdp.workspace_quality import WorkspaceQualityCfg
+
+    term = scoring_command()
+    term.cfg.workspace_quality = WorkspaceQualityCfg(position_tolerance_m=.05)
+    term.pose_error = lambda: (torch.full((3, 2), .01), torch.full((3, 2), .01))
+    term._env.common_step_counter = 2
+    term.collect_window_metrics()
+    assert not term._pose_window.sums[:, 1].any()
+    torch.testing.assert_close(term._pose_window.sums[:, 0], torch.ones(3))
+
+
 def test_failure_frequency_counts_real_robot_seconds_not_number_of_episodes():
     result = failure_per_10s(torch.tensor([1, 3, 6]), torch.tensor([1000.0, 3000.0, 3000.0]))
     torch.testing.assert_close(result, torch.tensor([0.01, 0.01, 0.02]))

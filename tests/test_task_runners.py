@@ -102,10 +102,10 @@ def test_upper_g1_resolves_its_own_configs():
     assert env_cfg.actions.joint_pos.class_type.__name__ == "UpperJointPositionAction"
     assert env_cfg.rewards.joint_acc.func.__name__ == "joint_acc_l2_substeps"
     assert env_cfg.rewards.joint_acc.params == {"action_name": "joint_pos"}
-    assert env_cfg.rewards.target_speed.weight == 0.0
-    assert env_cfg.rewards.workspace_quality.weight == 0.0
+    assert env_cfg.rewards.target_speed.weight == -2.0e-3
+    assert env_cfg.rewards.workspace_quality.weight == 0.2
     assert env_cfg.rewards.workspace_quality.func.__name__ == "workspace_quality_bonus"
-    assert env_cfg.commands.wrist_pose.workspace_quality.position_tolerance_m == 0.008
+    assert env_cfg.commands.wrist_pose.workspace_quality.position_tolerance_m == 0.05
     assert env_cfg.commands.wrist_pose.height_task is None
     assert env_cfg.rewards.target_speed.func.__name__ == "joint_target_speed_excess_l2"
     assert env_cfg.rewards.target_speed.params == {"action_name": "joint_pos", "soft_limit": 2.5}
@@ -176,7 +176,7 @@ def test_mobile_upper_owns_velocity_commands_and_upper_actions_and_uses_latest_l
     assert env.rewards.end_effector_acc.params == {"action_name": "joint_pos"}
     assert env.actions.joint_pos.acceleration_reference_body_name == env.commands.wrist_pose.reference_body_name
     assert env.actions.joint_pos.acceleration_body_names == env.commands.wrist_pose.body_names
-    assert env.rewards.target_speed.weight == 0.0
+    assert env.rewards.target_speed.weight == -2.0e-3
     assert env.rewards.target_speed.params == {"action_name": "joint_pos", "soft_limit": 2.5}
     assert len(env.actions.joint_pos.joint_names) == 17
     assert not env.scene.robot.spawn.fix_root_link

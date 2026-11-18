@@ -33,6 +33,15 @@ def poll(self, dt):
     c, term = self.controller, playback.term
     n = len(checks)
     if n == 0:
+        import isaaclab.sim as sim_utils
+
+        from g1.tasks.upper_limb_agent.config.g1.utils.collisions import ARM_COLLISION_LINK_NAMES
+
+        stage = sim_utils.get_current_stage()
+        for name in ARM_COLLISION_LINK_NAMES:
+            collision = stage.GetPrimAtPath(f"/World/envs/env_0/Robot/{name}/collisions")
+            assert collision and collision.IsActive()
+        saved["arm_collisions_active"] = True
         saved["actor"] = {k: v.detach().cpu().clone() for k, v in playback.policy.state_dict().items()}
         saved["contract"] = term.range_curriculum.contract()
         saved["level"] = term.range_curriculum.level
@@ -137,6 +146,7 @@ def verify():
                 "checks": len(checks),
                 "level": saved["level"],
                 "actor_unchanged": True,
+                "arm_collisions_active": saved["arm_collisions_active"],
                 "contract_unchanged": True,
                 "input_closed": True,
                 "native_key": True,

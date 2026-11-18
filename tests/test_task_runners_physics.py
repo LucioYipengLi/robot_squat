@@ -71,6 +71,7 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family, planar)
         # Exercise the coupled geometry even with only four physical environments.
         common.append("env.commands.wrist_pose.mode_probabilities=[0,0,1]")
         common.append("env.rewards.target_speed.weight=-1e-4")
+        common.append("env.rewards.workspace_quality.weight=0.0")
     if task == "Template-G1-Upper-Mobile-v0":
         # Guarantee coverage of episode-held targets even with only four envs.
         common.append("env.commands.wrist_pose.height_task.probability=1.0")
@@ -82,6 +83,7 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family, planar)
             [
                 "env.episode_length_s=35",
                 "env.commands.wrist_pose.planar_task.probability=1.0",
+                "env.commands.wrist_pose.planar_task.curriculum_knots=null",
                 "env.commands.wrist_pose.range_curriculum.advance=true",
                 "env.commands.wrist_pose.planar_task.initial_half_extent_m=0.000001",
                 "env.commands.wrist_pose.planar_task.half_extent_m=0.000001",
@@ -159,7 +161,7 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family, planar)
             assert all(math.isfinite(row.value) and 0 <= row.value <= 1.000001 for row in events.Scalars(tag))
         assert all(row.value == 0 for row in events.Scalars("Episode_Reward/workspace_quality"))
         workspace = infos["g1_workspace_quality"]
-        assert workspace["position_tolerance_m"] == 0.008
+        assert workspace["position_tolerance_m"] == 0.05
         assert (checkpoint.parent / workspace["artifact"]).is_file()
         if task == "Template-G1-Upper-Mobile-v0":
             prefix = "Metrics/wrist_pose/task/height_shifted/"

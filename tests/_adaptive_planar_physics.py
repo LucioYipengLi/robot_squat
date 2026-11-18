@@ -48,8 +48,10 @@ with launch_simulation(env_cfg, args):
         ids = torch.arange(64, device=raw.device)
         course.begin(ids)
         categories = torch.full((64,), 2, device=raw.device)
+        categories[:16] = 0
+        categories[16:32] = 1
         failed = torch.zeros(64, dtype=torch.bool, device=raw.device)
-        failed[:3] = True
+        failed[-3:] = True
         for index in range(1, 5):
             course.complete(
                 ids,
@@ -61,6 +63,7 @@ with launch_simulation(env_cfg, args):
             )
         course.clock_offset = course.last_check - raw.common_step_counter
         assert course.planar_probability == 0.25 and course.planar_sampling.cooldown == 1
+        assert course.logs()["Curriculum/upper_sampling/other_tasks_quality_ready"] == 1
         torch.cuda.manual_seed(781)
         expected = torch.rand(64, device=raw.device) < 0.25
         torch.cuda.manual_seed(781)

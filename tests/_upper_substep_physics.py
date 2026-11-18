@@ -57,6 +57,9 @@ def main():
     cfg.scene.num_envs = 4
     cfg.seed = 42
     cfg.episode_length_s = 0.12
+    # Explicitly exercise both disabled and enabled rewards independently of
+    # the training default, which now enables target_speed.
+    cfg.rewards.target_speed.weight = 0.0
     with launch_simulation(cfg, {"headless": True, "device": "cuda:0", "visualizer": None}):
         import gymnasium as gym
 

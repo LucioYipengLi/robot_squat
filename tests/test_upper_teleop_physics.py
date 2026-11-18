@@ -28,5 +28,6 @@ def test_upper_teleop_native_panel_and_command_lifecycle(tmp_path):
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert summary["checks"] == 65 and summary["actor_unchanged"] and summary["input_closed"]
     assert summary["native_key"] and summary["window_closed"]
+    assert summary["arm_collisions_active"]
     rows = [json.loads(line) for line in (tmp_path / "session/session.jsonl").read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["event"] == "closed"

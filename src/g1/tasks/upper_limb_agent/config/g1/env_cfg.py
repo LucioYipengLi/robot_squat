@@ -92,7 +92,7 @@ class CommandsCfg:
         distance_reference_speed=0.08,  # m/s，仅用于计算目标保持时间。
         workspace_quality=mdp.WorkspaceQualityCfg(
             map_path="data/workspace_q0_v1.npz",  # 相对 upper_limb_agent 包目录；也接受绝对路径。
-            position_tolerance_m=0.008,  # 8 mm纯位置达标指标与Q门控；课程使用独立容差。
+            position_tolerance_m=0.05,  # 5 cm启用Q；纯位置指标仍用8 mm，课程使用独立容差。
         ),
         # 单手模式：位置沿默认骨盆轴偏移（m），姿态在该腕默认朝向上扰动（rad）。
         left_offsets=mdp.BimanualPoseCommandCfg.Ranges(
@@ -243,19 +243,20 @@ class RewardsCfg:
         params={"command_name": "wrist_pose"},
     )
 
-    # 目标骨盆相对位置的 0 kg 空间 Q；默认只记录指标，正权重启用奖励。
+    # 目标骨盆相对位置的 0 kg 空间 Q；所有活动腕在5 cm内时启用。
     workspace_quality = RewTerm(
         func=mdp.workspace_quality_bonus,
-        weight=0.0,
+        weight=0.2,
         params={"command_name": "wrist_pose"},
     )
 
     # 动作与实际关节运动平滑
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.03)
-    # Soft penalty on processed-goal speed; enable with a negative weight for a separate experiment.
+    # 60 Hz、scale=0.5时，大幅指令跳变的额外代价约为action_rate的9.6倍。
+    # 仅惩罚超过2.5 rad/s的部分；权重推导见docs/UPPER_TARGET_SPEED.md。
     target_speed = RewTerm(
         func=mdp.joint_target_speed_excess_l2,
-        weight=0.0,
+        weight=-5.0e-3,
         params={"action_name": "joint_pos", "soft_limit": 2.5},  # rad/s; does not limit execution
     )
     joint_vel = RewTerm(

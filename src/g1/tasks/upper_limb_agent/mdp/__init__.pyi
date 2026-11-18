@@ -8,6 +8,7 @@ from .actions import (
 )
 from .adaptive_sampling import AdaptivePlanarSamplingCfg as AdaptivePlanarSamplingCfg
 from .commands import BimanualPoseCommand, BimanualPoseCommandCfg
+from .contacts import ARM_CONTACT_BODY_PATHS, TorsoContactPenalty, torso_contact_termination
 from .events import reset_mobile_root, reset_robot_joints
 from .frozen_lower_actions import (
     FrozenLowerAction,

@@ -9,10 +9,14 @@ from test_upper_limb_task import pose_command as _pose_command
 
 from isaaclab.utils.math import quat_apply_inverse, quat_error_magnitude, quat_from_euler_xyz, quat_mul
 
-from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileActionsCfg, MobileCommandsCfg
+from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import (
+    MobileActionsCfg,
+    MobileCommandsCfg,
+    MobileTerminationsCfg,
+)
 from g1.tasks.upper_limb_agent.mdp.commands import BimanualPoseCommand, BimanualPoseCommandCfg
 from g1.tasks.upper_limb_agent.mdp.goal_timing import GoalTimingCfg, budget_steps, rest_to_rest_time
-from g1.tasks.upper_limb_agent.mdp.planar_targets import PlanarTaskCfg, sample_station
+from g1.tasks.upper_limb_agent.mdp.planar_targets import PlanarTaskCfg, sample_station, station_limits
 from g1.tasks.upper_limb_agent.mdp.range_curriculum import RangeCurriculumCfg
 from g1.tasks.upper_limb_agent.mdp.terminations import task_time_out
 
@@ -76,6 +80,65 @@ def test_station_sampler_covers_bearing_sector_inside_square_and_radius(progress
     assert angle.min() < -bearing * 0.98 and angle.max() > bearing * 0.98
     assert shift[:, 0].max() > half * 0.95
     assert torch.isfinite(shift).all()
+
+
+@pytest.mark.parametrize("level", range(11))
+def test_mobile_planar_schedule_matches_knots_bounds_and_episode_budget(level):
+    cfg = MobileCommandsCfg().wrist_pose.planar_task
+    cfg.validate_parameters()
+    extent, angle = station_limits(level / 10, cfg)
+    assert float(extent) == pytest.approx(cfg.curriculum_knots[level][1])
+    assert float(angle) == pytest.approx(cfg.curriculum_knots[level][2])
+    p = torch.full((1024,), level / 10)
+    shift, heading = sample_station(p, torch.full_like(p, 0.4), cfg)
+    assert (shift.abs() <= extent + 1e-6).all()
+    assert (heading.abs() <= angle + 1e-6).all()
+    term = make_command(level=level, configure=lambda c, env: setattr(c, "planar_task", cfg))
+    assert (term.episode_deadline_steps <= 35 * 60).all()
+    assert ((term.episode_deadline_steps - term.evaluation_start_steps) == 600).all()
+
+
+def test_mobile_planar_schedule_interpolates_monotonically_and_checkpoint_records_it():
+    cfg = MobileCommandsCfg().wrist_pose.planar_task
+    extent, angle = station_limits(torch.linspace(0, 1, 101), cfg)
+    assert (extent.diff() >= 0).all() and (angle.diff() >= 0).all()
+    middle_extent, middle_angle = station_limits(0.15, cfg)
+    assert float(middle_extent) == pytest.approx(0.175)
+    assert float(middle_angle) == pytest.approx(math.radians(17.5))
+    assert float(extent[0]) == pytest.approx(0.1) and float(extent[-1]) == pytest.approx(2.5)
+    term = make_command(configure=lambda c, env: setattr(c, "planar_task", cfg))
+    saved = term.range_curriculum.state_dict(100)
+    assert saved["contract"]["target"]["planar_task"]["curriculum_knots"] is not None
+    with pytest.raises(ValueError, match="reset_on_load"):
+        make_command().range_curriculum.load_state_dict(saved, 0)
+
+
+def test_contact_threshold_change_rejects_old_curriculum_failure_statistics():
+    def configure(cfg, env):
+        env.cfg.terminations = MobileTerminationsCfg()
+
+    term = make_command(configure=configure)
+    saved = term.range_curriculum.state_dict(100)
+    assert saved["contract"]["target"]["torso_contact"]["threshold_n"] == 20
+    other = make_command(configure=configure)
+    other.range_curriculum.target_contract["torso_contact"]["threshold_n"] = 10
+    with pytest.raises(ValueError, match="reset_on_load"):
+        other.range_curriculum.load_state_dict(saved, 0)
+
+
+@pytest.mark.parametrize(
+    "knots",
+    [
+        ((0, 0.1, 0),),
+        ((0, 0.1, 0), (1, 2.5, math.pi)),  # First knot disagrees with the configured initial limits.
+        ((0, 0.25, math.pi / 6), (0.5, 2, 1), (0.4, 2, 2), (1, 2.5, math.pi)),
+        ((0, 0.25, math.pi / 6), (0.5, 0.1, 1), (1, 2.5, math.pi)),
+        ((0, 0.25, math.pi / 6), (1, 2.5, float("nan"))),
+    ],
+)
+def test_invalid_planar_schedule_is_rejected(knots):
+    with pytest.raises(ValueError, match="curriculum_knots"):
+        PlanarTaskCfg(curriculum_knots=knots).validate_parameters()
 
 
 @pytest.mark.parametrize("level", [0, 5, 10])

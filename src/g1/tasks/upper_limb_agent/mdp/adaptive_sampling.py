@@ -14,7 +14,8 @@ class AdaptivePlanarSamplingCfg:
     history_windows: int = 4  # 4 * 3600 control steps / 24 rollout steps = 600 PPO iterations.
     minimum_relative_improvement: float = 0.10
     probability_step: float = 0.05
-    maximum_probability: float = 0.40
+    maximum_probability: float = 0.30
+    other_tasks_pose_ready_gate: float = 0.85
     cooldown_windows: int = 1
 
 
@@ -30,6 +31,8 @@ class AdaptivePlanarSampling:
             raise ValueError("Sampling probability_step must be in (0,1]")
         if not math.isfinite(cfg.maximum_probability) or not 0 < base_probability <= cfg.maximum_probability < 1:
             raise ValueError("Sampling maximum_probability must contain the base probability and remain below 1")
+        if not math.isfinite(cfg.other_tasks_pose_ready_gate) or not 0 <= cfg.other_tasks_pose_ready_gate <= 1:
+            raise ValueError("Sampling other_tasks_pose_ready_gate must be finite and in [0, 1]")
         self.cfg, self.base_probability = cfg, base_probability
         self.reset()
 
@@ -50,7 +53,7 @@ class AdaptivePlanarSampling:
         improvement = (rates[0] - rates[1]) / max(rates[0], failure_limit, 1e-9)
         return *rates, improvement
 
-    def observe(self, failures, elapsed_s, eligible, failure_limit):
+    def observe(self, failures, elapsed_s, eligible, failure_limit, *, other_tasks_quality_ready: bool):
         # Cooldown consumes a check, not its samples. Keep collecting the sliding
         # history so the following check can react without another warm-up.
         cooling = self.cooldown > 0
@@ -61,7 +64,8 @@ class AdaptivePlanarSampling:
         self.history.append((failures, elapsed_s))
         self.history = self.history[-self.cfg.history_windows :]
         trend = self.trend(failure_limit)
-        if cooling or trend is None or 10 * failures / elapsed_s <= failure_limit:
+        # Keep the failure history while other tasks recover; only pause increases.
+        if cooling or not other_tasks_quality_ready or trend is None or 10 * failures / elapsed_s <= failure_limit:
             return
         if trend[2] < self.cfg.minimum_relative_improvement and self.probability < self.cfg.maximum_probability:
             self.probability = min(
