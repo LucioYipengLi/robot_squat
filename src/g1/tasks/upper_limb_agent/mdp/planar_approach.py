@@ -39,11 +39,18 @@ class PlanarApproachCfg:
     arm_posture_deadband_rad: float = 0.15
     arm_posture_scale_rad: float = 0.50
     arm_posture_max_cost: float = 2.0
+    wrist_posture_weight: float = 0.0
+    wrist_posture_deadband_rad: float = 0.15
+    wrist_posture_scale_rad: float = 0.50
+    wrist_posture_max_cost: float = 2.0
     waist_posture_weight: float = 0.0
     waist_posture_deadband_rad: float = 0.15
     waist_posture_scale_rad: float = 0.50
     waist_posture_max_cost: float = 2.0
     waist_posture_full_heading_rad: float = math.radians(30)
+    waist_distance_axis_scale: tuple[float, float, float] = (0.0, 0.0, 0.0)  # yaw, roll, pitch
+    waist_large_heading_yaw_gain: float = 0.0
+    waist_large_heading_full_rad: float = math.radians(65)
     geometry_enabled: bool = False
     blocked_x_m: float = 0.10
     clear_x_m: float = 0.14
@@ -69,6 +76,8 @@ class PlanarApproachCfg:
             "angular_reference_rad_s",
             "arm_posture_scale_rad",
             "arm_posture_max_cost",
+            "wrist_posture_scale_rad",
+            "wrist_posture_max_cost",
             "waist_posture_scale_rad",
             "waist_posture_max_cost",
             "blocked_x_m",
@@ -79,16 +88,36 @@ class PlanarApproachCfg:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"planar_approach {name} must be positive and finite")
-        for name in ("translation_weight", "heading_weight", "arm_posture_deadband_rad", "waist_posture_deadband_rad"):
+        for name in (
+            "translation_weight",
+            "heading_weight",
+            "arm_posture_deadband_rad",
+            "wrist_posture_deadband_rad",
+            "waist_posture_deadband_rad",
+            "waist_large_heading_yaw_gain",
+        ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"planar_approach {name} must be non-negative and finite")
-        for name in ("arm_posture_weight", "waist_posture_weight"):
+        for name in ("arm_posture_weight", "wrist_posture_weight", "waist_posture_weight"):
             value = getattr(self, name)
             if not math.isfinite(value) or value > 0:
                 raise ValueError(f"planar_approach {name} must be non-positive and finite")
         if self.waist_posture_weight < 0 and not self.near_heading_rad < self.waist_posture_full_heading_rad <= math.pi:
             raise ValueError("planar_approach waist_posture_full_heading_rad must exceed near heading and be <= pi")
+        if len(self.waist_distance_axis_scale) != 3 or not all(
+            math.isfinite(scale) and scale >= 0 for scale in self.waist_distance_axis_scale
+        ):
+            raise ValueError("waist_distance_axis_scale needs three non-negative scales in yaw, roll, pitch order")
+        extended_waist = any(self.waist_distance_axis_scale) or self.waist_large_heading_yaw_gain > 0
+        if extended_waist and self.waist_posture_weight == 0:
+            raise ValueError("Planar waist distance and yaw gains require a negative waist_posture_weight")
+        if (extended_waist or self.wrist_posture_weight < 0) and not self.geometry_enabled:
+            raise ValueError("Planar wrist and extended waist posture costs require geometry_enabled")
+        if self.waist_large_heading_yaw_gain > 0 and not (
+            self.far_heading_rad < self.waist_large_heading_full_rad <= math.pi
+        ):
+            raise ValueError("planar_approach waist_large_heading_full_rad must exceed far heading and be <= pi")
 
     def waist_heading_gate(self, heading):
         return (
@@ -160,18 +189,35 @@ class PlanarApproachReward(ManagerTermBase):
         self._observed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._last_reward = torch.zeros(self.num_envs, device=self.device)
         self._names = ("translation_reward", "heading_reward", "posture_penalty", "wrist_handoff")
+        self._planar_names = ()
         if self.approach.geometry_enabled:
             self._names += ("blocked_fraction", "far_fraction")
             self._previous_goals = torch.zeros_like(self.command.goal_pose_w)
             self._previous_active = torch.zeros_like(self.command.active_mask)
             self._previous_station = torch.zeros_like(self._observed)
             self._goal_steps = torch.zeros(self.num_envs, device=self.device)
+            if self.approach.wrist_posture_weight < 0:
+                self._wrist_action_ids = torch.tensor(
+                    [
+                        [self.action._joint_names.index(name) for name in names[4:]]
+                        for names in (LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES)
+                    ],
+                    device=self.device,
+                )
+                self._planar_names += ("wrist_posture_penalty",)
             if self.approach.waist_posture_weight < 0:
                 self._waist_action_ids = [self.action._joint_names.index(name) for name in WAIST_JOINT_NAMES]
                 self._waist_joint_ids = self.command.robot.find_joints(list(WAIST_JOINT_NAMES), preserve_order=True)[0]
                 self._names += ("waist_posture_penalty", "waist_gate")
-        self._sums = torch.zeros(self.num_envs, len(self._names), device=self.device)
+                self._waist_distance_scale = None
+                if any(self.approach.waist_distance_axis_scale):
+                    self._waist_distance_scale = self._last_reward.new_tensor(self.approach.waist_distance_axis_scale)
+                    self._planar_names += ("waist_distance_penalty",)
+                if self.approach.waist_large_heading_yaw_gain > 0:
+                    self._planar_names += ("waist_yaw_boost_penalty",)
+        self._sums = torch.zeros(self.num_envs, len(self._names) + len(self._planar_names), device=self.device)
         self._steps = torch.zeros(self.num_envs, device=self.device)
+        self._planar_steps = torch.zeros_like(self._steps) if self._planar_names else None
         self._last_step = None
         self._dead_zones = torch.tensor(
             [self.approach.near_distance_m, self.approach.near_heading_rad], device=self.device
@@ -249,37 +295,88 @@ class PlanarApproachReward(ManagerTermBase):
         far = ((travel > 0) & active).any(dim=-1)
         scale = command.wrist_bonus_scale
         signals = (translation, heading, posture, scale, blocked, far)
+        planar_signals = ()
         reward = translation + heading + posture
+        if cfg.wrist_posture_weight < 0:
+            target = self.action.processed_actions[:, self._wrist_action_ids]
+            default = command.robot.data.default_joint_pos.torch[:, command.arm_joint_ids[:, 4:]]
+            excess = ((target - default).abs() - cfg.wrist_posture_deadband_rad).clamp_min(0.0)
+            cost = (excess / cfg.wrist_posture_scale_rad).square().mean(-1).clamp_max(cfg.wrist_posture_max_cost)
+            wrist_posture = cfg.wrist_posture_weight * planar * (cost * carry * active).sum(-1) / count
+            reward = reward + wrist_posture
+            planar_signals += (wrist_posture,)
         if cfg.waist_posture_weight < 0:
-            station_heading = command.planar_station_errors()[:, 1]
-            gate = torch.where(planar, cfg.waist_heading_gate(station_heading), wrists.waist_gate)
-            target = self.action.processed_actions[:, self._waist_action_ids]
-            default = command.robot.data.default_joint_pos.torch[:, self._waist_joint_ids]
-            excess = ((target - default).abs() - cfg.waist_posture_deadband_rad).clamp_min(0)
-            cost = (excess / cfg.waist_posture_scale_rad).square().mean(dim=1).clamp_max(cfg.waist_posture_max_cost)
-            waist_posture = cfg.waist_posture_weight * gate * cost
+            waist_posture, waist_gate, waist_signals = self._waist_posture(planar, wrists.waist_gate)
             reward = reward + waist_posture
-            signals += (waist_posture, gate)
+            signals += (waist_posture, waist_gate)
+            planar_signals += waist_signals
         self._last_reward.copy_(reward)
-        self._sums += torch.stack(signals, dim=-1)
+        self._sums += torch.stack(signals + planar_signals, dim=-1)
         self._steps += 1
+        if self._planar_steps is not None:
+            self._planar_steps += planar
         self._last_step = self._env.common_step_counter
         return self._last_reward
+
+    def _waist_posture(self, planar, wrist_gate):
+        cfg = self.approach
+        distance, heading = self.command.planar_station_errors().unbind(-1)
+        gate = torch.where(planar, cfg.waist_heading_gate(heading), wrist_gate)
+        target = self.action.processed_actions[:, self._waist_action_ids]
+        default = self.command.robot.data.default_joint_pos.torch[:, self._waist_joint_ids]
+        excess = ((target - default).abs() - cfg.waist_posture_deadband_rad).clamp_min(0)
+        axis_cost = (excess / cfg.waist_posture_scale_rad).square()
+        mean_cost = axis_cost.mean(dim=1)
+        turn_cost = mean_cost.clamp_max(cfg.waist_posture_max_cost)
+        penalty = cfg.waist_posture_weight * gate * turn_cost
+        # Report only the incremental penalty each route contributes to the final cost.
+        signals = ()
+        if self._waist_distance_scale is not None:
+            distance_gate = ((distance - cfg.near_distance_m) / (cfg.far_distance_m - cfg.near_distance_m)).clamp(0, 1)
+            distance_cost = (axis_cost * self._waist_distance_scale).mean(-1).clamp_max(cfg.waist_posture_max_cost)
+            distance_penalty = cfg.waist_posture_weight * planar * distance_gate * distance_cost
+            combined = torch.minimum(penalty, distance_penalty)
+            signals += (combined - penalty,)
+            penalty = combined
+        if cfg.waist_large_heading_yaw_gain > 0:
+            yaw_gate = (
+                (heading - cfg.far_heading_rad) / (cfg.waist_large_heading_full_rad - cfg.far_heading_rad)
+            ).clamp(0, 1)
+            # Yaw is the first axis in WAIST_JOINT_NAMES; keep the three-axis mean.
+            yaw_cost = axis_cost[:, 0] * (cfg.waist_large_heading_yaw_gain / len(WAIST_JOINT_NAMES))
+            boosted = (mean_cost + yaw_cost * yaw_gate * planar).clamp_max(cfg.waist_posture_max_cost)
+            combined = torch.minimum(penalty, cfg.waist_posture_weight * gate * boosted)
+            signals += (combined - penalty,)
+            penalty = combined
+        return penalty, gate, signals
 
     def reset(self, env_ids=None):
         if self.approach is None or not self.approach.enabled:
             return
         ids = slice(None) if env_ids is None else env_ids
-        steps = self._steps[ids]
-        if (steps > 0).any():
+        steps = self._steps[ids].sum()
+        planar_steps = self._planar_steps[ids].sum() if self._planar_steps is not None else None
+        if planar_steps is None:
+            has_steps = bool(steps > 0)
+            has_planar_steps = False
+        else:
+            has_steps, has_planar_steps = torch.stack((steps, planar_steps)).gt(0).tolist()
+        if has_steps:
             log = self._env.extras.setdefault("log", {})
-            values = self._sums[ids].sum(dim=0) / steps.sum()
+            sums = self._sums[ids].sum(dim=0)
             prefix = "MobileApproach" if self.approach.geometry_enabled else "PlanarApproach"
+            values = sums[: len(self._names)] / steps
             for name, value in zip(self._names, values, strict=True):
                 log[f"{prefix}/{name}"] = value
+            if has_planar_steps:
+                values = sums[len(self._names) :] / planar_steps
+                for name, value in zip(self._planar_names, values, strict=True):
+                    log[f"{prefix}/planar/{name}"] = value
         self._observed[ids] = False
         self._last_reward[ids] = 0
         self._sums[ids] = 0
         self._steps[ids] = 0
+        if self._planar_steps is not None:
+            self._planar_steps[ids] = 0
         if env_ids is None:
             self._last_step = None

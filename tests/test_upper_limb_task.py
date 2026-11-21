@@ -313,6 +313,77 @@ def test_waist_reward_applies_to_planar_and_height_when_turning_is_needed(pose_c
     assert env.extras["log"]["MobileApproach/waist_gate"] == pytest.approx(2 / 3)
 
 
+@pytest.mark.parametrize(
+    "distance, heading_deg, carry, waist_offset, waist_penalty, distance_penalty, yaw_boost_penalty",
+    [
+        (0.10, 0, 0.0, (0.65, 0.65, 0.65), 0.0, 0.0, 0.0),
+        (0.10, 70, 1.0, (0.65, 0.65, 0.65), -0.2 * 3.5 / 3, 0.0, -0.2 * 0.5 / 3),
+        (0.60, 0, 1.0, (0.0, 0.0, 0.65), -0.05, -0.05, 0.0),
+        (0.60, 70, 1.0, (0.65, 0.65, 0.65), -0.2 * 3.5 / 3, 0.0, -0.2 * 0.5 / 3),
+        (0.325, 0, 0.5, (0.0, 0.65, 0.0), -0.05 / 3, -0.05 / 3, 0.0),
+        (0.10, 55, 1.0, (0.65, 0.0, 0.0), -0.25 / 3, 0.0, -0.05 / 3),
+    ],
+)
+def test_planar_wrist_and_waist_posture_follow_approach_geometry(
+    pose_command, distance, heading_deg, carry, waist_offset, waist_penalty, distance_penalty, yaw_boost_penalty
+):
+    from isaaclab.managers import RewardManager
+
+    from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileRewardsCfg
+
+    term = pose_command
+    env = term._env
+    env.common_step_counter = 1
+    env.max_episode_length_s = 10
+    env.extras = {}
+    env.sim.is_playing = lambda: True
+    term.cfg.planar_approach = PlanarApproachCfg(
+        enabled=True,
+        geometry_enabled=True,
+        arm_posture_weight=-0.35,
+        wrist_posture_weight=-0.05,
+        waist_posture_weight=-0.20,
+        waist_distance_axis_scale=(0.25, 0.50, 0.75),
+        waist_large_heading_yaw_gain=0.50,
+    )
+    term.cfg.planar_approach.validate()
+    term.planar_task_mask[:2] = True
+    term.height_task_mask[2] = True
+    term.mode_id[:] = torch.tensor([0, 2, 0])
+    pelvis = term.robot.data.body_link_pose_w.torch[:, term.reference_body_idx]
+    term.planar_station_w.copy_(pelvis[:, :3])
+    term.planar_station_w[:, 0] += distance
+    term.planar_heading_rad.fill_(math.radians(heading_deg))
+    term.goal_pose_w[2, 0, :3] = pelvis[2, :3] + quat_apply(pelvis[2, 3:], torch.tensor([0.8, -0.8, 0.0]))
+
+    action = UpperJointPositionAction.__new__(UpperJointPositionAction)
+    action._joint_names = list(reversed(UPPER_BODY_JOINT_NAMES))
+    joint_ids = term.robot.find_joints(action._joint_names, preserve_order=True)[0]
+    action._processed_actions = term.robot.data.default_joint_pos.torch[:, joint_ids].clone()
+    left_wrist = action._joint_names.index("left_wrist_yaw_joint")
+    right_wrist = action._joint_names.index("right_wrist_yaw_joint")
+    left_shoulder = action._joint_names.index("left_shoulder_yaw_joint")
+    waist_ids = [action._joint_names.index(name) for name in WAIST_JOINT_NAMES]
+    action._processed_actions[:, left_wrist] += 0.65
+    action._processed_actions[0, right_wrist] += 1.5  # Inactive in the left-only episode.
+    action._processed_actions[0, left_shoulder] += 0.65
+    action._processed_actions[:2, waist_ids] += torch.tensor(waist_offset)
+    action._processed_actions[2, waist_ids] += 0.65
+    env.action_manager = SimpleNamespace(get_term=lambda _: action)
+    manager = RewardManager({"planar_approach": MobileRewardsCfg().planar_approach}, env)
+
+    wrist_penalty = -0.05 * carry / 3
+    shoulder_penalty = -0.35 * carry / 4
+    expected = torch.tensor([waist_penalty + wrist_penalty + shoulder_penalty, waist_penalty + wrist_penalty / 2, -0.2])
+    torch.testing.assert_close(manager.compute(env.step_dt) / env.step_dt, expected, atol=1e-6, rtol=0)
+
+    manager.reset(torch.arange(3))
+    log = env.extras["log"]
+    assert log["MobileApproach/planar/wrist_posture_penalty"] == pytest.approx(wrist_penalty * 0.75, abs=1e-6)
+    assert log["MobileApproach/planar/waist_distance_penalty"] == pytest.approx(distance_penalty, abs=1e-6)
+    assert log["MobileApproach/planar/waist_yaw_boost_penalty"] == pytest.approx(yaw_boost_penalty, abs=1e-6)
+
+
 def test_pose_error_observation_has_signed_pelvis_vectors_and_matches_reward_error_norms(pose_command):
     term = pose_command
     poses = term.robot.data.body_link_pose_w.torch
