@@ -14,7 +14,7 @@ class AdaptivePlanarSamplingCfg:
     history_windows: int = 4  # 4 * 3600 control steps / 24 rollout steps = 600 PPO iterations.
     minimum_relative_improvement: float = 0.10
     probability_step: float = 0.05
-    maximum_probability: float = 0.30
+    maximum_probability: float = 0.50
     other_tasks_pose_ready_gate: float = 0.85
     cooldown_windows: int = 1
 

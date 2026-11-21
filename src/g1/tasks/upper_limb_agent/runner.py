@@ -11,6 +11,13 @@ from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab.utils import to_dict
 
+from .symmetry import (
+    FULL_OBSERVATION_DIM,
+    LEGACY_OBSERVATION_DIM,
+    expand_legacy_observation_columns,
+    validate_mobile_observation_layout,
+)
+
 
 class UpperLimbOnPolicyRunner(OnPolicyRunner):
     """Keep PPO updates unchanged and archive the configured prior and frozen Lower model."""
@@ -46,6 +53,9 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
         height = manager.get_term("height_offset")
         pelvis = manager.get_term("pelvis_offset")
         joint_cfg = manager.get_term("joint_pos").cfg
+        observation_dim = raw.observation_manager.group_obs_dim["policy"][0]
+        if observation_dim == FULL_OBSERVATION_DIM:
+            validate_mobile_observation_layout(raw)
         control = {
             "schema_version": 4,
             "action_mapping": "episode_range",
@@ -56,7 +66,7 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
             ],
             "action_terms": list(manager.active_terms),
             "action_dimensions": list(manager.action_term_dim),
-            "policy_observation_dim": raw.observation_manager.group_obs_dim["policy"][0],
+            "policy_observation_dim": observation_dim,
             "upper_joint_names": list(manager.get_term("joint_pos")._joint_names),
             "command_ranges": command.cfg.command_ranges,
             "velocity_reward_reference": command.cfg.reward_reference_scale,
@@ -135,6 +145,7 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
         saved = torch.load(path, weights_only=False, map_location="cpu")
         control = self._control_interface()
         saved_control = (saved.get("infos") or {}).get("g1_control_interface")
+        migrate_observations = False
         if control is not None:
             # Enabled flags permit playback ablations; layout, mapping and cost scales are structural.
             # Magnitude normalization is recorded for audits, allowing reward changes on fine-tuning.
@@ -144,7 +155,6 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
                 "range_command_names",
                 "action_terms",
                 "action_dimensions",
-                "policy_observation_dim",
                 "upper_joint_names",
                 "control_dt",
                 "command_ranges",
@@ -157,13 +167,34 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
                 "use_training_envelope",
                 "standing_thresholds",
             )
-            if saved_control is None or any(saved_control.get(key) != control[key] for key in keys):
+            actual_width = control["policy_observation_dim"]
+            saved_width = (saved_control or {}).get("policy_observation_dim")
+            migrate_observations = saved_width == LEGACY_OBSERVATION_DIM and actual_width == FULL_OBSERVATION_DIM
+            if (
+                saved_control is None
+                or any(saved_control.get(key) != control[key] for key in keys)
+                or (saved_width != actual_width and not migrate_observations)
+            ):
                 raise ValueError(
                     "Mobile Upper control interface mismatch: expected 23 actions "
-                    "[lower_command:3, height_offset:1, pelvis_offset:2, joint_pos:17], 109 observations "
+                    f"[lower_command:3, height_offset:1, pelvis_offset:2, joint_pos:17], {actual_width} observations "
                     "with episode-range action mapping and matching physical/reward scales. "
                     "A1 schema-3 fixed-maximum mappings and older 21/107 or 20/106 checkpoints require retraining."
                 )
+            if migrate_observations:
+                if load_cfg is None or load_cfg.get("optimizer"):
+                    raise ValueError(
+                        "Upper observation migration requires a fresh optimizer. "
+                        "Set env.legacy_observations=true to resume the original optimizer and observation layout."
+                    )
+                for model in ("actor", "critic"):
+                    if load_cfg.get(model):
+                        weights = saved[f"{model}_state_dict"]
+                        weights["mlp.0.weight"] = expand_legacy_observation_columns(weights["mlp.0.weight"])
+                        for stat, fill in (("_mean", 0), ("_var", 1), ("_std", 1)):
+                            key = f"obs_normalizer.{stat}"
+                            if key in weights:
+                                weights[key] = expand_legacy_observation_columns(weights[key], fill)
         elif saved_control is not None:
             raise ValueError("This mobile Upper checkpoint requires the velocity-command environment")
         expected = (saved.get("infos") or {}).get("g1_frozen_lower")
@@ -186,7 +217,12 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
             curriculum.restart(self.env.unwrapped.common_step_counter)
         elif range_state is not None and curriculum is None:
             raise ValueError("Checkpoint requires an Upper range curriculum configuration")
-        result = super().load(path, load_cfg, strict, map_location)
+        if migrate_observations:
+            if self.alg.load(saved, load_cfg, strict):
+                self.current_learning_iteration = saved["iter"]
+            result = saved["infos"]
+        else:
+            result = super().load(path, load_cfg, strict, map_location)
         if curriculum is not None:
             raw = self.env.unwrapped
             command = raw.command_manager.get_term("wrist_pose")

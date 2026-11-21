@@ -1,6 +1,7 @@
 """Square-bounded planar stations and episode-wide target timing configuration."""
 
 import math
+from copy import deepcopy
 
 import torch
 
@@ -8,12 +9,81 @@ from isaaclab.utils import configclass
 
 from .goal_timing import GoalTimingCfg
 
-__all__ = ["PlanarTaskCfg"]
+__all__ = ["PlanarTaskCfg", "PlanarTransitionSamplingCfg"]
+
+PLANAR_SAMPLING_GROUPS = ("legacy", "walk", "turn", "wide")
+
+
+@configclass
+class PlanarTransitionSamplingCfg:
+    """Begin outside the near-field radius and gradually include the wider level ranges."""
+
+    enabled: bool = False
+    min_distance_m: float = 0.25
+    walk_fraction: float = 0.75
+    walk_max_distance_m: float = 0.40
+    walk_max_bearing_rad: float = math.radians(15)
+    turn_max_distance_m: float = 0.30
+    turn_bearing_rad: tuple[float, float] = (math.radians(20), math.radians(25))
+    wide_start_progress: float = 0.30
+    # Optional (progress, wide probability, turn probability) knots. Walk takes the remainder.
+    probability_knots: tuple[tuple[float, float, float], ...] | None = None
+    # Optional (first progress, turn maximum in rad) before turn follows the wide bearing.
+    turn_bearing_bridge: tuple[float, float] | None = None
+
+    def validate(self, max_goal_distance_m):
+        if not math.isfinite(self.min_distance_m) or not 0 < self.min_distance_m < max_goal_distance_m:
+            raise ValueError("transition_sampling requires 0 < min_distance_m < max_goal_distance_m")
+        if any(
+            not math.isfinite(limit) or not self.min_distance_m <= limit <= max_goal_distance_m
+            for limit in (self.walk_max_distance_m, self.turn_max_distance_m)
+        ):
+            raise ValueError("transition_sampling maximum distances must contain the minimum and fit the goal cap")
+        if not 0 <= self.walk_fraction <= 1 or not 0 <= self.wide_start_progress < 1:
+            raise ValueError("transition_sampling requires walk_fraction in [0,1] and wide_start_progress in [0,1)")
+        if not 0 <= self.walk_max_bearing_rad <= math.pi:
+            raise ValueError("transition_sampling walk bearing must be in [0,pi]")
+        if len(self.turn_bearing_rad) != 2 or not 0 <= self.turn_bearing_rad[0] <= self.turn_bearing_rad[1] <= math.pi:
+            raise ValueError("transition_sampling turn bearings must be ordered in [0,pi]")
+        bridge = self.turn_bearing_bridge
+        if bridge is not None and (
+            len(bridge) != 2 or not 0 <= bridge[0] < 1 or not self.turn_bearing_rad[1] <= bridge[1] <= math.pi
+        ):
+            raise ValueError("transition_sampling turn_bearing_bridge requires valid (progress, maximum bearing)")
+        if (knots := self.probability_knots) is not None:
+            if len(knots) < 2 or any(
+                len(k) != 3 or not all(math.isfinite(v) and 0 <= v <= 1 for v in k) or k[1] + k[2] > 1 for k in knots
+            ):
+                raise ValueError("transition_sampling requires valid (progress, wide, turn) probability triples")
+            if (
+                knots[0][0] != 0
+                or knots[-1][0] != 1
+                or any(a[0] >= b[0] for a, b in zip(knots[:-1], knots[1:], strict=True))
+            ):
+                raise ValueError("transition_sampling probability progress must increase from 0 to 1")
+
+    def group_probabilities(self, progress):
+        progress = torch.as_tensor(progress, dtype=torch.float32)
+        if self.probability_knots is not None:
+            wide, turn = _interpolate_knots(progress, self.probability_knots).unbind(-1)
+            return 1 - wide - turn, turn, wide
+        wide = ((progress - self.wide_start_progress) / (1 - self.wide_start_progress)).clamp(0, 1)
+        walk = (1 - wide) * self.walk_fraction
+        return walk, (1 - wide) * (1 - self.walk_fraction), wide
+
+    def turn_bearing_limit(self, progress, wide_bearing, wide_probability):
+        minimum, maximum = self.turn_bearing_rad
+        if self.turn_bearing_bridge is None:
+            return maximum
+        bridge_start, bridge_limit = self.turn_bearing_bridge
+        progress = torch.as_tensor(progress, device=wide_probability.device)
+        limit = torch.where(progress >= bridge_start, bridge_limit, maximum)
+        wide_limit = torch.as_tensor(wide_bearing, device=wide_probability.device).clamp_min(minimum)
+        return torch.where(wide_probability > 0, wide_limit, limit)
 
 
 @configclass
 class PlanarTaskCfg:
-    # Opt-in until far-field reward guidance is connected.
     probability: float = 0.0
     initial_half_extent_m: float = 0.25
     half_extent_m: float = 2.5
@@ -24,6 +94,7 @@ class PlanarTaskCfg:
     curriculum_knots: tuple[tuple[float, float, float], ...] | None = None
     max_goal_distance_m: float = 5.0  # Each active wrist, from the initial pelvis; full 3D norm.
     timing: GoalTimingCfg = GoalTimingCfg()
+    transition_sampling: PlanarTransitionSamplingCfg = PlanarTransitionSamplingCfg()
 
     def validate_parameters(self):
         if not math.isfinite(self.probability) or not 0 <= self.probability <= 1:
@@ -55,7 +126,18 @@ class PlanarTaskCfg:
                 )
             if any(b[0] <= a[0] or b[1] < a[1] or b[2] < a[2] for a, b in zip(knots[:-1], knots[1:], strict=True)):
                 raise ValueError("planar_task.curriculum_knots must have increasing progress and nondecreasing limits")
+        if self.transition_sampling.enabled:
+            self.transition_sampling.validate(self.max_goal_distance_m)
         self.timing.validate_parameters()
+
+
+def _interpolate_knots(progress, values):
+    progress = torch.as_tensor(progress, dtype=torch.float32)
+    knots = progress.new_tensor(values)
+    right = torch.searchsorted(knots[:, 0].contiguous(), progress.contiguous(), right=True).clamp(1, len(knots) - 1)
+    lo, hi = knots[right - 1], knots[right]
+    fraction = (progress - lo[..., 0]) / (hi[..., 0] - lo[..., 0])
+    return torch.lerp(lo[..., 1:], hi[..., 1:], fraction[..., None])
 
 
 def station_limits(progress, cfg):
@@ -65,12 +147,7 @@ def station_limits(progress, cfg):
             cfg.initial_half_extent_m + progress * (cfg.half_extent_m - cfg.initial_half_extent_m),
             cfg.initial_bearing_rad + progress * (cfg.bearing_rad - cfg.initial_bearing_rad),
         )
-    progress = torch.as_tensor(progress, dtype=torch.float32)
-    knots = torch.tensor(cfg.curriculum_knots, device=progress.device, dtype=progress.dtype)
-    right = torch.searchsorted(knots[:, 0].contiguous(), progress.contiguous(), right=True).clamp(1, len(knots) - 1)
-    lo, hi = knots[right - 1], knots[right]
-    fraction = (progress - lo[..., 0]) / (hi[..., 0] - lo[..., 0])
-    return torch.lerp(lo[..., 1], hi[..., 1], fraction), torch.lerp(lo[..., 2], hi[..., 2], fraction)
+    return _interpolate_knots(progress, cfg.curriculum_knots).unbind(-1)
 
 
 def sample_station(progress, local_radius, cfg):
@@ -80,11 +157,122 @@ def sample_station(progress, local_radius, cfg):
     square-area sampling. A triangle-inequality radius budget protects every
     active wrist after the rigid target-group transform.
     """
-    extent, bearing = station_limits(progress, cfg)
-    angle = (2 * torch.rand_like(progress) - 1) * bearing
+    return _sample_station(*station_limits(progress, cfg), local_radius, cfg, progress)
+
+
+def _sample_station(extent, bearing, local_radius, cfg, random_like):
+    angle = (2 * torch.rand_like(random_like) - 1) * bearing
     direction = torch.stack((angle.cos(), angle.sin()), dim=-1)
     room = cfg.max_goal_distance_m - local_radius
     if (room <= 0).any():
         raise ValueError("planar_task.max_goal_distance_m leaves no room for the local wrist targets")
-    radius = torch.minimum(extent / direction.abs().amax(-1), room) * torch.rand_like(progress).sqrt()
+    radius = torch.minimum(extent / direction.abs().amax(-1), room) * torch.rand_like(random_like).sqrt()
     return direction * radius[:, None], torch.where(radius > 1e-6, angle, 0.0)
+
+
+def station_budget_bounds(progress, cfg):
+    """Conservative (distance, absolute bearing) bounds for each enabled sampling group."""
+    extent, bearing = station_limits(progress, cfg)
+    wide_bounds = (math.sqrt(2) * extent, bearing)
+    transition = cfg.transition_sampling
+    if not transition.enabled:
+        return (wide_bounds,)
+    walk, turn, wide = transition.group_probabilities(progress)
+    bounds = []
+    if walk > 0:
+        bounds.append((transition.walk_max_distance_m, transition.walk_max_bearing_rad))
+    if turn > 0:
+        bounds.append((transition.turn_max_distance_m, transition.turn_bearing_limit(progress, bearing, wide)))
+    if wide > 0:
+        if extent < transition.min_distance_m:
+            raise ValueError("transition_sampling minimum distance exceeds the wide square half extent")
+        bounds.append(wide_bounds)
+    return bounds
+
+
+def sample_transition_station(progress, local_radius, cfg):
+    """Sample a walk, turn or wide target, with area-weighted radius in a bounded interval."""
+    return _sample_transition_station(*_transition_limits(progress, cfg), local_radius, cfg, progress)
+
+
+def _transition_limits(progress, cfg):
+    transition = cfg.transition_sampling
+    walk_fraction, _, wide_fraction = transition.group_probabilities(progress)
+    extent, bearing = station_limits(progress, cfg)
+    turn_max = transition.turn_bearing_limit(progress, bearing, wide_fraction)
+    return extent, bearing, walk_fraction, wide_fraction, turn_max - transition.turn_bearing_rad[0]
+
+
+def _sample_transition_station(
+    extent, bearing, walk_fraction, wide_fraction, turn_span, local_radius, cfg, random_like
+):
+    transition = cfg.transition_sampling
+    choice = torch.rand_like(random_like)
+    wide = choice < wide_fraction
+    walk = ~wide & (choice < wide_fraction + walk_fraction)
+    signed = 2 * torch.rand_like(random_like) - 1
+    turn_min = transition.turn_bearing_rad[0]
+    turn = (turn_min + signed.abs() * turn_span) * torch.where(signed < 0, -1.0, 1.0)
+    angle = torch.where(wide, signed * bearing, torch.where(walk, signed * transition.walk_max_bearing_rad, turn))
+    direction = torch.stack((angle.cos(), angle.sin()), dim=-1)
+    upper = torch.where(
+        wide,
+        extent / direction.abs().amax(-1),
+        torch.where(walk, transition.walk_max_distance_m, transition.turn_max_distance_m),
+    )
+    upper = torch.minimum(upper, cfg.max_goal_distance_m - local_radius)
+    if (upper < transition.min_distance_m).any():
+        raise ValueError("transition_sampling minimum distance conflicts with the planar wrist distance cap")
+    lower_sq = transition.min_distance_m**2
+    radius = (lower_sq + (upper.square() - lower_sq) * torch.rand_like(random_like)).sqrt()
+    group = torch.where(wide, 3, torch.where(walk, 1, 2))
+    return direction * radius[:, None], angle, group
+
+
+class PlanarStationSampler:
+    """Batch lookup of the fixed schedule at each episode's level."""
+
+    def __init__(self, num_levels, device):
+        self._progress = (
+            torch.arange(num_levels, device=device, dtype=torch.float32) / (num_levels - 1)
+            if num_levels > 1
+            else torch.ones(1, device=device)
+        )
+        self._schedule = None
+        self._table = None
+
+    def sample(self, levels, local_radius, cfg):
+        transition = cfg.transition_sampling
+        # Evaluation can override the sampling schedule after the environment is built.
+        schedule = (
+            cfg.initial_half_extent_m,
+            cfg.half_extent_m,
+            cfg.initial_bearing_rad,
+            cfg.bearing_rad,
+            cfg.curriculum_knots,
+            transition.enabled,
+            transition.walk_fraction,
+            transition.wide_start_progress,
+            transition.probability_knots,
+            transition.turn_bearing_rad,
+            transition.turn_bearing_bridge,
+        )
+        if self._schedule != schedule:
+            values = (
+                _transition_limits(self._progress, cfg) if transition.enabled else station_limits(self._progress, cfg)
+            )
+            self._table = torch.stack(
+                [
+                    torch.as_tensor(value, dtype=self._progress.dtype, device=self._progress.device).expand_as(
+                        self._progress
+                    )
+                    for value in values
+                ],
+                dim=-1,
+            )
+            self._schedule = deepcopy(schedule)
+        values = self._table[levels].unbind(dim=-1)
+        if transition.enabled:
+            return _sample_transition_station(*values, local_radius, cfg, values[0])
+        shift, angle = _sample_station(*values, local_radius, cfg, values[0])
+        return shift, angle, None

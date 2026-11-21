@@ -18,7 +18,7 @@ from .task_registry import TASK_FAMILIES, get_task_family, resolve_task_family
 
 
 @contextmanager
-def _runner_adapter(backend, factory):
+def _runner_adapter(backend, factory, *, restore_upper_observations=False):
     """Scope the upstream constructor seam to one synchronous CLI invocation.
 
     The local IsaacLab entrypoints import create_rsl_rl_runner at module scope and expose no
@@ -30,11 +30,26 @@ def _runner_adapter(backend, factory):
     original = backend.create_rsl_rl_runner
     if original is not create_rsl_rl_runner:
         raise RuntimeError("Unsupported IsaacLab runner constructor seam; review the project adapter")
+
+    if restore_upper_observations:
+        from g1.tasks.upper_limb_agent.checkpoint_observations import configure_checkpoint_observations
+
+        resolve_checkpoint = backend._resolve_checkpoint
+
+        def resolve_with_observations(args, agent_cfg, env_cfg, log_root):
+            checkpoint = resolve_checkpoint(args, agent_cfg, env_cfg, log_root)
+            if checkpoint is not None:
+                configure_checkpoint_observations(env_cfg, checkpoint)
+            return checkpoint
+
+        backend._resolve_checkpoint = resolve_with_observations
     backend.create_rsl_rl_runner = factory
     try:
         yield
     finally:
         backend.create_rsl_rl_runner = original
+        if restore_upper_observations:
+            backend._resolve_checkpoint = resolve_checkpoint
 
 
 def main(argv=None):
@@ -135,7 +150,9 @@ def main(argv=None):
     original_argv = sys.argv
     try:
         sys.argv = [original_argv[0], *remaining]
-        with _runner_adapter(backend, factory):
+        with _runner_adapter(
+            backend, factory, restore_upper_observations=selected.action == "play" and family_name == "upper_limb_agent"
+        ):
             result = backend.run(fuse_kit_args(remaining))
         return result or 0
     finally:

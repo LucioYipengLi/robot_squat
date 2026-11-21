@@ -185,6 +185,26 @@ def test_magnitude_without_curriculum_uses_signed_configured_ranges_not_rate_ref
     assert not torch.allclose(lower_command_magnitude_l2(env), term.reward_normalized.square().sum(-1))
 
 
+def test_extra_magnitude_cost_starts_after_planar_entry_and_uses_processed_lateral_and_yaw():
+    action = make_command(command_ranges=((-0.5, 1.0), (-0.2, 0.2), (-0.8, 0.8)))
+    term = SimpleNamespace(
+        planar_task_mask=torch.tensor([True, True, False]), planar_first_near_step=torch.tensor([24, -1, 12])
+    )
+    env = SimpleNamespace(
+        action_manager=SimpleNamespace(get_term=lambda _: action),
+        command_manager=SimpleNamespace(get_term=lambda _: term),
+    )
+    action.process_actions(torch.tensor([[5.0, 3.0, -5.0]]).expand(3, -1))
+    torch.testing.assert_close(lower_command_magnitude_l2(env, near_planar_gain=4.0), torch.tensor([5.0, 3.0, 3.0]))
+    action.process_actions(torch.tensor([[5.0, -0.5, 0.25]]).expand(3, -1))
+    torch.testing.assert_close(lower_command_magnitude_l2(env, near_planar_gain=4.0), lower_command_magnitude_l2(env))
+    action.process_actions(torch.tensor([[5.0, -0.75, 0.25]]).expand(3, -1))
+    torch.testing.assert_close(
+        lower_command_magnitude_l2(env, near_planar_gain=4.0) - lower_command_magnitude_l2(env),
+        torch.tensor([0.25, 0.0, 0.0]),
+    )
+
+
 @pytest.mark.parametrize("reward", [lower_command_overflow_l2, lower_command_magnitude_l2])
 def test_command_costs_require_the_velocity_action_type(reward):
     env = SimpleNamespace(action_manager=SimpleNamespace(get_term=lambda name: object()))

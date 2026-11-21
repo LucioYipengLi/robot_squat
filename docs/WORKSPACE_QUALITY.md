@@ -132,7 +132,7 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Upper-Mobile-v0
 ```
 
 `0.02` 是低权重试验示例，实际效果需通过跟踪误差、达标比例及 Q 分数对照确认。
-使用 `Template-G1-Upper-v0` 可以做固定底座对照（17动作/93观测）；Mobile 使用23动作/109观测。
+使用 `Template-G1-Upper-v0` 可以做固定底座对照（17 动作、93 维观测）。Mobile 默认使用 23 动作、660 维历史观测。
 Q 对照实验的两组应使用相同 Mobile 接口与命令变化惩罚，再改变 Q 权重。
 续训仍使用项目标准 `--checkpoint` 和 `--max_iterations` 参数。
 

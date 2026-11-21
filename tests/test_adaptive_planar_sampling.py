@@ -32,7 +32,7 @@ def test_flat_failure_increases_small_steps_keeps_history_and_skips_exactly_one_
     assert s.probability == 0.3 and len(s.history) == 4
     for _ in range(30):
         observe(s, 4)
-    assert s.probability == 0.3 and s.adjustments == 2
+    assert s.probability == 0.5 and s.adjustments == 6
 
 
 def test_other_task_quality_blocks_increases_but_keeps_history_and_resumes_without_warmup():

@@ -87,14 +87,20 @@ def contact_statistics(trace, partners, physics_dt, threshold=1.0):
 
 
 class FailureArchive:
-    def __init__(self, directory, manifest):
+    def __init__(self, directory, manifest, *, planar_hold=None):
+        self.planar_hold = planar_hold
+        if planar_hold is not None:
+            planar_hold.validate_run(manifest)
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         (self.directory / "clips").mkdir()
+        if manifest.get("planar_startup") is not None:
+            (self.directory / "startup").mkdir()
         self.manifest = {"schema_version": 1, **manifest}
         self.completed = self.failed = self.saved = 0
         self.classes, self.reasons = Counter(), Counter()
         self.failed_classes, self.elapsed_classes = Counter(), Counter()
+        self.planar_groups = {}
         self._episodes = (self.directory / "episodes.jsonl").open("w", encoding="utf-8", buffering=1)
         self._failures = (self.directory / "failures.jsonl").open("w", encoding="utf-8", buffering=1)
         self._switches = self.switch_summary = None
@@ -102,7 +108,7 @@ class FailureArchive:
         if (paired := manifest.get("switch_pair_evaluation")) is not None:
             from .pairs import PairedSwitchSummary
 
-            self.pair_summary = PairedSwitchSummary(paired["cases"])
+            self.pair_summary = PairedSwitchSummary(paired["cases"], dual=paired.get("trial_mode") == "dual_arm")
         if manifest.get("regular_switch_evaluation") is not None:
             from .switches import SwitchSummary
 
@@ -111,15 +117,23 @@ class FailureArchive:
         write_json(self.directory / "run.json", self.manifest)
         self.progress("starting")
 
-    def add_episode(self, episode, trace=None, *, switches=()):
+    def _write_trace(self, clip, trace):
+        temporary = self.directory / f"{clip}.tmp"
+        with temporary.open("wb") as stream:
+            np.savez_compressed(stream, **trace)
+        temporary.replace(self.directory / clip)
+
+    def add_episode(self, episode, trace=None, *, switches=(), startup_trace=None):
         episode = {"episode_id": self.completed, **episode}
+        if startup_trace is not None:
+            episode["planar_startup_clip"] = f"startup/{episode['env_id']:06d}.npz"
+            self._write_trace(episode["planar_startup_clip"], startup_trace)
+            if self.planar_hold is not None:
+                self.planar_hold.add_episode(episode, startup_trace)
         if trace is not None:
             sample_id = f"{self.saved:06d}"
             clip = f"clips/{sample_id}.npz"
-            temporary = self.directory / f"{clip}.tmp"
-            with temporary.open("wb") as stream:
-                np.savez_compressed(stream, **trace)
-            temporary.replace(self.directory / clip)
+            self._write_trace(clip, trace)
             sample = {"sample_id": sample_id, "clip": clip, **episode}
             self._failures.write(json.dumps(plain(sample), ensure_ascii=False, allow_nan=False) + "\n")
             self.saved += 1
@@ -139,12 +153,39 @@ class FailureArchive:
         self.failed_classes[episode["category"]] += int(episode["failed"])
         self.elapsed_classes[episode["category"]] += episode["elapsed_s"]
         self.reasons.update(episode["reasons"])
+        if (name := episode.get("planar_sampling_group")) is not None:
+            group = self.planar_groups.setdefault(name, Counter())
+            group["episodes"] += 1
+            group["failures"] += int(episode["failed"])
+            group["robot_seconds"] += episode["elapsed_s"]
+            group["near_entries"] += int(episode["planar_entered_near"])
+            group["failures_after_near"] += int(episode["planar_entered_near"] and episode["failed"])
+            group["near_seconds"] += episode["planar_first_near_s"] or 0.0
+            group["pose_ready_sum"] += episode["planar_eval_pose_ready_fraction"]
 
     def progress(self, status, **extra):
         if self.switch_summary is not None:
             extra["regular_switches"] = self.switch_summary.report()
         if self.pair_summary is not None:
             extra["switch_pair_evaluation"] = self.pair_summary.report()
+        if self.planar_hold is not None:
+            extra["planar_hold"] = self.planar_hold.report()
+        if self.planar_groups:
+            extra["planar_groups"] = {
+                name: {
+                    "episodes": group["episodes"],
+                    "failures": group["failures"],
+                    "failure_per_10s": 10 * group["failures"] / max(group["robot_seconds"], 1e-9),
+                    "near_entry_fraction": group["near_entries"] / group["episodes"],
+                    "failures_after_near": group["failures_after_near"],
+                    "failure_after_near_fraction": group["failures_after_near"] / group["near_entries"]
+                    if group["near_entries"]
+                    else None,
+                    "first_near_s": group["near_seconds"] / group["near_entries"] if group["near_entries"] else None,
+                    "eval_pose_ready_fraction": group["pose_ready_sum"] / group["episodes"],
+                }
+                for name, group in self.planar_groups.items()
+            }
         write_json(
             self.directory / "summary.json",
             {

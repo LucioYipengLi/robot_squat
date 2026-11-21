@@ -210,7 +210,7 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family, planar)
             control = infos["g1_control_interface"]
             assert control["schema_version"] == 4 and control["action_mapping"] == "episode_range"
             assert control["action_terms"] == ["lower_command", "height_offset", "pelvis_offset", "joint_pos"]
-            assert control["action_dimensions"] == [3, 1, 2, 17] and control["policy_observation_dim"] == 109
+            assert control["action_dimensions"] == [3, 1, 2, 17] and control["policy_observation_dim"] == 660
             for metric in ("command_speed_m_s", "command_yaw_rad_s", "velocity_error_m_s", "yaw_error_rad_s"):
                 assert f"FrozenLower/{metric}" in tags
             assert any(row.value < 0 for row in events.Scalars("Episode_Reward/lower_command_rate"))
@@ -293,7 +293,7 @@ def checked_factory(env, *args, **kwargs):
             assert cfg.params['asset_cfg'].joint_ids.tolist() == action_ids.tolist()
         assert raw_env.reward_manager.get_term_cfg('torque_limits').params['soft_ratio'] == 0.8
         observations = env.get_observations()['policy']
-        assert observations.shape == (4, 109 if mobile else 93)
+        assert observations.shape == (4, 660 if mobile else 93)
         assert set(raw_env.command_manager.active_terms) == {'wrist_pose'}
         command = raw_env.command_manager.get_term('wrist_pose')
         wrist_cfg = raw_env.reward_manager.get_term_cfg('end_effector_acc')
@@ -350,7 +350,8 @@ def checked_factory(env, *args, **kwargs):
         else:
             assert command.cfg.height_task is None and not command.height_task_mask.any()
         assert torch.isfinite(command.pose_error()[0]).all()
-        errors = observations[:, 30:42].reshape(4, 2, 6)
+        errors = observations[:, 150:210].reshape(4, 5, 12)[:, -1] if mobile else observations[:, 30:42]
+        errors = errors.reshape(4, 2, 6)
         position_error, orientation_error = command.pose_error()
         torch.testing.assert_close(
             command.orientation_error_quat_squared(), torch.sin(orientation_error / 2).square(), atol=1e-6, rtol=1e-5

@@ -64,12 +64,16 @@ class UpperPolicyPlayback:
         }
         self._stream.write(json.dumps(_json_value(row), ensure_ascii=False) + "\n")
 
-    def _begin(self):
+    def _begin(self, *, keep_manual_targets=False):
         self._trial += 1
         self._trial_steps = 0
         self._snapshot = self.term.teleop_snapshot()
-        self.controller.adopt(self.term.goal_pose_w)
-        self._write("target", target=self._snapshot)
+        self._manual_targets_pending = keep_manual_targets
+        if keep_manual_targets:
+            self._write("target", target=self._snapshot, retained_manual_goal_pose_w=self.controller.poses[None])
+        else:
+            self.controller.adopt(self.term.goal_pose_w)
+            self._write("target", target=self._snapshot)
         self.update_status()
 
     def _reset(self, *, reason, replay=None, carry=None):
@@ -121,6 +125,7 @@ class UpperPolicyPlayback:
                 self.term.set_manual_targets(c.poses[None], c.arm_mode)
                 self._write("edit", goal_pose_w=c.poses[None])
                 c.changed = False
+                self._manual_targets_pending = False
             self.obs, _, dones, infos = self.env.step(actions)
             self.policy.reset(dones)
             self._trial_steps += 1
@@ -131,7 +136,8 @@ class UpperPolicyPlayback:
                     if name.startswith("Episode_Termination/") and float(value) > 0
                 ]
                 self._write("ended", reasons=reasons, elapsed_s=self._trial_steps * self.raw.step_dt)
-                self._begin()  # env.step already reset the physical scene and sampled its next goal.
+                # Keep the editor's values while the reset pose holds the robot.
+                self._begin(keep_manual_targets=self._source == "manual")
             elif c.source == "auto":
                 c.adopt(self.term.goal_pose_w)
             self._status_age += self.raw.step_dt
@@ -146,7 +152,7 @@ class UpperPolicyPlayback:
         deadline = int(term.episode_deadline_steps[0])
         category = ["regular", "height_shifted", "planar"][int(term.task_ids[0])]
         stage = (
-            "manual hold"
+            ("targets kept; edit or Retry target to apply" if self._manual_targets_pending else "manual hold")
             if c.source == "manual"
             else (
                 "evaluation"

@@ -4,7 +4,8 @@
 
 ## 快速使用
 
-新Mobile使用 **23动作／109观测**：先处理速度3维、高度1维、骨盆偏移2维，再处理17维腰臂动作。
+Mobile 默认使用 **23 动作／660 观测**。动作依次是速度 3 维、高度 1 维、骨盆偏移 2 维和腰臂 17 维。
+观测按项堆叠最近 5 个控制步，每步 132 维。关节位置和速度各覆盖腰、臂、腿共 29 轴。
 冻结Lower仍接收650维历史观测并输出12维腿部动作，每控制步推理一次，物理子步持续执行。
 默认冻结模型：
 
@@ -13,7 +14,7 @@ logs/rsl_rl/g1_flat/2026-11-11_21-45-46_lower_base_p3/model_19997.pt
 ```
 
 当前映射版本为schema 4：六维Lower动作按当前回合范围解码。
-A1的schema 3虽同为23／109，但使用最终大范围解码再裁剪，需在匹配的旧实现中回放，当前版本从头训练。
+A1 的 schema 3 使用最终大范围解码再裁剪，回放需要匹配的历史实现。
 H5C及更早的21动作检查点也需要显式迁移才能复用。
 
 ```powershell
@@ -28,10 +29,14 @@ uv run python -m g1.rl play --task Template-G1-Upper-Mobile-v0 --checkpoint "<23
 达到最终等级所需轮数由训练结果决定。首训示例沿用A1的seed=1217707953，
 先检查300／600／1300轮的贴边调用、跟踪和冲击，再决定后续预算。训练入口仍默认随机种子。
 
+旧 schema 4 的 109 维 checkpoint 在 `play`、`teleop` 和 `failures mine` 中自动使用原观测。
+默认续训会把保留特征的首层权重迁移到最近一帧，其余历史和双腿输入列从零权重开始，使用新优化器。
+如需沿用旧布局，训练时指定 `env.legacy_observations=true`。该布局支持 `--resume_optimizer_state`。
+
 ## PPO 左右镜像增强
 
 `agent.mirror_augmentation=true` 在 Mobile 训练时接入 RSL-RL 数据增强，默认关闭。
-每个 PPO 小批次包含原样本和镜像样本。镜像交换左右腕目标、实际位姿、误差和活动掩码，按 G1 关节轴变换双臂、腰部及历史动作，并反射基座运动和 Lower 的侧向、转向指令。Actor 和 Critic 使用原有 109 维观测和 23 维动作，`mirror loss` 保持关闭。TensorBoard 的 `Loss/symmetry` 是镜像动作不一致程度的诊断值。
+每个 PPO 小批次包含原样本和镜像样本。镜像在每个历史步独立变换左右腕目标、实际位姿、误差、活动掩码、腰臂和双腿状态，并反射基座运动及 Lower 的侧向、转向指令。23 维动作也进行镜像，`mirror loss` 保持关闭。TensorBoard 的 `Loss/symmetry` 是镜像动作不一致程度的诊断值。
 
 从 v5 续训 1200 轮的示例。固定 Level 1 和平面基础采样比例，便于做同条件对照。
 
@@ -130,7 +135,7 @@ Lower接口、腕部局部偏移和高度范围按k/10插值；平面站位使�
 
 半边长是采样正方形边界，实际径向位移随方位变化；方位角还用于整体旋转目标组。
 终点仍为5 m × 5 m区域，活动腕相对初始盆骨的3D距离上限仍为5 m。
-平面采样概率上限保持30%，晋级质量与其他任务质量门槛沿用现有设置。
+平面采样概率上限为50%，晋级质量与其他任务质量门槛沿用现有设置。
 
 新站位课程和接触失败定义会写入检查点课程契约。从旧模型续训时，显式重建课程统计：
 
@@ -302,7 +307,7 @@ relative_improvement = (previous_failure - recent_failure) / max(previous_failur
 `min_episodes_per_class`（默认512），当前等级的位姿达标EMA不低于
 `other_tasks_pose_ready_gate`（默认0.85），当前窗口的`window_failure_per_10s`不高于
 课程的`failure_rate_limit`（默认每10机器人秒0.01次）。关闭的任务类别不参与该保护判断。
-20%→25%→30%，达到上限后继续统计。改善明显或其他任务任一条件未达标时保持当前比例，
+从20%每次提高5个百分点，最多50%，达到上限后继续统计。改善明显或其他任务任一条件未达标时保持当前比例，
 同时继续收集有效平面历史。其他任务恢复达标后可用已有历史判断是否加码。
 调整后的下一个窗口只暂停增加比例，照常更新滑动历史和范围课程；再下个检查点即可继续判断。
 历史不足或平面样本不足不加码，平面样本不足会打断连续历史。
@@ -319,7 +324,7 @@ relative_improvement = (previous_failure - recent_failure) / max(previous_failur
 | `history_windows` | 4 | 必须为至少2的偶数；默认约600轮 |
 | `minimum_relative_improvement` | 0.10 | 低于该改善幅度判定下降不足；负数表示退化 |
 | `probability_step` | 0.05 | 单次增加5个百分点 |
-| `maximum_probability` | 0.30 | 上限，须不小于配置基础概率且小于1 |
+| `maximum_probability` | 0.50 | 上限，须不小于配置基础概率且小于1 |
 | `other_tasks_pose_ready_gate` | 0.85 | 其他启用任务允许平面加码的位姿达标EMA下限，取值[0,1]；同时要求当前窗口样本充分 |
 | `cooldown_windows` | 1 | 每次增加后跳过的调整检查次数；期间仍收集数据 |
 
@@ -385,7 +390,7 @@ RSL-RL批次平均，课程自身直接聚合回合计数，推进不依赖Tenso
 ## 保存、续训与固定条件回放
 
 检查点 `infos.g1_upper_ranges`（schema 2）保存等级、三类EMA、计数、实际存活时间、检查时钟和课程契约；
-`infos.g1_control_interface` 保存23／109布局、物理映射及奖励尺度。
+`infos.g1_control_interface` 保存动作和观测维度、物理映射及奖励尺度。
 当前控制契约为schema 4、action_mapping=episode_range，并记录三项动作的课程来源。
 新增 `velocity_magnitude_normalization=episode_range` 标识幅值公式；
 `velocity_reward_reference` 继续记录固定的速度变化率尺度。

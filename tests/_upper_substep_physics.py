@@ -296,7 +296,7 @@ def main():
                 preserved_target_velocity = action.joint_target_velocity[1:].clone()
                 reset_obs, _ = env.reset(env_ids=torch.tensor([0], device=env.device))
                 if mobile:
-                    assert not reset_obs["policy"][0, 76:93].any()
+                    assert not reset_obs["policy"][0, 500:585].any()
                 torch.testing.assert_close(action.joint_target_velocity[1:], preserved_target_velocity, rtol=0, atol=0)
                 assert not action.joint_target_velocity[0].any()
                 torch.testing.assert_close(action.mean_joint_acc_l2()[1:], expected[1:], rtol=1e-6, atol=1e-3)

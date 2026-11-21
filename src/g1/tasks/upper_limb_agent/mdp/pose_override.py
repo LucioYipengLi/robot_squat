@@ -16,6 +16,7 @@ SNAPSHOT_FIELDS = (
     "planar_station_w",
     "planar_distance_m",
     "planar_heading_rad",
+    "planar_sampling_group",
     "evaluation_start_steps",
     "episode_deadline_steps",
 )

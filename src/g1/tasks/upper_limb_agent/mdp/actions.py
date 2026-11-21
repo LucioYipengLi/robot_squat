@@ -40,6 +40,12 @@ RIGHT_ARM_JOINT_NAMES = (
 )
 
 UPPER_BODY_JOINT_NAMES = WAIST_JOINT_NAMES + LEFT_ARM_JOINT_NAMES + RIGHT_ARM_JOINT_NAMES
+LEG_JOINT_NAMES = tuple(
+    f"{side}_{joint}_joint"
+    for side in ("left", "right")
+    for joint in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")
+)
+MOBILE_OBSERVATION_JOINT_NAMES = UPPER_BODY_JOINT_NAMES + LEG_JOINT_NAMES
 
 __all__ = [
     "LEFT_ARM_JOINT_NAMES",

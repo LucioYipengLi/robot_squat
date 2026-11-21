@@ -293,7 +293,8 @@ sigma 是奖励带宽，成功阈值需独立定义。支持 `0 < sigma_fine <= 
 镜像数据增强和 mirror loss 的研究计划保留在上肢 PPO 配置的 TODO 中。
 
 Upper 的自由底座版本 `Template-G1-Upper-Mobile-v0` 复用同一任务族和 Runner，使用23维动作：
-速度3维、高度1维、骨盆偏移2维、腰臂17维；观测109维。冻结Lower执行六维命令。
+速度 3 维、高度 1 维、骨盆偏移 2 维、腰臂 17 维。冻结 Lower 执行六维命令。
+默认观测每步 132 维，按项堆叠 5 步，共 660 维。
 Mobile 的 `action_rate` 限定为17维上肢动作，`lower_command_rate=-0.10` 使用固定物理尺度约束六维有效命令变化。
 `lower_command_magnitude=-0.05` 按各子环境本回合范围的正／负向边界归一化，仅约束三维有效速度。
 范围课程和联合位姿EMA、保存恢复见 [Upper范围课程](UPPER_RANGE_CURRICULUM.md)。

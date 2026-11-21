@@ -199,3 +199,42 @@ def test_playback_preserves_one_step_observation_timing_and_can_retry_and_switch
     rows = [json.loads(line) for line in (tmp_path / "session.jsonl").read_text().splitlines()]
     assert {row["event"] for row in rows} >= {"session", "target", "edit", "interrupted", "closed"}
     assert len([row for row in rows if row["event"] == "target"]) == 3
+
+
+def test_manual_targets_survive_physical_reset_and_can_be_applied_together(tmp_path):
+    session, c, term, _, _ = _session(tmp_path)
+    reset_goals = term.goal_pose_w.clone()
+    c.set_pose(0, [0.2, 1.2, 0.8], [10, 0, 90])
+    session.step()
+    edited = c.poses.clone()
+    normal_step = session.env.step
+
+    def contact_step(actions):
+        normal_step(actions)
+        obs, _ = session.env.reset()
+        session.env.step = normal_step
+        return obs, None, torch.tensor([True]), {"log": {"Episode_Termination/base_contact": 1.0}}
+
+    session.env.step = contact_step
+    session.step()
+    torch.testing.assert_close(c.poses, edited)
+    assert "targets kept" in c.status["Stage"]
+    session.step()
+    torch.testing.assert_close(term.goal_pose_w, reset_goals)
+
+    c.set_pose(1, [-0.2, 1.1, 0.8], [0, 0, 90])
+    session.step()
+    torch.testing.assert_close(term.goal_pose_w[0, 0], edited[0])
+    torch.testing.assert_close(term.goal_pose_w[0, 1], c.poses[1])
+    edited = c.poses.clone()
+    session.env.step = contact_step
+    session.step()
+    c.request("retry")
+    session.step()
+    torch.testing.assert_close(term.goal_pose_w[0], edited)
+    session.close()
+
+    rows = [json.loads(line) for line in (tmp_path / "session.jsonl").read_text().splitlines()]
+    reset = next(row for row in rows if "retained_manual_goal_pose_w" in row)
+    torch.testing.assert_close(torch.tensor(reset["retained_manual_goal_pose_w"][0][0]), edited[0])
+    torch.testing.assert_close(torch.tensor(reset["target"]["goal_pose_w"]), reset_goals)

@@ -102,7 +102,7 @@ def test_upper_g1_resolves_its_own_configs():
     assert env_cfg.actions.joint_pos.class_type.__name__ == "UpperJointPositionAction"
     assert env_cfg.rewards.joint_acc.func.__name__ == "joint_acc_l2_substeps"
     assert env_cfg.rewards.joint_acc.params == {"action_name": "joint_pos"}
-    assert env_cfg.rewards.target_speed.weight == -2.0e-3
+    assert env_cfg.rewards.target_speed.weight == -5.0e-3
     assert env_cfg.rewards.workspace_quality.weight == 0.2
     assert env_cfg.rewards.workspace_quality.func.__name__ == "workspace_quality_bonus"
     assert env_cfg.commands.wrist_pose.workspace_quality.position_tolerance_m == 0.05
@@ -176,7 +176,7 @@ def test_mobile_upper_owns_velocity_commands_and_upper_actions_and_uses_latest_l
     assert env.rewards.end_effector_acc.params == {"action_name": "joint_pos"}
     assert env.actions.joint_pos.acceleration_reference_body_name == env.commands.wrist_pose.reference_body_name
     assert env.actions.joint_pos.acceleration_body_names == env.commands.wrist_pose.body_names
-    assert env.rewards.target_speed.weight == -2.0e-3
+    assert env.rewards.target_speed.weight == -5.0e-3
     assert env.rewards.target_speed.params == {"action_name": "joint_pos", "soft_limit": 2.5}
     assert len(env.actions.joint_pos.joint_names) == 17
     assert not env.scene.robot.spawn.fix_root_link
@@ -282,7 +282,11 @@ def test_upper_cli_forwards_native_options_and_restores_backend(
     native = [*task_args, "--seed", "42", "env.scene.num_envs=4"]
     if action == "play":
         native.append("--train_env_cfg")
-    backend = SimpleNamespace(create_rsl_rl_runner=create_rsl_rl_runner)
+
+    def resolve_checkpoint(*_):
+        return None
+
+    backend = SimpleNamespace(create_rsl_rl_runner=create_rsl_rl_runner, _resolve_checkpoint=resolve_checkpoint)
 
     def run(argv):
         assert argv == native and sys.argv[1:] == native
@@ -307,6 +311,7 @@ def test_upper_cli_forwards_native_options_and_restores_backend(
         assert cli.main(args) == 0
     assert sys.argv is original_argv
     assert backend.create_rsl_rl_runner is create_rsl_rl_runner
+    assert backend._resolve_checkpoint is resolve_checkpoint
 
 
 @pytest.mark.parametrize(
@@ -485,15 +490,25 @@ def test_mobile_runner_keeps_frozen_parameters_outside_ppo_and_checks_model_iden
 
 
 def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_physical_remapping(tmp_path):
+    from g1.tasks.upper_limb_agent.checkpoint_observations import configure_checkpoint_observations
+    from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileActionsCfg, MobileObservationsCfg
+    from g1.tasks.upper_limb_agent.symmetry import FULL_OBS_TERMS, FULL_OBSERVATION_DIM, OBS_HISTORY, OBS_TERMS
+
     class MobileEnv(_UpperEnv):
         num_actions = 23
 
-        def __init__(self):
+        def __init__(self, width=109):
             super().__init__()
-            self.state = torch.zeros(self.num_envs, 109)
+            self.state = torch.zeros(self.num_envs, width)
             self.step_dt = 1 / 60
-            self.observation_manager = SimpleNamespace(group_obs_dim={"policy": (109,)})
-            from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileActionsCfg
+            self.observation_manager = SimpleNamespace(group_obs_dim={"policy": (width,)})
+            if width == FULL_OBSERVATION_DIM:
+                self.cfg.observations = MobileObservationsCfg()
+                self.observation_manager.active_terms = {"policy": [name for name, _ in FULL_OBS_TERMS]}
+                self.observation_manager.group_obs_term_dim = {
+                    "policy": [(length * OBS_HISTORY,) for _, length in FULL_OBS_TERMS]
+                }
+                self.observation_manager.group_obs_concatenate = {"policy": True}
 
             actions = MobileActionsCfg()
             self.command_cfg, self.height_cfg = actions.lower_command, actions.height_offset
@@ -558,6 +573,34 @@ def test_mobile_control_checkpoint_records_layout_rejects_legacy_and_physical_re
     torch.save(saved, legacy)
     with pytest.raises(ValueError, match="control interface mismatch"):
         runner.load(legacy)
+
+    full_env = MobileEnv(FULL_OBSERVATION_DIM)
+    full = create_task_runner(full_env, _agent(), str(tmp_path))
+    with pytest.raises(ValueError, match="fresh optimizer"):
+        full.load(checkpoint)
+    full.load(checkpoint, load_cfg={"actor": True, "critic": True, "optimizer": False, "iteration": True})
+    for model in ("actor", "critic"):
+        old_weights = getattr(runner.alg, model).state_dict()
+        new_weights = getattr(full.alg, model).state_dict()
+        for key in old_weights:
+            if key != "mlp.0.weight":
+                torch.testing.assert_close(new_weights[key], old_weights[key], rtol=0, atol=0)
+        old_blocks = old_weights["mlp.0.weight"].split([w for _, w in OBS_TERMS], -1)
+        old = dict(zip((n for n, _ in OBS_TERMS), old_blocks, strict=True))
+        full_blocks = new_weights["mlp.0.weight"].split([w * OBS_HISTORY for _, w in FULL_OBS_TERMS], -1)
+        for (name, width), block in zip(FULL_OBS_TERMS, full_blocks, strict=True):
+            frames = block.reshape(block.shape[0], OBS_HISTORY, width)
+            retained_width = old[name].shape[-1]
+            torch.testing.assert_close(frames[:, -1, :retained_width], old[name], rtol=0, atol=0)
+            assert not frames[:, :-1].any() and not frames[:, -1, retained_width:].any()
+    full_path = tmp_path / "full.pt"
+    full.save(full_path)
+    full.load(full_path)
+    cfg = SimpleNamespace(legacy_observations=False)
+    configure_checkpoint_observations(cfg, checkpoint)
+    assert cfg.legacy_observations
+    configure_checkpoint_observations(cfg, full_path)
+    assert not cfg.legacy_observations
     fixed = create_task_runner(_UpperEnv(), _agent(), evaluation=True)
     with pytest.raises(ValueError, match="mobile Upper"):
         fixed.load(checkpoint)

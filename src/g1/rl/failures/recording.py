@@ -10,6 +10,7 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
 from g1.tasks.upper_limb_agent.mdp.contacts import torso_force_samples
+from g1.tasks.upper_limb_agent.mdp.planar_targets import PLANAR_SAMPLING_GROUPS
 
 from .storage import TensorHistory, contact_statistics
 
@@ -71,7 +72,18 @@ def force_category(term, category):
 
 class FailureMiner:
     def __init__(
-        self, env, archive, partners, *, history_s, episodes, max_failures, switch_tracker=None, fixed_pairs=None
+        self,
+        env,
+        archive,
+        partners,
+        *,
+        history_s,
+        episodes,
+        max_failures,
+        switch_tracker=None,
+        fixed_pairs=None,
+        first_episode_only=False,
+        startup_s=None,
     ):
         self.env, self.archive, self.partners = env, archive, partners
         self.term = env.command_manager.get_term("wrist_pose")
@@ -86,8 +98,15 @@ class FailureMiner:
         self.substeps = env.cfg.decimation
         self.episodes, self.max_failures = episodes, max_failures
         self.history = TensorHistory(math.ceil(history_s / env.step_dt), env.num_envs)
+        self.startup_steps_remaining = math.ceil(startup_s / env.step_dt) if startup_s is not None else 0
+        self.startup_history = (
+            TensorHistory(self.startup_steps_remaining + 1, env.num_envs) if startup_s is not None else None
+        )
         self.switch_tracker = switch_tracker
         self.fixed_pairs = fixed_pairs
+        self.pending_first_episodes = (
+            torch.ones_like(self.term.planar_first_near_step, dtype=torch.bool) if first_episode_only else None
+        )
         self.elapsed_robot_s = 0.0
         self.unrecorded_completions = 0
 
@@ -100,21 +119,14 @@ class FailureMiner:
         if self.switch_tracker is not None:
             self.switch_tracker.reset(ids)
 
-    def capture(self):
-        if self.done:
-            return
+    def _motion_frame(self):
         env, term, robot = self.env, self.term, self.robot
-        data = self.sensor.data
-        pair = data.normal_force_matrix_w_history.torch[:, : self.substeps, 0].flip(1)
-        net = data.net_normal_forces_w_history.torch[:, : self.substeps, 0].flip(1)
-        if pair.shape[-2] != len(self.partners) or pair.shape[1] != self.substeps:
-            raise RuntimeError("Contact filter/history layout differs from the archived channel labels")
         origin = env.scene.env_origins
         poses = robot.data.body_link_pose_w.torch.clone()
         poses[..., :3] -= origin[:, None]
         goals = term.goal_pose_w.clone()
         goals[..., :3] -= origin[:, None]
-        frame = {
+        return {
             "time": term.episode_age_steps().float() * env.step_dt,
             "body_pose": poses,
             "joint_pos": robot.data.joint_pos.torch,
@@ -122,22 +134,66 @@ class FailureMiner:
             "goal_pose": goals,
             "action": env.action_manager.action,
             "lower_command": env.action_manager.get_term("joint_pos").lower_command,
+        }
+
+    def _capture_startup(self, motion, pair):
+        self.startup_history.push({**motion, "pair_force": pair, "station_error": self.term.planar_station_errors()})
+
+    def capture_startup_initial(self):
+        motion = self._motion_frame()
+        # The reset pose precedes any physics substeps for this episode.
+        shape = (self.env.num_envs, self.substeps, len(self.partners), 3)
+        self._capture_startup(motion, motion["body_pose"].new_full(shape, float("nan")))
+        return motion
+
+    def capture(self):
+        if self.done:
+            return
+        env, term = self.env, self.term
+        data = self.sensor.data
+        pair = data.normal_force_matrix_w_history.torch[:, : self.substeps, 0].flip(1)
+        net = data.net_normal_forces_w_history.torch[:, : self.substeps, 0].flip(1)
+        if pair.shape[-2] != len(self.partners) or pair.shape[1] != self.substeps:
+            raise RuntimeError("Contact filter/history layout differs from the archived channel labels")
+        motion = self._motion_frame()
+        if self.startup_steps_remaining > 0:
+            self._capture_startup(motion, pair)
+            self.startup_steps_remaining -= 1
+        frame = {
+            **motion,
             "pair_force": pair,
             "net_force": net,
             "termination_force_history": self.termination_sensor.data.net_normal_forces_w_history.torch[
                 :, :, self.torso_id
             ],
-            "contact_pos": data.contact_pos_w.torch[:, 0] - origin[:, None],
+            "contact_pos": data.contact_pos_w.torch[:, 0] - env.scene.env_origins[:, None],
         }
         self.history.push(frame)
+        goals, poses = motion["goal_pose"], motion["body_pose"]
         if self.switch_tracker is not None:
             arm_force, _ = torso_force_samples(env, None)
             self.switch_tracker.observe(goals, arm_force[:, : self.substeps].flip(1), env.reset_terminated)
-        self.elapsed_robot_s += env.num_envs * env.step_dt
+            if diagnostic := getattr(self.fixed_pairs, "diagnostic", None):
+                diagnostic.observe(
+                    poses[:, term.reference_body_idx],
+                    self.switch_tracker.previous_ready,
+                    self.switch_tracker.previous_contact,
+                    env.reset_terminated,
+                )
         ended = env.reset_terminated | env.reset_time_outs
+        active_envs = env.num_envs
+        if self.pending_first_episodes is not None:
+            ended &= self.pending_first_episodes
+            active_envs -= self.archive.completed
+        self.elapsed_robot_s += active_envs * env.step_dt
         if self.fixed_pairs is not None:
             ended &= self.fixed_pairs.trial_ids >= 0
-        ids = ended.nonzero().flatten().tolist()
+        ended_ids = ended.nonzero().flatten()
+        ids = ended_ids.tolist()
+        if ids:
+            # The recorder sees the terminal frame before the Mobile reset
+            # hook. The command's per-frame guard makes both reads safe.
+            term.collect_window_metrics(ended_ids)
         accepted = 0
         for index in ids:
             if self.done:
@@ -168,6 +224,14 @@ class FailureMiner:
             }
             if self.fixed_pairs is not None:
                 episode.update(self.fixed_pairs.metadata(index))
+            if episode["category"] == "planar":
+                first = int(term.planar_first_near_step[index])
+                episode.update(
+                    planar_sampling_group=PLANAR_SAMPLING_GROUPS[int(term.planar_sampling_group[index])],
+                    planar_entered_near=first >= 0,
+                    planar_first_near_s=first * env.step_dt if first >= 0 else None,
+                    planar_eval_pose_ready_fraction=float(term.episode_quality([index])[0]),
+                )
             trace = self.history.extract(index) if failed else None
             if trace is not None:
                 episode["contacts"] = contact_statistics(trace, self.partners, self.physics_dt)
@@ -180,6 +244,13 @@ class FailureMiner:
                 if self.switch_tracker is not None and episode["category"] == "regular"
                 else ()
             )
-            self.archive.add_episode(episode, trace, switches=switches)
+            startup_trace = (
+                self.startup_history.extract(index)
+                if self.startup_history is not None and episode.get("planar_sampling_group") == "wide"
+                else None
+            )
+            self.archive.add_episode(episode, trace, switches=switches, startup_trace=startup_trace)
             accepted += 1
+        if self.pending_first_episodes is not None and accepted:
+            self.pending_first_episodes[ended_ids[:accepted]] = False
         self.unrecorded_completions += len(ids) - accepted

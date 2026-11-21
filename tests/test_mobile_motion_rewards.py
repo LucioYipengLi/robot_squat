@@ -247,7 +247,10 @@ def test_mobile_retains_velocity_weights_and_enables_only_the_vertical_soft_base
         expected_weight = {"lower_command_overflow": -3e-4, "lower_command_magnitude": -0.05}.get(name, 0.0)
         assert cfg.weight == expected_weight and cfg.func is function
         assert getattr(mdp, function.__name__) is function
-        assert cfg.params == {"action_name": "lower_command" if name.startswith("lower_command") else "joint_pos"}
+        expected_params = {"action_name": "lower_command" if name.startswith("lower_command") else "joint_pos"}
+        if name == "lower_command_magnitude":
+            expected_params.update(command_name="wrist_pose", near_planar_gain=0.0, near_planar_threshold=0.5)
+        assert cfg.params == expected_params
         assert not hasattr(fixed, name)
     assert MobileActionsCfg().joint_pos.base_body_name == "pelvis"
     assert mobile.lower_command_rate.weight == -0.10 and mobile.action_rate.weight == -0.03

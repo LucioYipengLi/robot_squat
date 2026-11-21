@@ -1,7 +1,7 @@
 # Upper：平面迁移目标与距离时间预算
 
 适用任务：`Template-G1-Upper-Mobile-v0`。已完成目标生成、时间预算、逐环境超时、
-固定窗口评分、三类课程、实际时长日志和续训契约。远场引导奖励保留为下一模块。
+固定窗口评分、三类课程、实际时长日志、续训契约和可选远场引导奖励。
 
 ## 启用与当前边界
 
@@ -14,7 +14,7 @@ env.commands.wrist_pose.range_curriculum.advance=true
 ```
 
 基础比例为56%常规、24%高度、20%平面。训练时默认启用
-[自适应平面采样](UPPER_RANGE_CURRICULUM.md#平面任务自适应采样)，平面比例可增至40%，晋级恢复20%。
+[自适应平面采样](UPPER_RANGE_CURRICULUM.md#平面任务自适应采样)，平面比例可增至50%，晋级恢复20%。
 非平面回合按`height_task.probability=0.3`选择高度目标，手臂模式仍独立选择。
 平面任务没有额外降高偏移。各类别在每回合开始时确定。
 
@@ -28,13 +28,165 @@ play恢复检查点等级并冻结推进。已有按手臂模式记录的指标�
 uv run python -m g1.rl play --task Template-G1-Upper-Mobile-v0 --checkpoint "<checkpoint.pt>" --num_envs 8 --seed 42 --real-time --viz kit physics=isaacsim_physx env.episode_length_s=35 env.commands.wrist_pose.planar_task.probability=1.0 env.commands.wrist_pose.range_curriculum.advance=false env.commands.wrist_pose.range_curriculum.initial_level=0 env.commands.wrist_pose.range_curriculum.reset_on_load=true
 ```
 
-`initial_level=0`用于近距离验证，改为10可查看最终空间。当前模型的远距离表现不是本模块的验收指标；
-正式远距离训练的持续引导仍需接入远场奖励。将概率改回0时，若要恢复原训练时限，也应将`env.episode_length_s`改回10。
+`initial_level=0`用于近距离验证，改为10可查看最终空间。将概率改回0时，
+若要恢复原训练时限，也应将`env.episode_length_s`改回10。
+
+## 过渡场分组采样
+
+设置 `env.commands.wrist_pose.planar_task.transition_sampling.enabled=true` 开启。Level 0–3
+的平面回合都从站位距离至少 25 cm 处开局。距离是站位相对初始骨盆的水平径向距离。
+
+| 组别 | Level 0–3 的平面回合占比 | 距离 | 转角 |
+|---|---:|---|---|
+| `walk` | 75% | 25–40 cm | ±15° |
+| `turn` | 25% | 25–30 cm | 绝对角度下限 20°，上限为 Level 0–1 的 25°、Level 2–3 的 35°，左右等概率 |
+| `wide` | 0% | 25 cm 起，受原等级正方形及腕目标距离上限约束 | 原等级方位扇区 |
+
+从 Level 4 起，`wide` 按 25%、37.5%、50%、62.5%、75%、87.5%、100% 逐级增加。
+`turn` 沿用 v8 同一级的绝对比例，分别为 21.43%、17.86%、14.29%、10.71%、7.14%、3.57%、0%。
+其余平面回合抽 `walk`。`turn` 从 Level 4 起跟随同级 `wide` 的角度上限，Level 4–9
+依次为 45°、65°、90°、115°、140°、160°，距离保持 25–30 cm。Level 10 只有 `wide`。
+回合预算使用实际站位、目标朝向和该级 Lower 指令范围。
+
+用 `transition_sampling.turn_bearing_bridge=null` 恢复旧版固定的 20–25° 转角，
+再设 `transition_sampling.probability_knots=null` 可恢复 v8 原版组别比例。改变组内采样的旧 checkpoint
+续训需设置 `range_curriculum.reset_on_load=true`，并显式将 `initial_level` 设为所需起点。
+`failures mine` 默认恢复 checkpoint 的组内采样，指定 `--planar-sampling transition` 使用 v8 的统一分布做版本对照。
+
+训练日志的 `Metrics/wrist_pose/task/planar/<group>/` 记录已结束回合数、每 10 机器人秒失败频率、
+进入近场比例、首次入场时间及完整评价窗的腕部达标率。近场以骨盆距离和朝向同时达标为准。
+`failures mine` 在正常与失败的平面回合中均写入对应字段，并在 `summary.json` 汇总为 `planar_groups`。
+
+用同一个 v6 起点比较旧采样和新采样。两支都固定 Level 3、20% 平面比例、开启远场奖励，
+并从同一份网络和优化器重建课程统计：
+
+```bash
+checkpoint=logs/rsl_rl/g1_upper_mobile/2026-11-18_18-09-28/model_7999.pt
+for transition in false true; do
+  uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 \
+    --checkpoint "$checkpoint" --num_envs 4096 --seed 1217707953 \
+    --max_iterations 1200 --viz none --run_name "v6_l3_transition_$transition" physics=isaacsim_physx \
+    agent.mirror_augmentation=true \
+    env.commands.wrist_pose.range_curriculum.initial_level=3 \
+    env.commands.wrist_pose.range_curriculum.reset_on_load=true \
+    env.commands.wrist_pose.range_curriculum.advance=false \
+    env.commands.wrist_pose.range_curriculum.planar_sampling.enabled=false \
+    env.commands.wrist_pose.planar_approach.enabled=true \
+    env.commands.wrist_pose.planar_task.transition_sampling.enabled="$transition"
+done
+```
+
+从新采样的 checkpoint 续训或用 `play`、`teleop` 回放时，沿用该 run 的采样配置与 `initial_level`。常规续训省略
+`reset_on_load=true`，恢复已保存的 Level 和课程统计。
+失败采集会恢复训练时的采样设置。用下列命令评估两支时，分别替换 checkpoint 和输出路径，
+统一使用 Level 4 过渡场配置。同种子和环境数使首批目标一致，后续目标序列会随自动重置时机变化。
+
+```bash
+uv run python -m g1.rl failures mine --checkpoint "<model_9198.pt>" \
+  --level 4 --category planar --planar-sampling transition --policy_output mean --seed 42 \
+  --num_envs 256 --episodes 600 --max_failures 600 --output "<new-output-directory>"
+```
+
+## 远场接近奖励
+
+训练时设置 `env.commands.wrist_pose.planar_approach.enabled=true` 开启，默认关闭。
+所有改动仅作用于平面回合。站位残差取实际骨盆到目标站位的水平距离及目标朝向的最短角误差。
+
+| 项目 | 默认值 |
+|---|---|
+| 平移、转向进展权重 | +0.60、+0.30 |
+| 进展归一化参考速度 | 0.40 m/s、0.40 rad/s |
+| 平移、转向死区 | 0.20 m、15° |
+| 腕部跟踪倍率 | 远场 0.10，近场 1.00。距离 0.20–0.45 m 和角误差 15–45° 各自线性过渡 |
+| 活动臂肩肘姿态惩罚 | 权重 −0.25，偏离默认关节目标的容差 0.15 rad，尺度 0.50 rad，均方代价上限 2.0 |
+
+进展用相邻物理状态的死区外误差差分，除以控制周期和参考速度，再限制到 [−1, 1]。
+回合首步应用姿态代价与腕部倍率，进展从第二个物理样本开始计算。
+两个近场过渡因子的乘积决定腕部跟踪的恢复程度，也决定肩肘姿态代价的退坡程度。
+Q 奖励继续使用活动腕 5 cm 门槛，20 N 硬终止继续生效。
+
+从同一个 v6 检查点各续训 1200 轮，固定 Level 3 和基础 20% 平面概率：
+
+```bash
+checkpoint=logs/rsl_rl/g1_upper_mobile/2026-11-18_18-09-28/model_7999.pt
+for approach in false true; do
+  uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 \
+    --checkpoint "$checkpoint" --num_envs 4096 --seed 1217707953 \
+    --max_iterations 1200 --viz none --run_name "v6_l3_approach_$approach" physics=isaacsim_physx \
+    agent.mirror_augmentation=true \
+    env.commands.wrist_pose.range_curriculum.advance=false \
+    env.commands.wrist_pose.range_curriculum.planar_sampling.enabled=false \
+    env.commands.wrist_pose.planar_approach.enabled="$approach"
+done
+```
+
+训练日志含 `Episode_Reward/planar_approach` 和 `PlanarApproach/`，后者分别记录已结算平面回合的
+平移进展、转向进展、肩肘代价及进入近场的程度。对两个模型用相同种子的 Level 6 `planar mean`
+评估检查早期肩躯接触与存活，再结合完整评价窗的位姿达标指标确认到位情况。
+
+## 按目标几何交接给 Lower
+
+同时启用 `planar_approach.enabled` 和 `planar_approach.geometry_enabled`。前向 X 使用实时骨盆的水平朝向，
+以各活动腕的世界目标为输入。位于躯干宽度内的近处目标，在 `x ≤ +0.10 m` 时关闭该腕的位置与姿态跟踪奖励，
+到 `x = +0.14 m` 恢复到该几何规则允许的全量权重。横向在 0.10–0.14 m 之间放宽。
+距离超过 0.50 m 时逐渐降低腕部权重，0.75 m 起为 0.10，身后目标再随背向程度降低。
+平面任务的站位和朝向仍参与评价，腕部使用站位规则和目标几何规则中较小的倍率。Q 和到位稳定奖励使用活动腕中较小的倍率。
+
+身体进展用同一目标下连续两帧的实际位姿计算。贴身时缩小目标与前向可追踪区域的差距，远处或身后目标
+缩小水平距离或转向误差。已有平面站位时，优先奖励接近指定站位和朝向。换目标或改变进展度量的首帧跳过差分。
+
+移动阶段对活动臂肩肘偏离默认关节构型计代价，每只臂的归一化均方代价上限为 2.0。
+贴身让位时，构型代价在 0.25 秒内逐步给到当前门控对应的强度。
+下面的训练把构型权重从 −0.25 调到 −0.35。
+
+Mobile 的几何版默认另加腰部目标偏离代价，权重 −0.20，默认位死区 0.15 rad，归一化尺度
+0.50 rad，三轴均方代价上限 2.0。Planar 用实时骨盆与站位的朝向误差控制强度，15° 以内退出，
+15–30° 平滑增加。Regular 和 Height 用实时骨盆系内的活动腕目标决定是否需要转向。
+跨身、远侧或明显身后的目标可启用，贴身后撤和双腕转向需求冲突的场景保留原有让位逻辑。
+转向进展与腰部代价采用同一几何判断。`MobileApproach/waist_gate` 和
+`MobileApproach/waist_posture_penalty` 记录启用强度与代价，可用 `waist_posture_weight=0` 做对照。
+
+从新策略训练 30000 轮。下例延续单臂 35%、双臂 25% 的专项尝试率、镜像和近场 Lower 指令代价。
+
+```bash
+uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 \
+  --num_envs 4096 --seed 1217707953 --max_iterations 30000 \
+  --viz none --run_name upper_mobile_geometry_30k physics=isaacsim_physx \
+  agent.mirror_augmentation=true \
+  env.commands.wrist_pose.planar_task.transition_sampling.enabled=true \
+  env.commands.wrist_pose.planar_approach.enabled=true \
+  env.commands.wrist_pose.planar_approach.geometry_enabled=true \
+  env.commands.wrist_pose.planar_approach.blocked_x_m=0.10 \
+  env.commands.wrist_pose.planar_approach.arm_posture_weight=-0.35 \
+  env.rewards.lower_command_magnitude.params.near_planar_gain=4.0 \
+  env.commands.wrist_pose.regular_retract_sampling.probability=0.35 \
+  env.commands.wrist_pose.regular_retract_sampling.dual_probability=0.25
+```
+
+`MobileApproach/` 记录平移和转向进展、姿态代价、腕部倍率，以及贴身门控和远场帧占比。
+评估时一起看固定回收用例的硬碰撞和稳定到位、原生 Regular 的失败率，以及 1.2 m 目标的移动与携臂姿态。
+
+## 入场后的 Lower 指令代价
+
+训练命令加入以下覆盖项，可单独启用该代价。默认 `gain=0.0`。
+
+```text
+env.rewards.lower_command_magnitude.params.near_planar_threshold=0.5
+env.rewards.lower_command_magnitude.params.near_planar_gain=4.0
+```
+
+平面回合首次进入近场后，对实际发给 Lower 的 `vy` 和 `wz` 计算
+`max(abs(u) - threshold, 0)^2`，其中 `u` 是指令除以本回合相应符号的最大幅度。
+两个轴的额外代价乘 `gain` 后并入原有 `lower_command_magnitude`，权重仍为 −0.05。
+示例参数下，两轴同时顶格的额外奖励为 −0.10，RewardManager 再乘控制周期。
+用普通平面采集评估策略自身表现，例如 `--level 4 --category planar --planar-sampling transition`。
+训练日志的 `Metrics/wrist_pose/task/planar/near_lower/` 给出已结算回合入场后两轴超阈值的帧比例。
+结合首次入场时间、入场后失败比例以及完整评价窗腕部达标率比较开关两组。
 
 ## 空间与朝向
 
 作业站位相对初始盆骨的水平朝向系采样。最终X／Y各为±2.5 m，即5 m × 5 m；
-0级各为±0.25 m。目标方位由0级正前方±30°扩至10级全方向±180°，按回合所属等级线性插值。
+默认等级表从 0 级的 ±0.10 m 和 ±10° 开始，到 10 级的 ±2.5 m 和 ±180°，中间范围由等级节点定义。
 无课程时使用最终范围。
 
 先按现有单手／双手几何生成局部腕目标，再将整组目标绕初始盆骨作共享水平转向，
@@ -104,7 +256,7 @@ d < v²/a：T = 2 × sqrt(d/a)
 
 ## 兼容性与验证
 
-平面概率为0时不增加目标采样随机数，超时回退到原固定时限；动作／观测仍为23／109。
+平面概率为 0 时不增加目标采样随机数，超时回退到固定时限。动作和观测布局由 [Mobile 接口](UPPER_RANGE_CURRICULUM.md#快速使用) 配置。
 启用后的空间、时间参数及控制步长写入课程契约。课程状态升级为schema 2，包含三类质量、失败次数和实际存活时间。
 本次修改前的检查点需显式`reset_on_load=true`重建课程统计，包含未开启平面任务的旧两类检查点。
 物理上限、奖励及冻结Lower执行代码不随本模块修改。

@@ -8,7 +8,7 @@ Lower负责双腿执行和反馈平衡，权重冻结，不进入Upper的PPO优�
 
 网络输出23维：`[vx, vy, yaw, height, pelvis_x, pelvis_y, upper_joints × 17]`。
 Lower桥接指令顺序为 `[height, vx, vy, yaw, pelvis_x, pelvis_y]`；其历史观测650维，腿部动作12维。
-Upper观测109维：原93维上肢观测、10维基座状态、6维实际生效的Lower指令。
+Upper 默认使用 660 维历史观测，每步 132 维。关节位置和速度各覆盖腰、臂、腿 29 轴。六维有效 Lower 指令也是观测的一部分。
 
 速度采用基座坐标系，高度相对默认根高度0.75 m；骨盆XY偏移相对于双踝中点、双脚平均水平朝向，
 它描述骨盆位置，未计算整机质量加权质心。
@@ -85,9 +85,7 @@ artifacts/workspace_quality.npz
 搬移后可将checkpoint_path指向归档Lower。只导出的Upper网络不包含Lower及动作处理；
 部署需同时保留两层模型、历史观测、物理单位映射和有效指令处理。
 
-H5C及此前21动作／107观测Mobile模型与新23／109接口不同，直接加载会在恢复权重前给出错误。
-当前控制契约为schema 4；A1的schema 3具有相同维数但不同映射，当前项目入口同样拒绝加载。
-新接口从头训练；固定底座17／93接口保持原样。`teleop/eval`目前仍只支持Lower任务。
+Mobile 的 21 动作／107 观测和 A1 schema 3 检查点需要匹配各自的历史控制接口。schema 4 的 109 维布局支持旧策略回放及权重迁移，详见 [Upper 范围课程](UPPER_RANGE_CURRICULUM.md#快速使用)。
 
 ## 验证入口
 

@@ -1,5 +1,6 @@
 """World-fixed bimanual commands, mode-aware rewards and local default-state resets."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -8,10 +9,11 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_from_euler_xyz, quat_mul
 
-from g1.tasks.upper_limb_agent.mdp.actions import UPPER_BODY_JOINT_NAMES
+from g1.tasks.upper_limb_agent.mdp.actions import UPPER_BODY_JOINT_NAMES, WAIST_JOINT_NAMES, UpperJointPositionAction
 from g1.tasks.upper_limb_agent.mdp.commands import BimanualPoseCommand, BimanualPoseCommandCfg
 from g1.tasks.upper_limb_agent.mdp.events import reset_robot_joints
 from g1.tasks.upper_limb_agent.mdp.observations import active_arms, end_effector_pose, end_effector_pose_error
+from g1.tasks.upper_limb_agent.mdp.planar_approach import PlanarApproachCfg
 from g1.tasks.upper_limb_agent.mdp.rewards import (
     end_effector_orientation_tracking,
     end_effector_position_tracking,
@@ -100,7 +102,215 @@ def test_default_wrist_anchor_world_goal_and_pelvis_observations_agree(pose_comm
     position_error, orientation_error = term.pose_error()
     torch.testing.assert_close(position_error, torch.zeros(3, 2), atol=1e-6, rtol=0)
     torch.testing.assert_close(orientation_error, torch.zeros(3, 2), atol=1e-6, rtol=0)
+
+
+def test_planar_approach_blends_position_and_orientation_only_for_planar_episodes(pose_command):
+    term = pose_command
+    term._env.common_step_counter = 1
+    term.cfg.planar_approach = PlanarApproachCfg(enabled=True)
+    term.planar_task_mask[:] = torch.tensor([True, True, False])
+    pelvis = term.robot.data.body_link_pose_w.torch[:, term.reference_body_idx]
+    zeros = torch.zeros(3)
+    pelvis[:, 3:] = quat_from_euler_xyz(zeros, zeros, torch.tensor([-math.pi + 0.1, 0.0, 0.0]))
+    term._sampling_quat_w[:] = quat_from_euler_xyz(zeros, zeros, torch.tensor([math.pi - 0.1, 0.0, 0.0]))
+    term._sampling_yaw_w[:] = torch.tensor([math.pi - 0.1, 0.0, 0.0])
+    term.planar_heading_rad[:] = torch.tensor([0.2 + math.radians(30), math.radians(60), 0.0])
+    term.planar_station_w.copy_(pelvis[:, :3])
+    term.planar_station_w[:, 0] += torch.tensor([0.325, 0.10, 1.0])
+    errors, near = term.planar_approach_geometry()
+    torch.testing.assert_close(errors[:, 1], torch.tensor([math.radians(30), math.radians(60), 0.0]))
+    torch.testing.assert_close(near, torch.tensor([0.25, 0.0, 0.0]), atol=1e-6, rtol=0)
+
+    for tracking in (
+        lambda: end_effector_position_tracking(term._env, "wrist_pose", 0, 0.1, 0.01, 0.4),
+        lambda: end_effector_orientation_tracking(term._env, "wrist_pose", 0, 0.1, 0.015, 0.4),
+    ):
+        scaled = tracking()
+        term.cfg.planar_approach.enabled = False
+        original = tracking()
+        term.cfg.planar_approach.enabled = True
+        torch.testing.assert_close(scaled, original * torch.tensor([0.325, 0.1, 1.0]), atol=1e-6, rtol=0)
+
+
+def test_planar_approach_rewards_signed_motion_and_resets_each_environment(pose_command):
+    from isaaclab.managers import RewardManager
+
+    from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileRewardsCfg
+
+    term = pose_command
+    env = term._env
+    env.common_step_counter = 1
+    env.max_episode_length_s = 10
+    env.extras = {}
+    env.sim.is_playing = lambda: True
+    term.cfg.planar_approach = PlanarApproachCfg(enabled=True)
+    term.planar_task_mask[:] = torch.tensor([True, True, False])
+    term.mode_id.fill_(0)
+    pelvis = term.robot.data.body_link_pose_w.torch[:, term.reference_body_idx]
+    zeros = torch.zeros(3)
+    pelvis[:, 3:] = quat_from_euler_xyz(zeros, zeros, zeros)
+    term._sampling_quat_w.copy_(pelvis[:, 3:])
+    term._sampling_yaw_w.zero_()
+    term.planar_station_w.copy_(pelvis[:, :3])
+    term.planar_station_w[:, 0] += 0.6
+    term.planar_heading_rad.fill_(0.7)
+
+    action = UpperJointPositionAction.__new__(UpperJointPositionAction)
+    action._joint_names = list(reversed(UPPER_BODY_JOINT_NAMES))
+    joint_ids = term.robot.find_joints(action._joint_names, preserve_order=True)[0]
+    action._processed_actions = term.robot.data.default_joint_pos.torch[:, joint_ids].clone()
+    action._processed_actions[:, action._joint_names.index("left_shoulder_yaw_joint")] += 0.65
+    action._processed_actions[:, action._joint_names.index("right_elbow_joint")] += 3.0
+    env.action_manager = SimpleNamespace(get_term=lambda _: action)
+    cfg = MobileRewardsCfg().planar_approach
+    manager = RewardManager({"planar_approach": cfg}, env)
+    torch.testing.assert_close(manager.compute(env.step_dt) / env.step_dt, torch.tensor([-0.0625, -0.0625, 0.0]))
+
+    env.common_step_counter += 1
+    pelvis[:, 0] += 0.2 * env.step_dt
+    pelvis[:, 3:] = quat_from_euler_xyz(zeros, zeros, zeros + 0.2 * env.step_dt)
+    torch.testing.assert_close(
+        manager.compute(env.step_dt) / env.step_dt, torch.tensor([0.3875, 0.3875, 0.0]), atol=3e-5, rtol=0
+    )
+    manager.reset(torch.tensor([0]))
+    env.common_step_counter += 1
+    pelvis[:, 0] -= 0.2 * env.step_dt
+    torch.testing.assert_close(
+        manager.compute(env.step_dt) / env.step_dt, torch.tensor([-0.0625, -0.3625, 0.0]), atol=3e-5, rtol=0
+    )
     torch.testing.assert_close(end_effector_pose_error(term._env, "wrist_pose"), torch.zeros(3, 12), atol=1e-6, rtol=0)
+
+
+def test_mobile_approach_gates_each_wrist_in_the_live_horizontal_pelvis_frame(pose_command):
+    term = pose_command
+    env = term._env
+    env.common_step_counter = 1
+    term.cfg.planar_approach = PlanarApproachCfg(enabled=True, geometry_enabled=True)
+    term.height_task_mask[1] = True
+    term.mode_id[:] = torch.tensor([2, 0, 0])
+    pelvis = term.robot.data.body_link_pose_w.torch[:, term.reference_body_idx]
+    targets = torch.tensor(
+        [
+            [[0.09, 0.04, 0.20], [0.09, -0.18, 0.00]],
+            [[0.12, 0.04, -0.10], [0.0, 0.0, 0.0]],
+            [[-1.20, 0.0, 0.20], [0.0, 0.0, 0.0]],
+        ]
+    )
+    term.goal_pose_w[..., :3] = pelvis[:, None, :3] + quat_apply(pelvis[:, None, 3:], targets)
+    torch.testing.assert_close(term.wrist_reward_scale, torch.tensor([[0.0, 1.0], [0.5, 1.0], [0.0, 1.0]]))
+    torch.testing.assert_close(term.wrist_bonus_scale, torch.tensor([0.0, 0.5, 0.0]))
+    assert term.wrist_reward_scale is term.wrist_reward_scale
+    assert term.wrist_bonus_scale is term.wrist_bonus_scale
+
+    # The regular reward gate acts on both wrist position and wrist orientation.
+    position = end_effector_position_tracking(env, "wrist_pose", 0, 0.1, 0.01, 0.4)
+    orientation = end_effector_orientation_tracking(env, "wrist_pose", 0, 0.1, 0.015, 0.4)
+    assert position[0] == orientation[0] == 0
+    torch.testing.assert_close(
+        term.goal_pose_w[..., :3], pelvis[:, None, :3] + quat_apply(pelvis[:, None, 3:], targets)
+    )
+    old_scale = term.wrist_reward_scale
+    term.reset(torch.tensor([0]))
+    assert term.wrist_reward_scale is not old_scale
+    torch.testing.assert_close(term.wrist_reward_scale[1:], old_scale[1:])
+
+
+def test_mobile_approach_rewards_retreat_and_penalizes_far_joint_deviation(pose_command):
+    from isaaclab.managers import RewardManager
+
+    from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileRewardsCfg
+
+    term = pose_command
+    env = term._env
+    env.common_step_counter = 1
+    env.max_episode_length_s = 10
+    env.extras = {}
+    env.sim.is_playing = lambda: True
+    term.cfg.planar_approach = PlanarApproachCfg(enabled=True, geometry_enabled=True, arm_posture_weight=-0.35)
+    term.mode_id.fill_(0)
+    poses = term.robot.data.body_link_pose_w.torch
+    pelvis = poses[:, term.reference_body_idx]
+    offsets = torch.tensor([[0.08, 0.04, 0.0], [1.20, 0.0, 0.0], [0.30, 0.16, 0.0]])
+    forward = quat_apply(pelvis[:, 3:], torch.tensor([1.0, 0.0, 0.0]))
+    term.goal_pose_w[:, 0, :3] = pelvis[:, :3] + quat_apply(pelvis[:, 3:], offsets)
+    poses[1, term.body_indices[0], 2] += 0.25
+    action = UpperJointPositionAction.__new__(UpperJointPositionAction)
+    action._joint_names = list(UPPER_BODY_JOINT_NAMES)
+    joint_ids = term.robot.find_joints(action._joint_names, preserve_order=True)[0]
+    action._processed_actions = term.robot.data.default_joint_pos.torch[:, joint_ids].clone()
+    env.action_manager = SimpleNamespace(get_term=lambda _: action)
+    manager = RewardManager({"planar_approach": MobileRewardsCfg().planar_approach}, env)
+
+    torch.testing.assert_close(term.wrist_reward_scale[:, 0], torch.tensor([0.0, 0.1, 1.0]))
+    torch.testing.assert_close(manager.compute(env.step_dt), torch.zeros(3))
+    env.common_step_counter += 1
+    action._processed_actions[1, action._joint_names.index("left_shoulder_pitch_joint")] += 1.15
+    pelvis[0, :3] -= forward[0] * (0.2 * env.step_dt)
+    pelvis[1, :3] += forward[1] * (0.2 * env.step_dt)
+    torch.testing.assert_close(
+        manager.compute(env.step_dt) / env.step_dt, torch.tensor([0.30, -0.05, 0.0]), atol=1e-4, rtol=0
+    )
+    env.common_step_counter += 1
+    term.goal_pose_w[0, 0, :3] += forward[0] * 0.2
+    # Resampling into an easier target contributes no apparent physical progress.
+    assert manager.compute(env.step_dt)[0] == 0
+    manager.reset(torch.tensor([0, 1, 2]))
+    assert env.extras["log"]["MobileApproach/posture_penalty"] < 0
+
+
+def test_waist_turn_geometry_preserves_near_reaching_and_bimanual_clearance():
+    cfg = PlanarApproachCfg(waist_posture_weight=-0.2)
+    xy = torch.tensor(
+        [
+            [[0.30, -0.25], [0.0, 0.0]],  # Left rolls across the midline.
+            [[0.30, 0.25], [0.0, 0.0]],  # Ordinary ipsilateral reach.
+            [[-0.08, 0.04], [0.0, 0.0]],  # Retreat for a close central target.
+            [[-0.70, 0.15], [0.0, 0.0]],  # Turn toward a rear target.
+            [[0.30, -0.25], [0.30, 0.30]],  # Wrists favor opposite turns.
+            [[0.30, 0.0], [0.30, 0.25]],  # Both wrists permit the same turn.
+        ]
+    )
+    active = torch.tensor([[1, 0]] * 4 + [[1, 1]] * 2, dtype=torch.bool)
+    wrists = cfg.wrist_geometry(xy, active)
+    turned = torch.tensor([True, False, False, True, False, True])
+    torch.testing.assert_close(wrists.waist_gate > 0, turned)
+    torch.testing.assert_close(wrists.errors[:, 1] > 0, turned)
+    assert wrists.errors[2, 0] > 0
+    torch.testing.assert_close(
+        cfg.waist_heading_gate(torch.deg2rad(torch.tensor([10.0, 15.0, 22.5, 30.0, 45.0]))),
+        torch.tensor([0.0, 0.0, 0.5, 1.0, 1.0]),
+    )
+
+
+def test_waist_reward_applies_to_planar_and_height_when_turning_is_needed(pose_command):
+    from isaaclab.managers import RewardManager
+
+    from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import MobileRewardsCfg
+
+    term = pose_command
+    env = term._env
+    env.common_step_counter = 1
+    env.max_episode_length_s = 10
+    env.extras = {}
+    env.sim.is_playing = lambda: True
+    term.cfg.planar_approach = PlanarApproachCfg(enabled=True, geometry_enabled=True, waist_posture_weight=-0.2)
+    term.mode_id.fill_(0)
+    term.planar_task_mask[0] = True
+    term.planar_heading_rad[0] = math.radians(35)
+    term.height_task_mask[1] = True
+    pelvis = term.robot.data.body_link_pose_w.torch[:, term.reference_body_idx]
+    wrist_goals = torch.tensor([[0.30, 0.15, 0.20], [0.30, -0.25, -0.10], [0.30, 0.25, 0.0]])
+    term.goal_pose_w[:, 0, :3] = pelvis[:, :3] + quat_apply(pelvis[:, 3:], wrist_goals)
+    action = UpperJointPositionAction.__new__(UpperJointPositionAction)
+    action._joint_names = list(UPPER_BODY_JOINT_NAMES)
+    joint_ids = term.robot.find_joints(action._joint_names, preserve_order=True)[0]
+    action._processed_actions = term.robot.data.default_joint_pos.torch[:, joint_ids].clone()
+    action._processed_actions[:, : len(WAIST_JOINT_NAMES)] += 0.65
+    env.action_manager = SimpleNamespace(get_term=lambda _: action)
+    manager = RewardManager({"planar_approach": MobileRewardsCfg().planar_approach}, env)
+    torch.testing.assert_close(manager.compute(env.step_dt) / env.step_dt, torch.tensor([-0.20, -0.20, 0.0]))
+    manager.reset(torch.arange(3))
+    assert env.extras["log"]["MobileApproach/waist_gate"] == pytest.approx(2 / 3)
 
 
 def test_pose_error_observation_has_signed_pelvis_vectors_and_matches_reward_error_norms(pose_command):

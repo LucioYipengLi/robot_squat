@@ -64,6 +64,75 @@ uv run python -m g1.rl failures view --run outputs/failures/planar_mean
 默认打开`http://127.0.0.1:8765`。通过远程IDE使用时转发8765端口，并加`--no_browser`；
 `--port 8766`可以更改端口。服务只绑定本机地址，Ctrl+C关闭服务。
 
+## 平面近场 Lower 指令诊断
+
+用同一检查点、种子和环境数各运行一组。诊断模式按 `--num_envs` 收集每个环境的首个回合，
+以 `env_id` 对齐目标与手臂模式。同一批目标可用不同的侧移和转向上限评估。
+
+```bash
+checkpoint=logs/rsl_rl/g1_upper_mobile/2026-11-19_00-28-13/model_29999.pt
+for scale in 1.0 0.5; do
+  uv run python -m g1.rl failures mine --checkpoint "$checkpoint" \
+    --level 4 --category planar --planar-sampling transition --policy_output mean \
+    --seed 42 --num_envs 512 --planar-near-lower-scale "$scale" \
+    --output "outputs/failures/v7_29999_l4_near_lower_${scale}" || break
+done
+```
+
+`1.0`沿用原始动作，`0.5`从首次满足骨盆站位误差 20 cm 和朝向误差 15° 的下一控制步起，
+将侧移和转向限制在该回合范围的 50%，直到重置。Level 4 对应 ±0.049 m/s 和 ±0.19 rad/s。
+其余动作沿用策略输出。`run.json`保存倍率，`summary.json`的`planar_groups`给出入场比例、
+入场后失败比例和完整评价窗腕部达标率。用`episodes.jsonl`按`env_id`对照两组首批目标。
+
+## 平面大角度启动双臂保持对照
+
+先使用 `--planar-startup`、`--planar-sampling transition` 和 `--policy_output mean` 采集原策略。
+每个环境保留首个回合，`startup/` 保存所有 `wide` 用例的初始帧和前 0.2 秒轨迹。
+将原采集目录交给 `--planar-hold-from`，沿用 checkpoint、等级、种子和并行环境数。
+
+```bash
+baseline=outputs/failures/v8_l4_wide_startup_20261120_144026
+checkpoint=logs/rsl_rl/g1_upper_mobile/2026-11-19_23-59-12_upper_mobile_geometry_30k/model_29999.pt
+output="outputs/failures/v8_l4_wide_hold_$(date +%Y%m%d_%H%M%S)"
+
+uv run python -m g1.rl failures mine \
+  --task Template-G1-Upper-Mobile-v0 --checkpoint "$checkpoint" \
+  --level 4 --category planar --planar-sampling transition \
+  --policy_output mean --seed 42 --num_envs 256 \
+  --planar-hold-from "$baseline" --output "$output"
+```
+
+对照选取全部 `wide` 失败用例，以及至少一只活动手的目标跨过初始骨盆中线 10 cm 的通过用例。
+每个用例按 `env_id` 核对重置姿态和目标。前 0.2 秒保持两条手臂的初始关节参考，重放原记录的
+Lower 和腰部动作。原记录提前终止时，沿用最后一帧指令直到保持期结束，然后交回完整策略。
+
+`summary.json` 的 `planar_hold.by_env_id` 报告共同窗口内两组的最大骨盆反转角、肩部及整条手臂
+对躯干的接触峰值、是否超过硬接触阈值，以及保持组释放后的首次入场与位姿达标率。
+`covered_baseline_window` 和 `lower_and_waist_replay_match` 均为真时，才计入可比用例。
+常规 `summary.json` 的回合总数仍覆盖原始并行批次，干预用例的统计见 `planar_hold`。
+
+### 腰部与双臂同时保持
+
+用 `--planar-hold-waist-from` 指向已完成的双臂保持运行。命令从该归档找到原始 v8 启动轨迹，
+沿用相同用例和原始 Lower 指令，前 0.2 秒保持腰部与双臂关节的初始参考，然后恢复完整策略。
+
+```bash
+arm_hold=outputs/failures/v8_l4_wide_hold_20261120_145850
+checkpoint=logs/rsl_rl/g1_upper_mobile/2026-11-19_23-59-12_upper_mobile_geometry_30k/model_29999.pt
+output="outputs/failures/v8_l4_wide_waist_hold_$(date +%Y%m%d_%H%M%S)"
+
+uv run python -m g1.rl failures mine \
+  --task Template-G1-Upper-Mobile-v0 --checkpoint "$checkpoint" \
+  --level 4 --category planar --planar-sampling transition \
+  --policy_output mean --seed 42 --num_envs 256 \
+  --planar-hold-waist-from "$arm_hold" --output "$output"
+```
+
+`summary.json` 的 `planar_hold.comparison_group` 为 `arms_only`。
+`by_env_id` 下的 `baseline` 是仅保持双臂的结果，`hold` 是同时保持腰部和双臂的结果，
+两侧统计到各自轨迹共同覆盖的时刻。`lower_replay_match` 核对该窗口内的 Lower 输入，
+保持期内终止、释放后终止和完成跟踪分别计数。
+
 ## Regular 切换评估
 
 `--category regular` 和 `--category mixed` 自动统计已接收回合中的每次常规目标切换，含安全完成的切换。
@@ -84,6 +153,120 @@ uv run python -m g1.rl failures mine \
 - 方向使用初始骨盆轴。任一活动手向后移动至少 3 cm 归为`retract`，其余中任一手向前移动至少 3 cm 归为`forward`。其余情况下，任一手的侧移达到 3 cm 且不少于该手的高度变化时归为`lateral`。位移分档用活动手中最大的三维目标跳变量。
 - 接触统计使用切换后物理子步上的逐臂/手通道法向力模长之和，分别报告大于 1 N 和大于硬终止阈值的比例。窗口提前结束时，已观察到的事件进入分子和分母，其他观察不足的结果记为`null`。新目标到位统计把 1 秒内到位前物理终止计作失败，提前超时且尚未到位的结果记为`null`。各比例的分母见`assessed`。
 - 回合起始目标单独计数。`regular_failures_before_first_switch`表示首次换目标前就终止的 regular 回合数。整体每10机器人秒的失败频率仍在`failure_per_10s_by_category.regular`。
+
+### 回收专项训练与对照
+
+训练命令加 `env.commands.wrist_pose.regular_retract_sampling.probability=0.35`，在 regular
+单臂回合的目标刷新时，以 35% 概率尝试定向回收。默认概率为 0。专项从当前 Level 的原生位置范围
+有限次抽取候选，接受初始骨盆坐标系的向后位移至少 3 cm、三维跳变 5–12 cm 的位置。
+抽不到候选时采用本次原生采样结果。方向和距离使用相邻两个指令目标。
+训练日志 `Metrics/wrist_pose/task/regular/retract_sampling/` 记录单臂刷新数、尝试数、命中数、回退数和实际回收比例。
+
+开启专项后，checkpoint 会记录采样配置。从旧分布切到新分布续训时，用 `range_curriculum.reset_on_load=true`
+重建课程统计，并用保存的目标等级作为新的 `initial_level`。评估载入时会恢复训练采样，
+加入 `--regular-sampling native` 可在恢复后关闭单双臂专项并使用原生刷新。比较整体能力时，在两组都指定 `native`。
+`run.json` 会同时记录 checkpoint 的单双臂专项概率和评估使用的概率。
+
+固定回收目标对可从已有 `regular` 评估生成。下例从每个距离档采 50 对，左右镜像各执行一次。
+
+```bash
+uv run python -m g1.rl failures pairs \
+  --run outputs/failures/regular_l3_v7_29999_mean --suite retract --per-bin 50 --regressions 0 \
+  --output outputs/failures/regular_l3_retract_pairs.json
+
+uv run python -m g1.rl failures mine \
+  --checkpoint "<checkpoint.pt>" --category regular --policy_output mean --seed 42 \
+  --switch_pairs outputs/failures/regular_l3_retract_pairs.json --num_envs 200 \
+  --output outputs/failures/regular_l3_retract_eval
+```
+
+在 `switch_pair_evaluation.by_group` 按 5–8 和 8–12 cm 比较两侧的 0.2 秒硬接触率和 1 秒内到位率。
+
+### 双臂回收专项加密
+
+`env.commands.wrist_pose.regular_retract_sampling.dual_probability=0.25` 让 regular 双臂回合从第二个目标起，
+每次刷新以 25% 的概率尝试双臂回收。该参数默认为 0。以初始骨盆轴衡量，两腕目标都需后移至少 3 cm，
+且两腕中较大的三维跳变需落在 `[8, 12)` cm。每次尝试最多从当前 Level 的双腕原生分布抽取 16 对完整候选，
+保留同一对的双手位置和姿态。未命中时使用本次原生目标对。训练日志
+`Metrics/wrist_pose/task/regular/dual_retract_sampling/` 中的 `switches`、`attempts`、`hits`、`fallbacks`
+分别表示双臂刷新数、专项尝试数、命中数、回退数。`retract_fraction` 统计实际两手均后移至少 3 cm 的刷新比例，
+包含原生采样命中的回收和各距离档。
+
+从同一 checkpoint 各续训 1200 轮，固定 Level 3、20% 平面和 35% 单臂专项，只改变双臂专项尝试率。
+
+```bash
+checkpoint=logs/rsl_rl/g1_upper_mobile/2026-11-19_15-03-43_v7_from5000_near_lower_retract_8k/model_12999.pt
+for dual_probability in 0.0 0.25; do
+  uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 \
+    --checkpoint "$checkpoint" --num_envs 4096 --seed 1217707953 --max_iterations 1200 \
+    --viz none --run_name "l3_dual_retract_$dual_probability" physics=isaacsim_physx \
+    agent.mirror_augmentation=true \
+    env.commands.wrist_pose.range_curriculum.initial_level=3 \
+    env.commands.wrist_pose.range_curriculum.reset_on_load=true \
+    env.commands.wrist_pose.range_curriculum.advance=false \
+    env.commands.wrist_pose.range_curriculum.planar_sampling.enabled=false \
+    env.commands.wrist_pose.planar_approach.enabled=true \
+    env.commands.wrist_pose.planar_task.transition_sampling.enabled=true \
+    env.rewards.lower_command_magnitude.params.near_planar_gain=4.0 \
+    env.commands.wrist_pose.regular_retract_sampling.probability=0.35 \
+    env.commands.wrist_pose.regular_retract_sampling.dual_probability="$dual_probability"
+done
+```
+
+固定评估从已有原生 regular 记录提取两个距离档，分别检查训练档 8–12 cm 和 12 cm 及以上的泛化。
+每个用例在同一回合执行一次，跟踪旧目标 4 秒后同时切换双腕，观察 1 秒。
+
+```bash
+uv run python -m g1.rl failures pairs \
+  --run outputs/failures/v7_resume_compare_20261119_183442/new_regular_l3 \
+  --suite dual_retract --per-bin 50 --regressions 0 \
+  --output outputs/failures/regular_l3_dual_retract_pairs.json
+
+uv run python -m g1.rl failures mine \
+  --checkpoint "<checkpoint.pt>" --category regular --policy_output mean --seed 42 --num_envs 100 \
+  --switch_pairs outputs/failures/regular_l3_dual_retract_pairs.json \
+  --output "<new-output-directory>"
+```
+
+在 `switch_pair_evaluation.by_group` 对比切换后 0.2 秒内的 `early_hard_contacts / contact_assessed`、
+1 秒内双腕的 `reached_within_1s / reach_assessed` 和切换前失败数 `failed_before_switch`。
+
+### 固定终点的后撤诊断
+
+同一 checkpoint、固定目标对和种子分别运行 `direct`、`hold`、`retreat`。三个模式先跟踪原目标 4 秒，
+再分别直接切换、保持上肢关节参考 0.60 秒、保持上肢参考同时让 Lower 后撤 0.60 秒。两种保持模式沿用
+干预开始时的高度指令，侧移、转向和骨盆站立偏移置零。后撤请求取当前 Level 的负向速度上限，骨盆实际后退
+达到 5 cm 后将速度指令置零，直到相同的释放时刻。随后交回策略并发布同一个世界坐标终点。每组都观察释放后的 1 秒。
+
+下例选择六个目标点落入切换前躯干碰撞凸包的用例，再加两个目标点在凸包外但发生过碰撞的对照。
+样本来自历史失败，用于诊断原因。实际后撤量沿干预开始时的骨盆水平前向测量。
+
+```bash
+checkpoint=logs/rsl_rl/g1_upper_mobile/2026-11-19_19-30-49_v7_from5000_near_lower_dual_retract_8k/model_12999.pt
+suite=outputs/failures/v7_dual_retract_12999_l3_20261119_225455/dual_retract_pairs.json
+output="outputs/failures/v7_retract_retreat_$(date +%Y%m%d_%H%M%S)"
+cases=(
+  dual_retract_12cm_and_over-9-2
+  dual_retract_12cm_and_over-277-1
+  dual_retract_12cm_and_over-485-1
+  dual_retract_12cm_and_over-1895-3
+  dual_retract_8_to_12cm-1026-1
+  dual_retract_12cm_and_over-777-1
+  dual_retract_8_to_12cm-514-1
+  dual_retract_8_to_12cm-1294-1
+)
+for mode in direct hold retreat; do
+  uv run python -m g1.rl failures mine \
+    --checkpoint "$checkpoint" --level 3 --category regular --policy_output mean --seed 42 \
+    --num_envs 8 --switch_pairs "$suite" --switch-cases "${cases[@]}" \
+    --switch-diagnostic "$mode" --output "$output/$mode" || break
+done
+```
+
+在 `summary.json` 的 `switch_pair_evaluation.by_pair` 对齐同一用例，核对
+`pelvis_retreat_at_switch_m`、`contact_over_hard_threshold` 和 `stable_last_0p2s`。最后一项要求
+双腕在回合结束前连续 0.2 秒满足位姿容差。这批用例的分母以全部已执行回合为准，同时检查释放前失败数。
+后撤会使机器人离开旧目标，三组的可比性用干预开始时的到位与接触状态判断。
 
 ## 左右镜像切换短评估
 

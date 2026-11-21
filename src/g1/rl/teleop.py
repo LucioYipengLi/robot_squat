@@ -133,12 +133,16 @@ def run(argv, *, snapshot_path=None):
         checkpoint = play_rsl_rl._resolve_checkpoint(args, agent_cfg, env_cfg, log_root)
         if checkpoint is None:
             raise ValueError("No checkpoint resolved for teleop; provide --checkpoint")
+        upper = args.task_family == "upper_limb_agent"
+        if upper:
+            from g1.tasks.upper_limb_agent.checkpoint_observations import configure_checkpoint_observations
+
+            configure_checkpoint_observations(env_cfg, checkpoint)
         env_cfg.log_dir = os.path.dirname(checkpoint)
         common.apply_video_recording(env_cfg, env_cfg.log_dir, args, subdir="teleop", checkpoint_path=checkpoint)
         raw_env = common.create_isaaclab_env(args.task, env_cfg, args, convert_marl_to_single_agent=False)
         cleanup.callback(common.close_env, raw_env)
         env = RslRlVecEnvWrapper(raw_env, clip_actions=agent_cfg.clip_actions)
-        upper = args.task_family == "upper_limb_agent"
         if upper:
             from .runner import create_task_runner
 

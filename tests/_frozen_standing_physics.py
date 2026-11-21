@@ -38,7 +38,7 @@ def main():
             robot = env.scene["robot"]
             assert not robot.is_fixed_base
             assert env.action_manager.total_action_dim == 23
-            assert observations["policy"].shape == (4, 109)
+            assert observations["policy"].shape == (4, 660)
             assert action.last_lower_observations.shape == (4, 650)
             assert action.lower_actions.shape == (4, 12)
             assert not hasattr(env, "upper_body_motion")

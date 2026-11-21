@@ -109,7 +109,8 @@ class DwellReward(ManagerTermBase):
             self._sums[:, 2] += torch.where(valid_rms, rms, 0.0)
             self._sums[:, 3] += valid_rms
             self._last_metric_step = env.common_step_counter
-        return ready.float()
+        bonus_scale = getattr(command, "wrist_bonus_scale", None)
+        return ready.float() if bonus_scale is None else ready.float() * bonus_scale
 
     def reset(self, env_ids=None):
         ids = slice(None) if env_ids is None else env_ids
@@ -182,18 +183,34 @@ def lower_command_overflow_l2(env: ManagerBasedRLEnv, action_name: str = "lower_
     return (action.raw_actions.abs() - 1.0).clamp_min(0.0).square().sum(dim=-1)
 
 
-def lower_command_magnitude_l2(env: ManagerBasedRLEnv, action_name: str = "lower_command") -> torch.Tensor:
+def lower_command_magnitude_l2(
+    env: ManagerBasedRLEnv,
+    action_name: str = "lower_command",
+    command_name: str = "wrist_pose",
+    near_planar_threshold: float = 0.5,
+    near_planar_gain: float = 0.0,
+) -> torch.Tensor:
     """Sum squared effective velocities divided by their episode range endpoints.
 
     Positive/negative commands use their corresponding signed bounds. Without a
     curriculum, use configured velocity ranges. Constant nonzero commands retain
-    a cost; disabled interfaces return zero. RewardManager applies weight and
-    control dt once. Reads change no command or change-cost history.
+    a cost; disabled interfaces return zero. After first planar near entry an
+    optional excess cost applies to lateral and yaw commands. RewardManager
+    applies weight and control dt once.
     """
+    if not 0 <= near_planar_threshold <= 1 or not math.isfinite(near_planar_gain) or near_planar_gain < 0:
+        raise ValueError("Lower magnitude requires a near threshold in [0, 1] and a finite non-negative gain")
     action = _lower_command_action(env, action_name)
     if not action.cfg.enabled:
         return torch.zeros_like(action.change_l2)
-    return action.magnitude_normalized.square().sum(dim=-1)
+    normalized = action.magnitude_normalized
+    base = normalized.square().sum(dim=-1)
+    if near_planar_gain == 0:
+        return base
+    term = env.command_manager.get_term(command_name)
+    near = term.planar_task_mask & (term.planar_first_near_step >= 0)
+    excess = (normalized[:, 1:3].abs() - near_planar_threshold).clamp_min(0).square().sum(dim=-1)
+    return base + near_planar_gain * torch.where(near, excess, 0.0)
 
 
 def _base_motion_cost(env: ManagerBasedRLEnv, action_name: str, component: int) -> torch.Tensor:
@@ -245,7 +262,10 @@ def workspace_quality_bonus(env: ManagerBasedRLEnv, command_name: str = "wrist_p
     reflect Y; all active targets need map support. Orientation is independent.
     RewardManager applies the positive weight and control step dt once.
     """
-    return env.command_manager.get_term(command_name).workspace_quality_state().reward
+    command = env.command_manager.get_term(command_name)
+    reward = command.workspace_quality_state().reward
+    bonus_scale = getattr(command, "wrist_bonus_scale", None)
+    return reward if bonus_scale is None else reward * bonus_scale
 
 
 def joint_target_speed_excess_l2(
@@ -302,6 +322,9 @@ def end_effector_position_tracking(
     coarse = 1.0 - torch.tanh(error / std)
     fine = torch.exp(-(error / sigma_fine).square())
     weight = 2.0 * term.active_mask[:, arm_index] / term.active_mask.sum(dim=-1)
+    approach_scale = getattr(term, "wrist_reward_scale", None)
+    if approach_scale is not None:
+        weight = weight * approach_scale[:, arm_index]
     return weight * ((1.0 - fine_weight) * coarse + fine_weight * fine)
 
 
@@ -330,6 +353,9 @@ def end_effector_orientation_tracking(
     coarse = torch.exp(-error_squared / sigma_coarse**2)
     fine = torch.exp(-error_squared / sigma_fine**2)
     weight = 2.0 * term.active_mask[:, arm_index] / term.active_mask.sum(dim=-1)
+    approach_scale = getattr(term, "wrist_reward_scale", None)
+    if approach_scale is not None:
+        weight = weight * approach_scale[:, arm_index]
     return weight * ((1.0 - fine_weight) * coarse + fine_weight * fine)
 
 

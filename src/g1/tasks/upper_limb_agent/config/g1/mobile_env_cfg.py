@@ -12,6 +12,7 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass, replace
 
 from ... import mdp
+from ...mdp.actions import MOBILE_OBSERVATION_JOINT_NAMES
 from .env_cfg import (
     ActionsCfg,
     CommandsCfg,
@@ -92,7 +93,7 @@ class MobileCommandsCfg(CommandsCfg):
             hold_episode=True,  # 第二类整个位姿保持一回合；常规目标仍按原间隔刷新。
         ),
         planar_task=mdp.PlanarTaskCfg(
-            probability=0.2,  # 三类评分/课程已接入；远场奖励完成前保持显式启用。
+            probability=0.2,
             initial_half_extent_m=0.10,
             half_extent_m=2.5,  # 作业站位相对初始盆骨的5 m × 5 m空间。
             initial_bearing_rad=math.radians(10),
@@ -113,6 +114,10 @@ class MobileCommandsCfg(CommandsCfg):
                     (10, 2.50, 180),
                 )
             ),
+            transition_sampling=mdp.PlanarTransitionSamplingCfg(
+                probability_knots=((0.0, 0.0, 0.25), (0.30, 0.0, 0.25), (0.40, 0.25, 3 / 14), (1.0, 1.0, 0.0)),
+                turn_bearing_bridge=(0.20, math.radians(35)),
+            ),
             max_goal_distance_m=5.0,  # 各活动腕目标相对初始盆骨的三维距离上限。
             timing=mdp.GoalTimingCfg(
                 linear_speed=0.4,
@@ -125,6 +130,7 @@ class MobileCommandsCfg(CommandsCfg):
                 near_episode_s=10.0,
             ),
         ),
+        planar_approach=mdp.PlanarApproachCfg(waist_posture_weight=-0.20),
         range_curriculum=mdp.RangeCurriculumCfg(
             initial_level=0,
             num_levels=11,
@@ -151,7 +157,7 @@ class MobileCommandsCfg(CommandsCfg):
                 history_windows=4,  # 当前每150轮检查一次：前300轮对比后300轮。
                 minimum_relative_improvement=0.10,
                 probability_step=0.05,
-                maximum_probability=0.30,
+                maximum_probability=0.50,
                 other_tasks_pose_ready_gate=0.85,  # 常规/高度任务还须分别通过当前窗口的样本量和失败频率门槛。
                 cooldown_windows=1,  # 加码后下一窗口只统计，随后恢复判断。
             ),
@@ -160,7 +166,7 @@ class MobileCommandsCfg(CommandsCfg):
 
 
 @configclass
-class MobileObservationsCfg(ObservationsCfg):
+class LegacyMobileObservationsCfg(ObservationsCfg):
     @configclass
     class PolicyCfg(ObservationsCfg.PolicyCfg):
         """109 inputs: 93 Upper, 10 pelvis state and six effective Lower commands."""
@@ -178,6 +184,39 @@ class MobileObservationsCfg(ObservationsCfg):
 
 
 @configclass
+class MobileObservationsCfg(LegacyMobileObservationsCfg):
+    @configclass
+    class PolicyCfg(LegacyMobileObservationsCfg.PolicyCfg):
+        """132 features per step, stacked across five control steps."""
+
+        joint_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", joint_names=list(MOBILE_OBSERVATION_JOINT_NAMES), preserve_order=True
+                )
+            },
+        )
+        joint_vel = ObsTerm(
+            func=mdp.joint_vel_rel,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", joint_names=list(MOBILE_OBSERVATION_JOINT_NAMES), preserve_order=True
+                )
+            },
+            scale=0.1,
+        )
+        base_height: ObsTerm | None = None
+
+        def __post_init__(self):
+            super().__post_init__()
+            self.history_length = 5
+            self.history_order = "term"
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
 class MobileEventsCfg(EventCfg):
     # Root and joints return to the same authored placement each episode.
     reset_root = EventTerm(func=mdp.reset_mobile_root, mode="reset")
@@ -185,6 +224,11 @@ class MobileEventsCfg(EventCfg):
 
 @configclass
 class MobileRewardsCfg(RewardsCfg):
+    planar_approach = RewTerm(
+        func=mdp.PlanarApproachReward,
+        weight=1.0,
+        params={"command_name": "wrist_pose", "action_name": "joint_pos"},
+    )
     # One shared change cost covers six effective commands in fixed physical scales.
     # Amplitude and overflow costs below still read only the three velocities.
     action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.03, params={"action_name": "joint_pos"})
@@ -205,7 +249,12 @@ class MobileRewardsCfg(RewardsCfg):
         # At a signed range endpoint, each velocity axis contributes one before weighting.
         func=mdp.lower_command_magnitude_l2,
         weight=-0.05,
-        params={"action_name": "lower_command"},
+        params={
+            "action_name": "lower_command",
+            "command_name": "wrist_pose",
+            "near_planar_threshold": 0.5,
+            "near_planar_gain": 0.0,
+        },
     )
     base_lin_vel = RewTerm(func=mdp.base_lin_vel_l2_substeps, weight=0.0, params={"action_name": "joint_pos"})
     base_ang_vel = RewTerm(func=mdp.base_ang_vel_l2_substeps, weight=0.0, params={"action_name": "joint_pos"})
@@ -269,6 +318,7 @@ class UpperLimbMobileEnvCfg(UpperLimbAgentEnvCfg):
     events: MobileEventsCfg = MobileEventsCfg()
     rewards: MobileRewardsCfg = MobileRewardsCfg()
     terminations: MobileTerminationsCfg = MobileTerminationsCfg()
+    legacy_observations: bool = False
 
     def __post_init__(self):
         super().__post_init__()

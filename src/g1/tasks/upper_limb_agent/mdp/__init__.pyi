@@ -39,7 +39,8 @@ from .observations import (
     projected_gravity,
     term_action,
 )
-from .planar_targets import PlanarTaskCfg
+from .planar_approach import PlanarApproachCfg, PlanarApproachReward
+from .planar_targets import PlanarTaskCfg, PlanarTransitionSamplingCfg
 from .range_curriculum import RangeCurriculum, RangeCurriculumCfg
 from .rewards import (
     DwellReward,

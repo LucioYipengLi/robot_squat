@@ -103,7 +103,7 @@ def main():
                     obs, _, terminated, truncated, info = env.step(
                         torch.zeros(4, env.action_manager.total_action_dim, device=env.device)
                     )
-                    assert obs["policy"].shape == (4, 109 if mobile else 93)
+                    assert obs["policy"].shape == (4, 660 if mobile else 93)
                     assert torch.isfinite(obs["policy"]).all()
                     if step == 5:
                         # Metrics remain active throughout the zero-weight stage.

@@ -7,7 +7,7 @@ import pytest
 import torch
 from test_upper_limb_task import pose_command as _pose_command
 
-from isaaclab.utils.math import quat_apply_inverse, quat_error_magnitude, quat_from_euler_xyz, quat_mul
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_error_magnitude, quat_from_euler_xyz, quat_mul
 
 from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import (
     MobileActionsCfg,
@@ -16,7 +16,14 @@ from g1.tasks.upper_limb_agent.config.g1.mobile_env_cfg import (
 )
 from g1.tasks.upper_limb_agent.mdp.commands import BimanualPoseCommand, BimanualPoseCommandCfg
 from g1.tasks.upper_limb_agent.mdp.goal_timing import GoalTimingCfg, budget_steps, rest_to_rest_time
-from g1.tasks.upper_limb_agent.mdp.planar_targets import PlanarTaskCfg, sample_station, station_limits
+from g1.tasks.upper_limb_agent.mdp.planar_targets import (
+    PlanarStationSampler,
+    PlanarTaskCfg,
+    sample_station,
+    sample_transition_station,
+    station_budget_bounds,
+    station_limits,
+)
 from g1.tasks.upper_limb_agent.mdp.range_curriculum import RangeCurriculumCfg
 from g1.tasks.upper_limb_agent.mdp.terminations import task_time_out
 
@@ -41,6 +48,128 @@ def make_command(probability=1.0, level=0, hard_s=35, advance=False, configure=N
     env.command_manager = SimpleNamespace(get_term=lambda name: term)
     term.reset()
     return term
+
+
+def test_station_schedule_lookup_preserves_draws_and_observes_live_overrides():
+    cfg = MobileCommandsCfg().wrist_pose.planar_task.copy()
+    transition = cfg.transition_sampling
+    original_knots, original_bridge = transition.probability_knots, transition.turn_bearing_bridge
+    sampler = PlanarStationSampler(11, "cpu")
+    levels = torch.arange(11).repeat_interleave(31)
+    progress = levels.float() / 10
+    local_radius = torch.full_like(progress, 0.4)
+    for enabled, knots, bridge in (
+        (False, None, None),
+        (True, None, None),
+        (True, original_knots, original_bridge),
+        (False, None, None),
+    ):
+        transition.enabled, transition.probability_knots, transition.turn_bearing_bridge = enabled, knots, bridge
+        torch.manual_seed(42)
+        if enabled:
+            expected = sample_transition_station(progress, local_radius, cfg)
+        else:
+            expected = (*sample_station(progress, local_radius, cfg), None)
+        expected_rng = torch.random.get_rng_state()
+        torch.manual_seed(42)
+        actual = sampler.sample(levels, local_radius, cfg)
+        for value, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        assert torch.equal(torch.random.get_rng_state(), expected_rng)
+
+
+def test_regular_retract_refresh_is_bounded_per_arm_and_falls_back_at_rear_edge():
+    def configure(cfg, _):
+        cfg.mode_probabilities = (1.0, 0.0, 0.0)
+        cfg.height_task.probability = 0.0
+        for arm in (cfg.left_offsets, cfg.right_offsets):
+            arm.pos_x, arm.pos_y, arm.pos_z = (-0.10, 0.10), (-0.03, 0.03), (-0.03, 0.03)
+        cfg.regular_retract_sampling.probability = 1.0
+
+    torch.manual_seed(42)
+    term = make_command(probability=0.0, level=3, configure=configure)
+    assert not term._regular_retract_counts.any()
+    term.mode_id[:] = torch.tensor([0, 1, 2])
+    ids, sides = torch.arange(2), torch.arange(2)
+    anchor = term._env.scene.env_origins[ids] + term.default_wrist_pose_e[ids, sides, :3]
+    frame = term._sampling_quat_w[ids]
+    previous = anchor + quat_apply(frame, torch.tensor([[0.064, 0.0, 0.0]]).expand(2, -1))
+    term.goal_pose_w[ids, sides, :3] = previous
+    term._resample(torch.arange(3))
+    new = term.goal_pose_w[ids, sides, :3]
+    delta = quat_apply_inverse(frame, new - previous)
+    assert (delta[:, 0] <= -0.03).all() and ((delta.norm(dim=1) >= 0.05) & (delta.norm(dim=1) < 0.12)).all()
+    assert (quat_apply_inverse(frame, new - anchor).abs() <= torch.tensor([0.065, 0.0195, 0.0195]) + 1e-6).all()
+    assert term._regular_retract_counts.tolist() == [[1, 1, 1, 1], [1, 1, 1, 1], [0, 0, 0, 0]]
+
+    term.goal_pose_w[0, 0, :3] = anchor[0] + quat_apply(frame[0], torch.tensor([-0.065, 0.0, 0.0]))
+    term._resample(torch.tensor([0]))
+    assert term._regular_retract_counts[0].tolist() == [2, 2, 1, 1]
+    log = term.reset(torch.tensor([0]))
+    assert (
+        log["task/regular/retract_sampling/fallbacks"] == 1
+        and log["task/regular/retract_sampling/retract_fraction"] == 0.5
+    )
+    assert term._regular_retract_counts.tolist() == [[0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 0, 0]]
+
+
+def test_dual_retract_uses_complete_native_candidates_and_preserves_fallback():
+    def configure(cfg, _):
+        cfg.mode_probabilities = (0.0, 0.0, 1.0)
+        cfg.height_task.probability = 0.0
+        cfg.regular_retract_sampling.dual_probability = 1.0
+        cfg.regular_retract_sampling.candidates = 128
+
+    torch.manual_seed(42)
+    term = make_command(probability=0.0, level=3, configure=configure)
+    assert not term._dual_retract_counts.any()
+    ids = torch.arange(3)
+    frame = term._sampling_quat_w
+    anchor = term._env.scene.env_origins[:, None] + term.default_wrist_pose_e[..., :3]
+    offsets = torch.tensor([[0.0975, 0.0, 0.0], [-0.08, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    previous = anchor + quat_apply(frame, offsets)[:, None]
+    term.goal_pose_w[..., :3] = previous
+    term.planar_task_mask[2] = True
+    rng_state = torch.random.get_rng_state()
+    native_pos, native_rot = term._draw_dual_targets(ids)
+    torch.rand(2)  # One Bernoulli draw per eligible Regular goal refresh.
+    candidates = term.cfg.regular_retract_sampling.candidates
+    candidate_pos, candidate_rot = term._draw_dual_targets(ids[:2].repeat_interleave(candidates))
+    expected_rng = torch.random.get_rng_state()
+    delta = quat_apply_inverse(frame[0], candidate_pos[:candidates] - previous[0])
+    jump = delta.norm(dim=-1).amax(dim=-1)
+    first = ((delta[..., 0] <= -0.03).all(dim=-1) & (jump >= 0.08) & (jump < 0.12)).nonzero()[0, 0]
+    torch.random.set_rng_state(rng_state)
+
+    term._sample_dual_targets(ids)
+
+    delta = quat_apply_inverse(frame[0], term.goal_pose_w[0, :, :3] - previous[0])
+    assert (delta[:, 0] <= -0.03).all()
+    assert 0.08 <= delta.norm(dim=-1).max() < 0.12
+    torch.testing.assert_close(term.goal_pose_w[0, :, :3], candidate_pos[first], rtol=0, atol=0)
+    torch.testing.assert_close(term.goal_pose_w[0, :, 3:], candidate_rot[first], rtol=0, atol=0)
+    assert torch.equal(torch.random.get_rng_state(), expected_rng)
+    torch.testing.assert_close(term.goal_pose_w[1:, :, :3], native_pos[1:])
+    torch.testing.assert_close(term.goal_pose_w[1:, :, 3:], native_rot[1:])
+    assert term._dual_retract_counts.tolist() == [[1, 1, 1, 1], [1, 1, 0, 0], [0, 0, 0, 0]]
+    log = term.reset(torch.tensor([1]))
+    assert log["task/regular/dual_retract_sampling/fallbacks"] == 1
+    assert term._dual_retract_counts.tolist() == [[1, 1, 1, 1], [0, 0, 0, 0], [0, 0, 0, 0]]
+
+
+def test_regular_retract_sampling_is_only_in_enabled_checkpoint_contracts():
+    control = make_command()
+    active = make_command(configure=lambda cfg, _: setattr(cfg.regular_retract_sampling, "probability", 0.3))
+    saved = control.range_curriculum.state_dict(0)
+    assert "regular_retract_sampling" not in saved["contract"]["target"]
+    single = active.range_curriculum.contract()["target"]["regular_retract_sampling"]
+    assert single["probability"] == 0.3
+    assert "dual_probability" not in single and "dual_jump_range_m" not in single
+    with pytest.raises(ValueError, match="reset_on_load"):
+        active.range_curriculum.load_state_dict(saved, 0)
+    dual_active = make_command(configure=lambda cfg, _: setattr(cfg.regular_retract_sampling, "dual_probability", 0.25))
+    dual = dual_active.range_curriculum.contract()["target"]["regular_retract_sampling"]
+    assert dual["dual_probability"] == 0.25 and dual["dual_jump_range_m"] == [0.08, 0.12]
 
 
 @pytest.mark.parametrize("speed,acceleration", [(0.08, 0.3), (0.4, 0.3), (0.4, 0.4)])
@@ -111,6 +240,95 @@ def test_mobile_planar_schedule_interpolates_monotonically_and_checkpoint_record
     assert saved["contract"]["target"]["planar_task"]["curriculum_knots"] is not None
     with pytest.raises(ValueError, match="reset_on_load"):
         make_command().range_curriculum.load_state_dict(saved, 0)
+
+
+@pytest.mark.parametrize("level", range(11))
+def test_transition_sampling_keeps_the_distance_floor_and_opens_wide_groups_gradually(level):
+    cfg = MobileCommandsCfg().wrist_pose.planar_task
+    cfg.transition_sampling.enabled = True
+    cfg.validate_parameters()
+    torch.manual_seed(7)
+    progress = torch.full((8192,), level / 10)
+    shift, heading, group = sample_transition_station(progress, torch.full_like(progress, 0.4), cfg)
+    distance = shift.norm(dim=-1)
+    bearing = heading.abs()
+    assert (distance >= 0.25 - 1e-6).all()
+    walk, turn, wide = group == 1, group == 2, group == 3
+    assert (distance[walk] <= 0.40 + 1e-6).all() and (bearing[walk] <= math.radians(15)).all()
+    assert (distance[turn] <= 0.30 + 1e-6).all()
+    extent, maximum_bearing = station_limits(level / 10, cfg)
+    assert (shift[wide].abs() <= extent + 1e-6).all() and (bearing[wide] <= maximum_bearing).all()
+    if level <= 3:
+        assert not wide.any()
+    if level == 10:
+        assert wide.all()
+    else:
+        turn_limit = (25, 25, 35, 35, 45, 65, 90, 115, 140, 160)[level]
+        assert (bearing[turn] >= math.radians(20)).all()
+        assert float(bearing[turn].max()) == pytest.approx(math.radians(turn_limit), abs=math.radians(5))
+        assert (bearing[turn] <= math.radians(turn_limit) + 1e-6).all()
+        turn_distance, turn_budget_bearing = station_budget_bounds(level / 10, cfg)[1]
+        assert turn_distance == pytest.approx(0.30)
+        assert float(turn_budget_bearing) == pytest.approx(math.radians(turn_limit))
+    turn_probability = (1 - max(0, (level - 3) / 7)) * 0.25
+    wide_probability = 0 if level < 4 else 0.25 + (level - 4) * 0.125
+    assert float(wide.float().mean()) == pytest.approx(wide_probability, abs=0.02)
+    assert float(turn.float().mean()) == pytest.approx(turn_probability, abs=0.02)
+    assert float(walk.float().mean()) == pytest.approx(1 - wide_probability - turn_probability, abs=0.02)
+
+
+def test_transition_sampling_contract_is_opt_in_and_uses_the_existing_full_evaluation_window():
+    cfg = MobileCommandsCfg().wrist_pose.planar_task
+    cfg.probability = 1.0
+    legacy = make_command(configure=lambda c, env: setattr(c, "planar_task", cfg.copy()))
+    saved = legacy.range_curriculum.state_dict(100)
+    assert "transition_sampling" not in saved["contract"]["target"]["planar_task"]
+    cfg.transition_sampling.enabled = True
+    active = make_command(configure=lambda c, env: setattr(c, "planar_task", cfg))
+    active_transition = active.range_curriculum.contract()["target"]["planar_task"]["transition_sampling"]
+    assert active_transition["turn_bearing_bridge"] == pytest.approx([0.2, math.radians(35)])
+    assert (active.planar_distance_m >= 0.25 - 1e-6).all()
+    assert (active.planar_sampling_group > 0).all()
+    assert (active.episode_deadline_steps <= 35 * 60).all()
+    assert ((active.episode_deadline_steps - active.evaluation_start_steps) == 600).all()
+    with pytest.raises(ValueError, match="reset_on_load"):
+        active.range_curriculum.load_state_dict(saved, 0)
+    previous_cfg = cfg.copy()
+    previous_cfg.transition_sampling.turn_bearing_bridge = None
+    previous = make_command(configure=lambda c, env: setattr(c, "planar_task", previous_cfg))
+    old_transition = previous.range_curriculum.contract()["target"]["planar_task"]["transition_sampling"]
+    assert "probability_knots" in old_transition and "turn_bearing_bridge" not in old_transition
+    assert station_budget_bounds(0.4, previous_cfg)[1] == pytest.approx((0.30, math.radians(25)))
+    with pytest.raises(ValueError, match="reset_on_load"):
+        active.range_curriculum.load_state_dict(previous.range_curriculum.state_dict(100), 0)
+
+    previous_cfg.transition_sampling.probability_knots = None
+    v8 = make_command(configure=lambda c, env: setattr(c, "planar_task", previous_cfg))
+    v8_transition = v8.range_curriculum.contract()["target"]["planar_task"]["transition_sampling"]
+    assert "probability_knots" not in v8_transition
+    assert float(previous_cfg.transition_sampling.group_probabilities(0.4)[2]) == pytest.approx(1 / 7)
+
+
+def test_planar_group_metrics_preserve_first_near_time_until_partial_reset():
+    term = make_command()
+    env = term._env
+    pelvis = term.robot.data.body_link_pose_w.torch[:, term.reference_body_idx]
+    pelvis[0, :3] = term.planar_station_w[0]
+    zero = torch.zeros(1)
+    pelvis[0, 3:] = quat_mul(quat_from_euler_xyz(zero, zero, term.planar_heading_rad[:1]), term._sampling_quat_w[:1])[0]
+    term.planar_sampling_group[0] = 1
+    env.common_step_counter = 1
+    term.collect_window_metrics()
+    assert term.planar_first_near_step[0] == 1
+    env.common_step_counter = 2
+    term.collect_window_metrics()
+    env.reset_time_outs[0] = True
+    metrics = term.reset(torch.tensor([0]))
+    prefix = "task/planar/walk/"
+    assert metrics[prefix + "near_entry_fraction"] == 1
+    assert metrics[prefix + "first_near_s"] == pytest.approx(env.step_dt)
+    assert metrics[prefix + "eval_pose_ready_fraction"] == 0
+    assert term.planar_first_near_step[0] == -1
 
 
 def test_contact_threshold_change_rejects_old_curriculum_failure_statistics():

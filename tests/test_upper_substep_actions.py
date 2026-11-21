@@ -178,7 +178,7 @@ def test_target_speed_reward_applies_weight_and_time_once_and_keeps_velocity_whe
     torch.testing.assert_close(manager.reset()["Episode_Reward/target_speed"], expected.mean() / 10)
 
 
-@pytest.mark.parametrize("move_steps,expected", [(1, -0.0352666667), (2, -0.0161333333), (6, -0.0036), (30, 0.0)])
+@pytest.mark.parametrize("move_steps,expected", [(1, -0.0881666667), (2, -0.0403333333), (6, -0.009), (30, 0.0)])
 def test_shorter_same_displacement_costs_more_and_later_hold_keeps_the_penalty(move_steps, expected):
     from g1.tasks.upper_limb_agent.config.g1.env_cfg import RewardsCfg
 

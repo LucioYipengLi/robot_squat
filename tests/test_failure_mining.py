@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from g1.rl.failures.cli import parse_args
+from g1.rl.failures.mine import limit_near_planar_actions
 from g1.rl.failures.pairs import PairedSwitchSummary
 from g1.rl.failures.recording import FailureMiner, FailureRecorderTerm, force_category
 from g1.rl.failures.storage import FailureArchive, TensorHistory, contact_statistics, write_json
@@ -44,7 +45,7 @@ def test_statistics_keep_substep_impulse_and_force_cancellation_visible():
     assert stats["partners"][0]["contact_onsets"] == 2
 
 
-def make_miner(tmp_path, *, episodes=10, max_failures=10, switches=False):
+def make_miner(tmp_path, *, episodes=10, max_failures=10, switches=False, first_episode_only=False, startup_s=None):
     n = 2
     proxy = lambda value: SimpleNamespace(torch=value)  # noqa: E731
     poses = torch.zeros(n, 3, 7)
@@ -73,9 +74,14 @@ def make_miner(tmp_path, *, episodes=10, max_failures=10, switches=False):
         episode_deadline_steps=torch.tensor([20, 20]),
         planar_distance_m=torch.tensor([0.2, 0]),
         planar_heading_rad=torch.tensor([0.1, 0]),
+        planar_sampling_group=torch.tensor([1, 0]),
+        planar_first_near_step=torch.tensor([4, -1]),
+        episode_quality=lambda ids: torch.full((len(ids),), 0.6),
+        collect_window_metrics=lambda ids: None,
         age=torch.ones(n, dtype=torch.long),
     )
     term.episode_age_steps = lambda: term.age
+    term.planar_station_errors = lambda: torch.zeros(n, 2)
     term.pose_error = lambda: ((goal[..., :3] - poses[:, :2, :3]).norm(dim=-1), torch.zeros(n, 2))
     pair = torch.zeros(n, 3, 1, 2, 3)
     pair[:, :, 0, 0, 0] = torch.tensor([3.0, 2.0, 1.0])
@@ -121,6 +127,8 @@ def make_miner(tmp_path, *, episodes=10, max_failures=10, switches=False):
     tracker = RegularSwitchTracker(env, term, 20.0) if switches else None
     if tracker is not None:
         manifest["regular_switch_evaluation"] = tracker.settings()
+    if startup_s is not None:
+        manifest["planar_startup"] = {"window_s": startup_s}
     archive = FailureArchive(tmp_path / "archive", manifest)
     miner = FailureMiner(
         env,
@@ -130,6 +138,8 @@ def make_miner(tmp_path, *, episodes=10, max_failures=10, switches=False):
         episodes=episodes,
         max_failures=max_failures,
         switch_tracker=tracker,
+        first_episode_only=first_episode_only,
+        startup_s=startup_s,
     )
     env.failure_miner = miner
     recorder = FailureRecorderTerm.__new__(FailureRecorderTerm)
@@ -175,6 +185,99 @@ def test_successes_have_target_summaries_but_no_failure_clip(tmp_path):
     assert rows[0]["category"] == "regular" and not rows[0]["failed"]
     assert rows[0]["reasons"] == ["time_out"] and "goal_pose" in rows[0]
     assert archive.completed == 1 and archive.saved == 0
+
+
+def test_planar_startup_saves_pre_action_and_bounded_traces_for_both_outcomes(tmp_path):
+    miner, recorder, env, term, archive = make_miner(tmp_path, episodes=2, first_episode_only=True, startup_s=0.04)
+    term.task_ids[:] = 2
+    term.planar_sampling_group[:] = 3
+    term.age.zero_()
+    miner.capture_startup_initial()
+
+    term.age[:] = 1
+    env.reset_terminated[0] = True
+    recorder.record_post_step()
+    recorder.reset([0])
+    env.reset_terminated[0] = False
+    term.age[:] = 2
+    recorder.record_post_step()
+    term.age[:] = 10
+    env.reset_time_outs[1] = True
+    recorder.record_post_step()
+    archive.close()
+
+    rows = [json.loads(line) for line in (archive.directory / "episodes.jsonl").read_text().splitlines()]
+    assert [row["failed"] for row in rows] == [True, False]
+    for row, times in zip(rows, ([0, 0.02], [0, 0.02, 0.04]), strict=True):
+        with np.load(archive.directory / row["planar_startup_clip"], allow_pickle=False) as trace:
+            np.testing.assert_allclose(trace["time"], times)
+            assert np.isnan(trace["pair_force"][0]).all()
+            assert trace["station_error"].shape == (len(times), 2)
+    assert archive.saved == 1
+
+
+def test_planar_archive_summarizes_completed_targets_with_and_without_failure(tmp_path):
+    _, recorder, env, term, archive = make_miner(tmp_path)
+    term.task_ids[:] = 2
+    term.planar_sampling_group[:] = 1
+    term.age[:] = 10
+    env.reset_time_outs[0] = True
+    env.reset_terminated[1] = True
+    recorder.record_post_step()
+    archive.progress("episodes")
+    archive.close()
+    rows = [json.loads(line) for line in (archive.directory / "episodes.jsonl").read_text().splitlines()]
+    assert rows[0]["planar_first_near_s"] == pytest.approx(0.08)
+    assert rows[1]["planar_first_near_s"] is None
+    summary = json.loads((archive.directory / "summary.json").read_text())["planar_groups"]["walk"]
+    assert summary["episodes"] == 2 and summary["failures"] == 1
+    assert summary["near_entry_fraction"] == 0.5
+    assert summary["failure_after_near_fraction"] == 0.0
+    assert summary["eval_pose_ready_fraction"] == pytest.approx(0.6)
+
+
+def test_near_lower_diagnostic_caps_only_lateral_and_yaw_after_first_entry():
+    actions = torch.tensor([[3.0, 2.0, 4.0, -3.0, 5.0], [3.0, 2.0, 4.0, -3.0, 5.0]])
+    entered = torch.tensor([True, False])
+    actual = limit_near_planar_actions(actions, entered, velocity_offset=1, scale=0.5)
+    torch.testing.assert_close(actual[0], torch.tensor([3.0, 2.0, 0.5, -0.5, 5.0]))
+    torch.testing.assert_close(actual[1], actions[1])
+    torch.testing.assert_close(actions[0], actions[1])
+    assert limit_near_planar_actions(actions, entered, velocity_offset=1, scale=1.0) is actions
+
+
+def test_first_episode_only_ignores_fast_resets_and_counts_initial_exposure(tmp_path):
+    miner, recorder, env, term, archive = make_miner(tmp_path, episodes=2, first_episode_only=True)
+    term.task_ids[:] = 2
+    term.planar_sampling_group[:] = 1
+    env.reset_terminated[0] = True
+    recorder.record_post_step()
+    recorder.reset([0])
+    recorder.record_post_step()  # A second failure in env 0 must not consume the quota.
+    assert archive.completed == 1
+    term.age[1] = 3
+    env.reset_time_outs[1] = True
+    recorder.record_post_step()
+    archive.progress("episodes")
+    archive.close()
+    rows = [json.loads(line) for line in (archive.directory / "episodes.jsonl").read_text().splitlines()]
+    assert [row["env_id"] for row in rows] == [0, 1]
+    assert miner.done and not miner.pending_first_episodes.any()
+    assert miner.unrecorded_completions == 0
+    assert miner.elapsed_robot_s == pytest.approx(0.08)
+    summary = json.loads((archive.directory / "summary.json").read_text())["planar_groups"]["walk"]
+    assert summary["failures_after_near"] == 1 and summary["failure_after_near_fraction"] == 1.0
+
+
+def test_planar_lower_diagnostic_cli_requires_a_common_mean_sampler():
+    base = ["mine", "--checkpoint", "model.pt", "--planar-near-lower-scale", "0.5"]
+    assert parse_args([*base, "--planar-sampling", "transition"]).planar_near_lower_scale == 0.5
+    with pytest.raises(SystemExit):
+        parse_args(base)
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--planar-sampling", "transition", "--policy_output", "sample"])
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--planar-sampling", "transition", "--planar-near-lower-scale", "nan"])
 
 
 def test_pair_recorder_ignores_unassigned_environment_and_labels_failure_clip(tmp_path):
@@ -397,7 +500,7 @@ def test_json_writer_never_exports_nan_or_partial_documents(tmp_path):
     assert not path.with_suffix(".json.tmp").exists()
 
 
-@pytest.mark.parametrize("requested_level", [None, 0, 2, 10, 11])
+@pytest.mark.parametrize("requested_level", [None, 0, 1, 2, 10, 11])
 def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_state_loss(
     tmp_path, monkeypatch, requested_level
 ):
@@ -463,6 +566,8 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
 
     def load(path):
         assert term.cfg.resampling_time_range == (2.0, 4.0)
+        assert term.cfg.regular_retract_sampling.probability == (0.3 if requested_level == 1 else 0.0)
+        assert term.cfg.regular_retract_sampling.dual_probability == (0.25 if requested_level == 1 else 0.0)
         calls.append("loaded")
         term.range_curriculum.level = 3
 
@@ -487,6 +592,8 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
     # The real YAML writer exercises config serialization; the runner has no learning method.
     checkpoint = tmp_path / "model.pt"
     saved_target = {"resampling_time_range": [2.0, 4.0]}
+    if requested_level == 1:
+        saved_target["regular_retract_sampling"] = {"probability": 0.3, "dual_probability": 0.25}
     torch.save({"infos": {"g1_upper_ranges": {"contract": {"target": saved_target}}}}, checkpoint)
     output = tmp_path / "mined"
     args = parse_args(
@@ -506,7 +613,11 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
             "cpu",
         ]
         + (["--level", str(requested_level)] if requested_level is not None else [])
-        + (["--category", "regular", "--regular_refresh_s", "2", "3"] if requested_level == 1 else [])
+        + (
+            ["--category", "regular", "--regular_refresh_s", "2", "3", "--regular-sampling", "native"]
+            if requested_level == 1
+            else []
+        )
     )
     if requested_level == 11:
         with pytest.raises(ValueError, match="--level must be between 0 and 10"):
@@ -530,6 +641,10 @@ def test_full_mining_flow_writes_loadable_archive_without_learning_or_terminal_s
     assert index["run"]["checkpoint_regular_refresh_s"] == [2.0, 4.0]
     assert index["run"]["regular_refresh_s"] == ([2.0, 3.0] if requested_level == 1 else [2.0, 4.0])
     if requested_level == 1:
+        assert index["run"]["checkpoint_regular_retract_probability"] == 0.3
+        assert index["run"]["regular_retract_probability"] == 0.0
+        assert index["run"]["checkpoint_regular_dual_retract_probability"] == 0.25
+        assert index["run"]["regular_dual_retract_probability"] == 0.0
         assert summary["regular_switches"]["regular_episodes_without_switch"] == 1
         assert (output / "switches.jsonl").is_file()
     assert index["samples"][0]["level"] == expected_level
