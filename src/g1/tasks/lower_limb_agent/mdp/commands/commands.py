@@ -317,6 +317,10 @@ class SquatWalkCommand(CommandTerm):
             - self.robot.data.default_joint_pos.torch[:, self._walk_hip_ids]
         )
         self.performance.sample_walk(self.mode, valid, self.task_command, contacts, foot_height, hip_deviation)
+        evaluation = getattr(self, "_evaluation_controller", None)
+        sampler = getattr(evaluation, "sample_metrics", None)
+        if sampler is not None:
+            sampler(valid, error_height)
 
     def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> dict[str, float]:
         """Finalize one shared episode record, retain curriculum flags and draw new modes.

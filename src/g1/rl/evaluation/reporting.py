@@ -264,7 +264,12 @@ def summarize_results(config, results):
     Wilson intervals describe pooled binomial rates; seed standard deviations expose
     between-seed variation separately and are omitted for a single seed.
     """
-    config = _benchmark(_configuration(config))
+    config = _configuration(config)
+    if config.get("schema_version") == 2:
+        from .four_stage_reporting import summarize_four_stage
+
+        return summarize_four_stage(config, results)
+    config = _benchmark(config)
     weights = {mode: _finite(weight, "mode_weights") for mode, weight in config["mode_weights"].items() if weight > 0}
     if not weights or set(weights) - set(MODES):
         raise ValueError("mode_weights must contain supported active modes")
@@ -353,6 +358,26 @@ def _safe_component(value):
 
 _PANELS = (
     (
+        "00 四阶段指标",
+        (
+            ("行走归一化误差 (%) ↓", "e_walk_percent"),
+            ("蹲起 RMSE (m) ↓", "e_squat_m"),
+            ("蹲走 RMSE (m) ↓", "e_squat_walk_m"),
+            ("高度 RMSE (m) ↓", "rmse_height_m"),
+            ("前向 RMSE (m/s) ↓", "rmse_vx_mps"),
+            ("侧向 RMSE (m/s) ↓", "rmse_vy_mps"),
+            ("转向 RMSE (rad/s) ↓", "rmse_wz_radps"),
+            ("最大高度偏差 (m) ↓", "max_height_error_m"),
+            ("最大 Roll (rad) ↓", "max_roll_rad"),
+            ("最大 Pitch (rad) ↓", "max_pitch_rad"),
+            ("计划推扰次数", "planned_push_count"),
+            ("实际推扰次数", "push_count"),
+            ("未恢复推扰数", "unrecovered_push_count"),
+            ("推扰恢复率 ↑", "push_recovery_rate"),
+            ("平均恢复确认时间 (s) ↓", "mean_recovery_s"),
+        ),
+    ),
+    (
         "01 任务完成",
         (
             ("联合成功率 ↑", "joint_success_rate"),
@@ -411,14 +436,23 @@ def _write_events(directory, rows):
         run = tuple(_safe_component(row[key]) for key in ("module", "policy_output", "checkpoint"))
         runs[run].append(row)
     for (module, policy, checkpoint), entries in runs.items():
+        from .four_stage import STAGES
+
+        panels = _PANELS if module in STAGES else _PANELS[1:]
         layout = Layout()
         available = {key for row in entries for key in row}
-        modes = [mode for mode in (*MODES, "aggregate", "original_three") if any(x["mode"] == mode for x in entries)]
-        axis = "双臂目标范围比例‰" if module == "upper_body_sweep" else "固定场景编号"
-        for index, (title, charts) in enumerate(_PANELS):
+        modes = list(dict.fromkeys(row["mode"] for row in entries))
+        axis = (
+            "双臂目标范围比例‰"
+            if module == "upper_body_sweep"
+            else "高度编号"
+            if module == "squat_push"
+            else "固定场景编号"
+        )
+        for index, (title, charts) in enumerate(panels):
             category = layout.category.add(title=title, closed=index != 0)
             expanded_charts = list(charts)
-            if index == 2:
+            if title.startswith("03"):
                 expanded_charts.extend(
                     ("终止原因：" + key.split("/", 1)[1], key)
                     for key in sorted(available)
@@ -431,7 +465,7 @@ def _write_events(directory, rows):
                         continue
                     tag = f"{title}/{mode}/{metric}"
                     category.chart.add(
-                        title=f"{_MODE_TITLES[mode]} · {chart_title}（横轴：{axis}）"
+                        title=f"{_MODE_TITLES.get(mode, mode)} · {chart_title}（横轴：{axis}）"
                     ).multiline.tag.append("^" + re.escape(tag) + "$")
         serialized = layout.SerializeToString()
         tensor = tensor_pb2.TensorProto(dtype=types_pb2.DT_STRING, string_val=[serialized])
@@ -450,7 +484,7 @@ def _write_events(directory, rows):
                     raise ValueError(f"Duplicate TensorBoard mode/axis position in {module}/{policy}/{checkpoint}")
                 positions.add(position)
                 values = []
-                for panel, charts in _PANELS:
+                for panel, charts in panels:
                     metrics = [metric for _, metric in charts]
                     if panel.startswith("03"):
                         metrics += [key for key in row if key.startswith("termination/")]
@@ -482,7 +516,9 @@ def write_report(output_dir, config, results):
     config = _configuration(config)
     results = list(results)
     rows = summarize_results(config, results)
-    _, incomplete = _group_results(_benchmark(config), results)
+    _, incomplete = _group_results(
+        config["benchmark"] if config.get("schema_version") == 2 else _benchmark(config), results
+    )
     generation = datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     directory = Path(output_dir) / "reports" / generation
     directory.mkdir(parents=True, exist_ok=False)
@@ -493,7 +529,7 @@ def write_report(output_dir, config, results):
         "summary_json": str(directory / "summary.json"),
     }
     summary = {
-        "schema_version": 1,
+        "schema_version": config.get("schema_version", 1),
         "configuration": config,
         "rows": rows,
         "incomplete_groups": incomplete,
@@ -503,6 +539,15 @@ def write_report(output_dir, config, results):
             "confidence_intervals": "per-mode pooled binomial Wilson 95%; seed std reported separately",
         },
     }
+    if config.get("schema_version") == 2:
+        summary["notes"] = {
+            "rmse": "sqrt(pooled squared-error sum / executed steps); includes terminal and transient samples",
+            "walking": "equal weights: straight vx, lateral vy, turn wz; scales: configured max absolute bounds",
+            "failures": "included through terminal sample; compare RMSE together with failure rate and sample counts",
+            "recovery": "continuous height/roll/pitch/speed tolerance hold; includes hold time; unresolved stays null",
+            "pushes": "world-frame velocity increments; same repetition uses the same plan across heights",
+            "attitude_validity": "Legacy records without xyzw marker omit Roll/recovery; rerun to measure them",
+        }
     Path(paths["summary_json"]).write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )

@@ -8,6 +8,8 @@
 | [训练性能指标](TRAINING_METRICS.md) | 逐模式生存、跟踪、样本分配、扰动暴露及统计口径。 |
 | [WALK 奖励](WALK_REWARDS.md) | 实际离地驱动的关节参考、支撑时长约束及本机保留参数。 |
 | [统一评估框架](EVALUATION.md) | 快速评估与 TensorBoard 查看；自定义套件、指标定义及执行机制。 |
+| [下肢四阶段测试](LOWER_FOUR_STAGE_EVALUATION.md) | 分组行走、蹲起、蹲走、分高度两次推扰；RMSE 口径与命令参数。 |
+| [下肢独立推扰测试](LOWER_PUSH_EVALUATION.md) | 单独测试分高度推扰，默认 ±0.70 m/s，采集与统计复用四阶段抗扰组。 |
 | [上肢渐进扰动](UPPER_BODY_MOTION.md) | 平滑参考、参数、重置、统一评估套件、执行统计及验证边界。 |
 | [模型遥操作](TELEOP.md) | 人工控制、键盘/手柄映射、几何可视化及代码组织。 |
 | [下肢 Sim2Sim 迁移](SIM2SIM_LOWER_LIMB.md) | 模型交付、观测历史、关节与指令协议、部署适配及训练环境参考。 |

@@ -23,6 +23,15 @@ def run(argv: list[str]) -> int:
     parser.add_argument("--policy-output", choices=("mean", "sample", "both"))
     parser.add_argument("--seeds", type=int, nargs="+")
     parser.add_argument("--episodes-per-seed", type=int)
+    parser.add_argument("--repetitions", type=int, help="Lower suite (schema 2): repeated full batches per stage")
+    parser.add_argument("--episode-length-s", type=float, help="Lower suite (schema 2): seconds per episode")
+    parser.add_argument("--height-range", type=float, nargs=2, metavar=("MIN", "MAX"))
+    parser.add_argument("--vx-range", type=float, nargs=2, metavar=("MIN", "MAX"))
+    parser.add_argument("--vy-range", type=float, nargs=2, metavar=("MIN", "MAX"))
+    parser.add_argument("--wz-range", type=float, nargs=2, metavar=("MIN", "MAX"))
+    parser.add_argument(
+        "--push-heights", type=float, nargs="+", help="Lower suite (schema 2): fixed height offsets in m"
+    )
     parser.add_argument(
         "--agent-config", type=Path, help="Explicit shared agent YAML; otherwise use adjacent params/agent.yaml"
     )
@@ -68,6 +77,13 @@ def run(argv: list[str]) -> int:
                 args.episodes_per_seed,
                 args.agent_config,
                 args.allow_unverified_checkpoint,
+                args.repetitions,
+                args.episode_length_s,
+                args.height_range,
+                args.vx_range,
+                args.vy_range,
+                args.wz_range,
+                args.push_heights,
             )
             if any(value is not None and value is not False for value in changes):
                 raise ValueError("--resume reuses its saved configuration; omit configuration overrides")
@@ -78,6 +94,38 @@ def run(argv: list[str]) -> int:
             from .config import load_suite, validate_suite
 
             config = load_suite(args.suite or "g1_core")
+            four_stage_options = (
+                args.repetitions,
+                args.episode_length_s,
+                args.height_range,
+                args.vx_range,
+                args.vy_range,
+                args.wz_range,
+                args.push_heights,
+            )
+            if config["schema_version"] == 2:
+                if args.episodes_per_seed is not None:
+                    raise ValueError("Lower suites (schema 2) use --repetitions instead of --episodes-per-seed")
+                benchmark = config["benchmark"]
+                if args.repetitions is not None:
+                    benchmark["repetitions"] = args.repetitions
+                if args.episode_length_s is not None:
+                    benchmark["episode_length_s"] = args.episode_length_s
+                for key, value in (
+                    ("height_offset", args.height_range),
+                    ("lin_vel_x", args.vx_range),
+                    ("lin_vel_y", args.vy_range),
+                    ("ang_vel_z", args.wz_range),
+                ):
+                    if value is not None:
+                        benchmark["ranges"][key] = value
+                if args.push_heights is not None:
+                    benchmark["push_height_offsets"] = args.push_heights
+                elif args.height_range is not None:
+                    # Regenerate height buckets inside the new range during validation.
+                    benchmark.pop("push_height_offsets", None)
+            elif any(value is not None for value in four_stage_options):
+                raise ValueError("These options require a schema 2 suite: g1_lower_four_stage or g1_lower_push")
             if args.task:
                 config["task"] = args.task
             if args.policy_output:

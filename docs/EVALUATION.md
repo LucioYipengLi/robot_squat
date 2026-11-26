@@ -2,6 +2,10 @@
 
 `eval` 用于在固定条件下评估一个或多个兼容检查点，默认以 headless 方式运行，输出逐回合记录、汇总表和 TensorBoard 对比图。
 
+分组行走、蹲起、蹲走及分高度推扰使用新增的 [下肢四阶段测试](LOWER_FOUR_STAGE_EVALUATION.md)，入口为 `--suite g1_lower_four_stage`。下文介绍原有 schema 1 基础/上肢扰动评估套件。
+
+只测试推扰可使用 [独立推扰评估](LOWER_PUSH_EVALUATION.md)，入口为 `--suite g1_lower_push`，默认使用 Phase 3 最终训练幅度 ±0.70 m/s。
+
 - [第一部分：快速评估与查看结果](#第一部分快速评估与查看结果)：选择内置套件、运行评估、恢复任务、阅读 TensorBoard。
 - [第二部分：创建 suite 与评估过程详解](#第二部分创建-suite-与评估过程详解)：编写自定义套件，了解参数、用例生成、模型加载和指标口径。
 

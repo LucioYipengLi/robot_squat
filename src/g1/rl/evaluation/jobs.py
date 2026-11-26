@@ -155,6 +155,7 @@ def source_digest() -> str:
 
 def build_manifest(config: dict, checkpoints: list[dict], runtime: dict) -> dict:
     from .config import suite_config_digest
+    from .four_stage import benchmark_for_job
     from .modules import conditions
 
     jobs = []
@@ -168,6 +169,7 @@ def build_manifest(config: dict, checkpoints: list[dict], runtime: dict) -> dict
                         "policy_output": policy_output,
                         "seed": seed,
                     }
+                    benchmark_for_job(config, identity, runtime)
                     jobs.append({**identity, "job_id": canonical_digest(identity)[:20]})
     manifest = {
         "schema_version": 1,
@@ -252,11 +254,13 @@ def execute_jobs(directory: Path, manifest: dict, *, progress=None) -> tuple[lis
     def ordered_results():
         return [results[job["job_id"]] for job in manifest["jobs"] if job["job_id"] in results]
 
-    benchmark = manifest["config"]["benchmark"]
+    from .four_stage import benchmark_for_job
+
     num_envs = manifest["runtime"]["num_envs"]
-    batches = (benchmark["episodes_per_seed"] + num_envs - 1) // num_envs
-    max_steps = round(benchmark["episode_length_s"] / benchmark["control_dt"])
     for job in manifest["jobs"]:
+        benchmark = benchmark_for_job(manifest["config"], job, manifest["runtime"])
+        batches = (benchmark["episodes_per_seed"] + num_envs - 1) // num_envs
+        max_steps = round(benchmark["episode_length_s"] / benchmark["control_dt"])
         if job["job_id"] not in results:
             cell = result_path(directory, job).parent
             cell.mkdir(parents=True, exist_ok=True)
@@ -264,7 +268,18 @@ def execute_jobs(directory: Path, manifest: dict, *, progress=None) -> tuple[lis
             progress.start_job(job, episodes=benchmark["episodes_per_seed"], batches=batches, steps=max_steps)
             started = time.monotonic()
 
-            def finalize(stage, *, cell=cell, job_id=job["job_id"], attempt_id=attempt_id, started=started, **values):
+            def finalize(
+                stage,
+                *,
+                cell=cell,
+                job_id=job["job_id"],
+                attempt_id=attempt_id,
+                started=started,
+                benchmark=benchmark,
+                batches=batches,
+                max_steps=max_steps,
+                **values,
+            ):
                 state = finalize_progress(
                     cell / "progress.json",
                     job_id,

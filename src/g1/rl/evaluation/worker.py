@@ -15,6 +15,10 @@ from .jobs import canonical_digest, result_path, validate_resume, write_json
 
 
 def episode_specs(benchmark: dict) -> list[dict]:
+    if benchmark.get("protocol") == "four_stage":
+        from .four_stage import protocol_specs
+
+        return protocol_specs(benchmark)
     from .config import mode_episode_quotas
 
     quotas = mode_episode_quotas(benchmark["episodes_per_seed"], benchmark["mode_weights"])
@@ -152,7 +156,9 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
     cell = result_path(directory, job).parent
     cell.mkdir(parents=True, exist_ok=True)
     config, runtime = manifest["config"], manifest["runtime"]
-    benchmark = config["benchmark"]
+    from .four_stage import benchmark_for_job
+
+    benchmark = benchmark_for_job(config, job, runtime)
     from .progress import PROGRESS_ID_ENV, ProgressWriter
 
     progress = ProgressWriter(cell / "progress.json", job_id, os.environ.get(PROGRESS_ID_ENV) or uuid.uuid4().hex)
@@ -208,7 +214,12 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                     allow_unverified=runtime["allow_unverified_checkpoint"],
                 )
                 env.clip_actions = effective_agent.get("clip_actions")
-                controller = EvaluationScenarioController(raw_env.unwrapped, benchmark, job, job["seed"])
+                controller_type = EvaluationScenarioController
+                if benchmark.get("protocol") == "four_stage":
+                    from g1.tasks.lower_limb_agent.evaluation_four_stage import FourStageScenarioController
+
+                    controller_type = FourStageScenarioController
+                controller = controller_type(raw_env.unwrapped, benchmark, job, job["seed"])
                 dump_yaml(str(cell / "effective_env.yaml"), env_cfg)
                 dump_yaml(str(cell / "effective_agent.yaml"), effective_agent)
                 records = run_rollouts(
@@ -235,6 +246,7 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                         "source_sha256": manifest["source_sha256"],
                         "environment": manifest["environment"],
                         "control_dt": raw_env.unwrapped.step_dt,
+                        "num_envs": runtime["num_envs"],
                         "upper_body_motion": benchmark["upper_body_motion"],
                         "upper_body_target_source": env_cfg.observations.policy.upper_body_target.params[
                             "target_source"
