@@ -332,6 +332,11 @@ class EvaluationProgress:
             f"当前：{self.job['checkpoint']['label']} · {self.job['module']} · 双臂 {self.job['arm_fraction']:g} "
             f"· 腰部 {self.job['waist_fraction']:g} · {self.job['policy_output']} · seed {self.job['seed']}"
         )
+        if self.job["module"] in ("walk_axes", "squat_tracking", "squat_walk_tracking", "squat_push"):
+            context = (
+                f"当前：{self.job['checkpoint']['label']} · {self.job['module']} "
+                f"· {self.job['policy_output']} · seed {self.job['seed']}"
+            )
         stage_time = self.state.get("stage_elapsed_s", 0) + max(0, self.clock() - self.observed)
         stage = (
             f"阶段：{STAGES[self.state['stage']]} | 单元已用 {_duration(self.clock() - self.job_started)} "

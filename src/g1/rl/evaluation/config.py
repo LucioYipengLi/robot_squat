@@ -207,6 +207,10 @@ def _benchmark(value):
 
 def validate_suite(raw: Mapping) -> dict:
     """Return a detached, normalized JSON-compatible suite or raise ``ValueError``."""
+    if isinstance(raw, Mapping) and raw.get("schema_version") == 2:
+        from .four_stage import validate_four_stage
+
+        return validate_four_stage(raw)
     raw = _mapping(
         raw, "suite config", ("schema_version", "suite", "task", "benchmark", "modules"), ("policy_outputs",)
     )

@@ -11,11 +11,12 @@ from g1.rl.evaluation.policy import _validate_saved_policy_semantics
 from g1.tasks.lower_limb_agent.config.g1.env_cfg import LowerLimbAgentEnvCfg
 
 
-def test_only_two_suites_use_progressive_limits_and_hash_them():
+def test_builtin_suites_use_progressive_limits_and_hash_them():
     from g1.rl.evaluation.config import SUITES_DIRECTORY
 
-    assert {p.stem for p in SUITES_DIRECTORY.glob("*.yaml")} == {"g1_core", "g1_robustness"}
-    for name in ("g1_core", "g1_robustness"):
+    names = {"g1_core", "g1_robustness", "g1_lower_four_stage", "g1_lower_push"}
+    assert {p.stem for p in SUITES_DIRECTORY.glob("*.yaml")} == names
+    for name in names:
         suite = load_suite(name)
         assert "profile" not in suite["benchmark"]["upper_body_motion"]
         changed = copy.deepcopy(suite)

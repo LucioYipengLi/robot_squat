@@ -14,6 +14,13 @@ def conditions(config: Mapping) -> list[dict]:
     fraction in per mille, so 0.555 is logged at TensorBoard step 555.
     """
     config = validate_suite(config)
+    if config["schema_version"] == 2:
+        from .four_stage import STAGES
+
+        return [
+            {"module": stage, "condition_id": stage, "axis_step": 0, "arm_fraction": 0.0, "waist_fraction": 0.0}
+            for stage in config.get("stages", STAGES)
+        ]
     result = []
     for module in config["modules"]:
         name = module["name"]

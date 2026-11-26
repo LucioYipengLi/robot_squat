@@ -10,7 +10,7 @@ import copy
 import hashlib
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -75,8 +75,8 @@ def prepare_env_cfg(env_cfg, benchmark: dict, condition: dict, num_envs: int, se
         "yaw_radps": "vel_yaw_success_threshold",
         "pelvis_xy_m": "pelvis_success_threshold",
     }
-    for name, field in threshold_fields.items():
-        setattr(command, field, benchmark["thresholds"][name])
+    for name, threshold_field in threshold_fields.items():
+        setattr(command, threshold_field, benchmark["thresholds"][name])
     for name in ("depth_frac", "vx_floor", "wz_floor"):
         setattr(command, "envelope_" + name, benchmark["envelope"][name])
     command.pelvis_target_speed = benchmark["pelvis_target_speed_mps"]
@@ -101,6 +101,7 @@ class CasePlan:
 
     commands: dict[int, tuple[float, ...]]
     disturbances: dict[int, tuple[float, ...]]
+    pushes: dict[int, tuple[float, float]] = field(default_factory=dict)
 
 
 def make_case_plan(benchmark: dict, seed: int, mode: int, episode_id: int, num_joints: int) -> CasePlan:
@@ -206,9 +207,10 @@ class EvaluationScenarioController:
         self._published_event_steps = [-1] * self.env.num_envs
         for slot, spec in enumerate(case_specs):
             self.modes[slot] = spec["mode"]
-            self.plans[slot] = make_case_plan(
-                self.benchmark, self.seed, spec["mode"], spec["episode_id"], len(self._joint_ids)
-            )
+            self.plans[slot] = self.make_plan(spec)
+
+    def make_plan(self, spec):
+        return make_case_plan(self.benchmark, self.seed, spec["mode"], spec["episode_id"], len(self._joint_ids))
 
     def assign_modes(self, env_ids: torch.Tensor) -> None:
         self.term.mode[env_ids] = self.modes[env_ids]
