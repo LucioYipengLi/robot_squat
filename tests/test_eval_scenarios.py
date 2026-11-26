@@ -82,6 +82,8 @@ def test_squat_walk_velocity_envelope_at_deepest_height(benchmark):
 
 @pytest.mark.parametrize("phase", [1, 2, 3])
 def test_prepare_disables_all_training_randomization_but_preserves_resets(benchmark, phase):
+    from isaaclab.managers import ObservationTermCfg
+
     from g1.tasks.lower_limb_agent.config.g1.env_cfg import LowerLimbAgentEnvCfg
     from g1.tasks.lower_limb_agent.config.g1.env_cfg_phase import (
         LowerLimbAgentEnvCfg_Phase2,
@@ -98,6 +100,11 @@ def test_prepare_disables_all_training_randomization_but_preserves_resets(benchm
     assert cfg.episode_length_s == 6
     assert cfg.curriculum is None
     assert not cfg.observations.policy.enable_corruption
+    assert all(
+        term.delay_min_lag == term.delay_max_lag == 0
+        for term in vars(cfg.observations.policy).values()
+        if isinstance(term, ObservationTermCfg)
+    )
     assert cfg.terminations.time_out is not None
     assert len(cfg._g1_eval_disturbance_groups) == 2
     for name, event in vars(cfg.events).items():

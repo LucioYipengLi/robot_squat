@@ -20,7 +20,7 @@ def conditions(config: Mapping) -> list[dict]:
     """Expand validated modules with deterministic IDs and comparable axis values.
 
     Tracking uses a single scenario at step zero; sweep steps encode the arm range
-    fraction in per mille, so 0.555 is logged at TensorBoard step 555.
+    fraction in per mille or the fixed action delay in physics substeps.
     """
     config = validate_suite(config)
     if config["schema_version"] == SCHEMA_VERSION:
@@ -35,6 +35,19 @@ def conditions(config: Mapping) -> list[dict]:
     result = []
     for module in config["modules"]:
         name = module["name"]
+        if name == "action_delay_sweep":
+            result.extend(
+                {
+                    "module": name,
+                    "condition_id": f"delay_{delay}",
+                    "axis_step": delay,
+                    "action_delay_steps": delay,
+                    "arm_fraction": module["arm_fraction"],
+                    "waist_fraction": module["waist_fraction"],
+                }
+                for delay in module["delay_steps"]
+            )
+            continue
         fractions = [module["arm_fraction"]] if name == "tracking" else module["arm_fractions"]
         waist = module["waist_fraction"]
         for arm in fractions:

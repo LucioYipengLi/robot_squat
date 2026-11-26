@@ -20,9 +20,9 @@ from .disturbance import joint_targets_from_uniform
 def prepare_env_cfg(env_cfg, benchmark: dict, condition: dict, num_envs: int, seed: int):
     """Apply a benchmark before environment construction, independent of play hooks.
 
-    Physical resets stay enabled and return authored nominal state. Every other
-    event (including Phase 2/3 randomization) is disabled. Disturbance groups are
-    retained separately for the deterministic controller to resolve after startup.
+    Physical resets return authored nominal state. Other events and observation delay
+    are disabled; an action delay sweep can supply a fixed actuator delay.
+    Disturbance groups are retained for the deterministic scenario controller.
     """
     if benchmark["observation_noise"]:
         raise ValueError("Evaluation v1 requires observation_noise=false for replayable test cases")
@@ -30,6 +30,8 @@ def prepare_env_cfg(env_cfg, benchmark: dict, condition: dict, num_envs: int, se
         raise ValueError("Evaluation v1 supports only nominal physical resets")
     env_cfg.scene.num_envs = num_envs
     env_cfg.seed = seed
+    delay = condition.get("action_delay_steps", 0)
+    env_cfg.lower_action_delay_steps = (delay, delay)
     env_cfg.episode_length_s = benchmark["episode_length_s"]
     actual_dt = env_cfg.sim.dt * env_cfg.decimation
     if not math.isclose(actual_dt, benchmark["control_dt"], rel_tol=0, abs_tol=1e-10):
@@ -57,6 +59,7 @@ def prepare_env_cfg(env_cfg, benchmark: dict, condition: dict, num_envs: int, se
     env_cfg.events.reset_base.params["velocity_range"] = {}
     env_cfg.events.reset_robot_joints.params["position_range"] = (0.0, 0.0)
     env_cfg.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+    env_cfg.observations.set_sensor_delay(0, 0)
     for group in vars(env_cfg.observations).values():
         if hasattr(group, "enable_corruption"):
             group.enable_corruption = False

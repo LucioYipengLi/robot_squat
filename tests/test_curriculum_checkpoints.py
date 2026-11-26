@@ -34,7 +34,8 @@ class _Environment:
             self.cfg.play_mode()
         self.num_envs = num_envs
         self.device = "cpu"
-        self.step_dt = self.cfg.sim.dt * self.cfg.decimation
+        self.physics_dt = self.cfg.sim.dt
+        self.step_dt = self.physics_dt * self.cfg.decimation
         self.max_episode_length = round(self.cfg.episode_length_s / self.step_dt)
         self.common_step_counter = 0
         self.episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
@@ -418,6 +419,9 @@ def test_runner_save_load_preserves_other_infos_and_restores_before_next_rollout
     target = _runner(_Environment(2), tmp_path)
     result = target.load(path)
     assert result["other"] == {"value": 7}
+    assert result["g1_lower_action_delay"]["range_physics_steps"] == [0, 0]
+    assert result["g1_lower_action_delay"]["physics_dt_s"] == 1 / 120
+    assert target.env.unwrapped.cfg.lower_action_delay_steps == (0, 5)
     assert target.alg.loads == 1
     assert target.env.unwrapped.term.cfg.ranges.height_offset == (-0.31, 0.04)
     assert target._curriculum_loaded

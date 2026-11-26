@@ -30,18 +30,19 @@ uv run python -m g1.rl eval --suite g1_upper_fixed_targets --checkpoints "upper_
 
 ### 1. 选择要回答的问题
 
-suite（评估套件）规定测试条件、回合预算、种子和测试模块。内置套件统一为以下两个，均采用渐进上肢扰动：
+suite（评估套件）规定测试条件、回合预算、种子和测试模块。常用的下肢跟踪、上肢扰动与下肢执行延迟套件如下：
 
 | 套件 | 评估内容 | 适合回答的问题 | 默认规模：每个检查点 |
 | --- | --- | --- | --- |
 | [`g1_core`](../src/g1/rl/evaluation/suites/g1_core.yaml) | 基础任务跟踪，双臂和腰部目标保持默认姿态；站立、下蹲、行走比例为 33% / 33% / 34%，跳过蹲行 | 模型的基础技能如何？后期检查点是否比早期退化？ | 3 个种子，2,400 回合，3 个评估单元 |
 | [`g1_robustness`](../src/g1/rl/evaluation/suites/g1_robustness.yaml) | 站立、下蹲、行走比例为 33% / 33% / 34%，跳过蹲行；先测无扰动跟踪，再扫描双臂比例 0.2、0.3、0.4、0.555，腰部固定为 0.1 | 上肢运动多大时开始影响下肢任务？哪个检查点更耐受扰动？ | 5 个条件 × 3 个种子，12,000 回合，15 个评估单元 |
+| [`g1_lower_delay`](../src/g1/rl/evaluation/suites/g1_lower_delay.yaml) | 等量评估站立、下蹲、行走、蹲行；固定下肢延迟 0–5 步，上肢无扰动 | 哪种模式最先受延迟影响？训练后的策略是否更耐受延迟？ | 6 个条件 × 3 个种子，7,200 回合，18 个评估单元 |
 
-两者默认都使用均值动作 `mean`，每回合上限 6 秒，每个种子、每个条件 800 回合，种子为 101、202、303。上肢比例表示关节默认姿态到限位余量的使用比例，例如 `0.555` 对应 55.5% 的目标范围。
+三个套件默认都使用均值动作 `mean`，每回合上限 6 秒，种子为 101、202、303。每个种子、每个条件的回合数量分别为 800、800、400。上肢比例表示关节默认姿态到限位余量的使用比例，例如 `0.555` 对应 55.5% 的目标范围。
 
 内置高度偏移范围为 `[-0.15, 0.02] m`，采用标称初始状态，关闭观测噪声及训练随机化。它们衡量共同固定场景下的能力。复盘更深下蹲、Phase 2 物理随机化或 Phase 3 外部推扰，需要相应的自定义套件或新模块，见第二部分。
 
-两个套件当前使用相同模式比例。比较检查点时，让所有检查点参加同一套件和相同执行配置。实际条件以本次 `manifest.json` 为准。
+比较检查点时，让所有检查点参加同一套件并使用相同执行配置。实际条件以本次 `manifest.json` 为准。
 
 ### 2. 运行一次评估
 
@@ -128,6 +129,8 @@ uv run tensorboard --logdir "$($report.tensorboard_dir)"
 2. 在左侧 Runs 中选择同一模块和动作方式，例如 `upper_body_sweep/mean/early` 与 `upper_body_sweep/mean/late`。检查点分别对应 run，颜色随 run 区分。
 3. 将平滑设为 **0**。每张图比较同一模式、同一指标下的多个检查点。
 4. `tracking` 横轴为固定场景编号 0，只有一个统计点，可结合悬停数值或 `summary.csv` 比较。`upper_body_sweep` 横轴为双臂目标范围比例的千分值，200 表示 0.2，555 表示 0.555。
+
+`action_delay_sweep` 的横轴为固定延迟的物理步数，`summary.csv` 和 `summary.json` 同时给出 `action_delay_steps` 与 `action_delay_ms`。
 
 `--logdir` 指向**一个报告版本的 `tensorboard` 目录**。每次汇总会保留独立版本，选定版本可使显示的曲线集合保持清楚。
 
@@ -237,10 +240,12 @@ uv run python -m g1.rl eval --resume outputs/eval/deep_compare
 | `envelope` | 蹲行深度比例与最深可行走高度处的前进、转向上限锚点，沿用训练的梯形包络语义 |
 | `thresholds` | 回合平均误差的达标阈值，采用严格小于判断 |
 | `policy_outputs` | `mean`、`sample` 的非空列表，取值不重复 |
-| `modules` | 选择 `tracking`、`upper_body_sweep` 或两者；每种模块最多配置一次 |
+| `modules` | 选择 `tracking`、`upper_body_sweep`、`action_delay_sweep` 中的一种或多种；每种最多配置一次 |
 | `arm_fraction` / `arm_fractions` / `waist_fraction` | 目标范围比例在 `[0,1]` 内，按 0.001 递增；扫描列表各点不重复，按升序执行 |
 
 `tracking` 使用单个双臂比例和腰部比例，内置套件均为 0。`upper_body_sweep` 使用双臂比例列表，腰部比例在整个扫描中固定。关节目标围绕默认姿态，按目标方向到限位的余量缩放，保留非对称限位映射。
+
+`action_delay_sweep` 使用不重复的非负整数 `delay_steps` 列表，双臂 `arm_fraction` 和腰部 `waist_fraction` 在整个扫描中固定。
 
 配置按严格字段校验，未知字段和拼写错误会报错。新批次支持以下 CLI 覆盖，最终展开配置写入 manifest：
 
@@ -405,6 +410,33 @@ uv run python -m g1.rl eval --resume outputs/eval/deep_compare
 $env:G1_EVAL_PHYSICS_SMOKE = '1'
 uv run --extra isaacsim pytest tests/test_eval_physics.py --basetemp outputs/pytest-eval-physx-local -q
 ```
+
+## 下肢执行延迟
+
+策略仍每 16.67 ms 产生动作；映射到关节位置的目标每 8.33 ms 进入一次延迟缓冲，然后交给原有的电机模型。每个子环境独立抽取一个整数延迟，12 个下肢关节共享该值，回合中不变。重置时只清空对应环境的历史；在本回合首个目标到达之前，电机以重置时的关节位置为目标。传感器、观测和上肢扰动时序不受此配置控制。
+
+| 运行方式 | 默认延迟 |
+| --- | --- |
+| Phase 1 训练 | 0 步 |
+| Phase 2/3 训练 | 0–5 步均匀随机，约 0–41.7 ms |
+| 标准 `play`、`teleop` 和其他评估套件 | 0 步 |
+| `g1_lower_delay` 评估 | 固定扫描 0、1、2、3、4、5 步 |
+
+训练或回放可用 Hydra 覆盖 `"env.lower_action_delay_steps=[0,0]"` 关闭，或用 `"env.lower_action_delay_steps=[3,3]"` 固定 25 ms。非零延迟要求物理后端允许逐个物理子步下发目标，推荐使用 `physics=isaacsim_physx`。这与可视化器的选择无关。
+
+训练时，`ActionDelay/episode_ms` 是本次日志聚合中**已结束回合**的平均采样延迟。配置范围和物理步长同时保存在 `params/env.yaml` 及 checkpoint 的 `infos.g1_lower_action_delay`；续训以本次任务配置为准，新回合重新采样。该机制未接入 Upper-Mobile 的冻结 Lower 执行链路。
+
+```powershell
+uv run --extra isaacsim python -m g1.rl eval --suite g1_lower_delay --checkpoints "baseline=<无延迟训练检查点.pt>" "delay_dr=<延迟随机化训练检查点.pt>" --num_envs 128 --output outputs/eval/lower_delay_compare
+```
+
+先比较 0 步的联合成功率和失败率，再看 3–5 步的变化；按模式检查生存比例、速度及高度误差。若要隔离延迟训练的收益，两个分支从同一个 Phase 1 checkpoint 续训 Phase 2，保持物理随机化配置、种子和迭代数一致，仅切换延迟范围。
+
+## 下肢观测延迟
+
+Phase 2/3 训练使用 IsaacLab 原生观测延迟，仅作用于根部线速度、角速度、投影重力，以及关节位置和速度。这五项对每个子环境分别在重置时从 `[0,1]` 帧采样，整回合固定。当前每帧为一个控制步（约 16.7 ms），与执行延迟的物理步不同。延迟后的样本再进入原有的 5 帧历史。指令、上一动作和上肢目标预告仍按原时序进入观测。
+
+Phase 1、标准回放、遥操作和现有固定条件评估保持零观测延迟，Upper-Mobile 的冻结 Lower 也继续使用零延迟。训练时的各项延迟范围保存在 `params/env.yaml`。
 
 ## 上肢运动参数
 

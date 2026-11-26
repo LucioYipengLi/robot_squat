@@ -21,13 +21,15 @@ also recover the checkpoint's actual command distribution. Old checkpoints requi
 explicit --curriculum-snapshot JSON; unknown training conditions are never inferred.
 """
 
+from dataclasses import field
+
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
 
 from ... import mdp
-from .env_cfg import CurriculumCfg, EventCfg, LowerLimbAgentEnvCfg, RewardsCfg
+from .env_cfg import CurriculumCfg, EventCfg, LowerLimbAgentEnvCfg, ObservationsCfg, RewardsCfg
 
 
 @configclass
@@ -112,11 +114,19 @@ class EventCfg_Phase2(EventCfg):
     )
 
 
+def _phase2_observations() -> ObservationsCfg:
+    observations = ObservationsCfg()
+    observations.set_sensor_delay(0, 1)
+    return observations
+
+
 @configclass
 class LowerLimbAgentEnvCfg_Phase2(LowerLimbAgentEnvCfg):
-    """Resume Phase 1's actual task distribution, adding static physics DR."""
+    """Resume Phase 1's task distribution with physics and delay randomization."""
 
     training_phase: int = 2
+    lower_action_delay_steps: tuple[int, int] = (0, 5)
+    observations: ObservationsCfg = field(default_factory=_phase2_observations)
     events: EventCfg_Phase2 = EventCfg_Phase2()
     rewards: RewardsCfg = RewardsCfg()
 

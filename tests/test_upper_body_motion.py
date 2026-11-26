@@ -78,6 +78,7 @@ def test_action_hook_delegates_lower_body_and_advances_exactly_once(monkeypatch,
     action = LowerBodyPositionAction.__new__(LowerBodyPositionAction)
     action._env = SimpleNamespace(upper_body_motion=SimpleNamespace(advance=lambda value: calls.append(value)))
     action._motion_dt = dt
+    action._delay = None
     action.apply_actions()
     assert calls == ["lower", dt]
 

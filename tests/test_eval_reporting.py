@@ -70,6 +70,14 @@ def _row(rows, mode):
     return next(row for row in rows if row["mode"] == mode)
 
 
+def test_delay_sweep_reports_fixed_step_and_measured_milliseconds():
+    case = _case(module="action_delay_sweep", fraction=0.0)
+    case.update(condition_id="delay_5", axis_step=5, action_delay_steps=5, action_delay_ms=1000 * 5 / 120)
+    row = _row(summarize_results(_config(), [case]), "stand")
+    assert row["axis_step"] == row["action_delay_steps"] == 5
+    assert row["action_delay_ms"] == pytest.approx(41.6667)
+
+
 def test_joint_success_uses_strict_thresholds_and_natural_timeout_without_failure():
     episodes = [
         _episode(0),

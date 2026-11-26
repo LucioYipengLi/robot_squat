@@ -65,6 +65,9 @@ def test_reset_discards_stale_commands_after_physical_reset(monkeypatch, env_ids
     project_env = LowerLimbAgentEnv.__new__(LowerLimbAgentEnv)
     project_env.scene = {"robot": robot}
     project_env.command_manager = SimpleNamespace(active_terms=[])
+    project_env.action_manager = SimpleNamespace(
+        get_term=lambda name: SimpleNamespace(completed_delay_ms=lambda ids: None)
+    )
     # Use a reordered, noncontiguous device selection as finalized SceneEntityCfg does.
     upper_ids = torch.tensor([4, 1], dtype=torch.int32)
     entity = SimpleNamespace(name="robot", joint_ids=upper_ids)
@@ -121,6 +124,10 @@ def test_reset_log_preserves_each_episode_sample_before_statistics_are_cleared(m
     env = LowerLimbAgentEnv.__new__(LowerLimbAgentEnv)
     env.scene = {"robot": robot}
     env.command_manager = SimpleNamespace(active_terms=[])
+    delay_samples = torch.tensor([0.0, 41.6667])
+    env.action_manager = SimpleNamespace(
+        get_term=lambda name: SimpleNamespace(completed_delay_ms=lambda ids: delay_samples.clone())
+    )
     entity = SimpleNamespace(name="robot", joint_ids=torch.tensor([4, 1]))
     env.observation_manager = SimpleNamespace(
         cfg=SimpleNamespace(policy=SimpleNamespace(upper_body_target=SimpleNamespace(params={"asset_cfg": entity})))
@@ -132,10 +139,12 @@ def test_reset_log_preserves_each_episode_sample_before_statistics_are_cleared(m
 
     def physical_reset(self, ids):
         self.extras = {"log": {}}
+        delay_samples.zero_()
 
     monkeypatch.setattr(ManagerBasedRLEnv, "_reset_idx", physical_reset)
     env._reset_idx(torch.tensor([1, 3]))
     log = env.extras["log"]
+    torch.testing.assert_close(log["ActionDelay/episode_ms"], torch.tensor([0.0, 41.6667]))
     torch.testing.assert_close(log["UpperBodyMotion/started_per_episode"], torch.tensor([2.0, 1.0]))
     torch.testing.assert_close(log["UpperBodyMotion/reference_completion_rate"], torch.tensor([0.5, 1.0]))
     assert not stats[[1, 3]].any()

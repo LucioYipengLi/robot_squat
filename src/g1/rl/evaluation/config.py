@@ -236,13 +236,26 @@ def validate_suite(raw: Mapping) -> dict:
     names = set()
     for index, module in enumerate(_sequence(raw["modules"], "modules")):
         path = f"modules[{index}]"
-        if not isinstance(module, Mapping) or module.get("name") not in ("tracking", "upper_body_sweep"):
-            raise ValueError(f"{path}.name must be 'tracking' or 'upper_body_sweep'")
+        if not isinstance(module, Mapping) or module.get("name") not in (
+            "tracking", "upper_body_sweep", "action_delay_sweep"
+        ):
+            raise ValueError(f"{path}.name must be 'tracking', 'upper_body_sweep' or 'action_delay_sweep'")
         name_value = module["name"]
         if name_value in names:
             raise ValueError(f"Duplicate evaluation module {name_value!r}")
         names.add(name_value)
-        if name_value == "tracking":
+        if name_value == "action_delay_sweep":
+            _mapping(module, path, ("name", "delay_steps", "arm_fraction", "waist_fraction"))
+            delay_path = f"{path}.delay_steps"
+            delays = [_integer(item, delay_path) for item in _sequence(module["delay_steps"], delay_path)]
+            if len(set(delays)) != len(delays):
+                raise ValueError(f"{path}.delay_steps must be unique")
+            normalized = {
+                "name": name_value,
+                "delay_steps": sorted(delays),
+                "arm_fraction": fraction_axis_step(module["arm_fraction"], f"{path}.arm_fraction") / 1000,
+            }
+        elif name_value == "tracking":
             _mapping(module, path, ("name", "arm_fraction", "waist_fraction"))
             normalized = {
                 "name": name_value,

@@ -7,7 +7,7 @@ An installable downstream Isaac Lab task package with a standard uv `src` layout
 The registered tasks are:
 
 - `Template-G1-v0`: Phase 1.
-- `Template-G1-Phase2-v0`: Phase 2, adding static physics randomization.
+- `Template-G1-Phase2-v0`: Phase 2, adding static physics randomization and lower-limb actuation delay.
 - `Template-G1-Phase3-v0`: Phase 3, adding external pushes.
 - `Template-G1-Upper-v0`: fixed-base waist/arm control with left-only, right-only and dual-arm modes, tracking world-fixed wrist goals observed in the live pelvis frame.
 - `Template-G1-Upper-Mobile-v0`: free-base Upper training with a frozen Lower actor executing a fixed zero-velocity standing command. See [frozen Lower standing](docs/FROZEN_LOWER_STANDING.md).
@@ -138,7 +138,7 @@ Select the target phase's task ID and explicitly provide a checkpoint from the i
 Command ranges, mode weights and disturbance magnitudes are inherited automatically:
 
 ```bash
-# Phase 1 → Phase 2: add static physics randomization
+# Phase 1 → Phase 2: add static physics randomization and actuation delay
 uv run --extra isaacsim python -m g1.rl train --task Template-G1-Phase2-v0 --checkpoint "<phase1_model.pt>" --max_iterations 5000 physics=isaacsim_physx
 
 # Phase 2 → Phase 3: add external pushes
@@ -148,6 +148,10 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Phase3-v0 --che
 Phase transitions inherit the live task distribution and cumulative curriculum progress, while rebuilding
 gate statistics under the new phase's conditions. Phase 2/3 require a checkpoint; phase skips and reverse
 transitions are rejected.
+
+Phase 2/3 sample one lower-limb actuation delay of 0–5 physics steps (about 0–41.7 ms) per environment
+on reset and hold it for the episode. See [lower-limb actuation delay](docs/EVALUATION.md#下肢执行延迟) (Chinese)
+for configuration, logs and fixed-delay comparisons.
 
 Phase 3 starts with per-axis velocity increments of ±0.10 m/s and progressively expands to ±0.70 m/s
 when both survival EMA and task success pass their gates. See the [push curriculum configuration](docs/CURRICULUM_CHECKPOINTS.md#phase-3-推扰课程与调参) (Chinese).

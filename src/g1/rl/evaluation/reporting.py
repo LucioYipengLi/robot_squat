@@ -301,6 +301,12 @@ def summarize_results(config, results):
             "checkpoint_sha256": reference["checkpoint"]["sha256"],
             **{key: reference[key] for key in _GROUP_FIELDS},
         }
+        if reference["module"] == "action_delay_sweep":
+            delay = reference["axis_step"]
+            delay_ms = _finite(reference["action_delay_ms"], "action_delay_ms")
+            if any(case["action_delay_steps"] != delay or case["action_delay_ms"] != delay_ms for case in cases):
+                raise ValueError("Inconsistent fixed action delay across evaluation seeds")
+            identity.update(action_delay_steps=delay, action_delay_ms=delay_ms)
         episode_sets = {mode: [] for mode in weights}
         seed_metrics = {}
         for case in cases:
@@ -473,6 +479,8 @@ def _write_events(directory, rows):
         axis = (
             "双臂目标范围比例‰"
             if module == "upper_body_sweep"
+            else "下肢执行延迟（物理步）"
+            if module == "action_delay_sweep"
             else "0 近端，1 远端"
             if module == UPPER_PROTOCOL
             else "高度编号"

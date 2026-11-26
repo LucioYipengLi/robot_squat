@@ -43,6 +43,7 @@ from ...walk import WALK_COMMAND_THRESHOLD
 from .utils import G1_29DOF_CFG
 
 WALK_SWING_TIME = 0.4
+SENSOR_DELAY_TERMS = ("base_lin_vel", "base_ang_vel", "projected_gravity", "joint_pos", "joint_vel")
 
 
 @configclass
@@ -198,6 +199,13 @@ class ObservationsCfg:
 
     # observation groups
     policy: PolicyCfg = PolicyCfg()
+
+    def set_sensor_delay(self, min_lag: int, max_lag: int) -> None:
+        """Set native observation lag bounds in control samples for the five sensor terms."""
+        for name in SENSOR_DELAY_TERMS:
+            term = getattr(self.policy, name)
+            term.delay_min_lag = min_lag
+            term.delay_max_lag = max_lag
 
 
 @configclass
@@ -628,6 +636,7 @@ class LowerLimbAgentEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the G1 lower-limb agent environment (stand / squat / walk / squat-walk)."""
     task_family: str = "lower_limb_agent"
     training_phase: int = 1
+    lower_action_delay_steps: tuple[int, int] = (0, 0)
     # Simulation settings
     upper_body_motion: UpperBodyMotionCfg = UpperBodyMotionCfg()
     sim: SimulationCfg = SimulationCfg(physics=LowerLimbAgentPhysicsCfg())
@@ -669,6 +678,8 @@ class LowerLimbAgentEnvCfg(ManagerBasedRLEnvCfg):
         super().play_mode()
         self.scene.num_envs = min(self.scene.num_envs, 10)
         self.curriculum = None
+        self.lower_action_delay_steps = (0, 0)
+        self.observations.set_sensor_delay(0, 0)
         self.events.physics_material = None
         if self.events.upper_body_disturbance is not None:
             from ...curriculum_state import disturbance_layout

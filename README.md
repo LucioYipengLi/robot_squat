@@ -7,7 +7,7 @@
 已注册的任务有：
 
 - `Template-G1-v0`：Phase 1。
-- `Template-G1-Phase2-v0`：Phase 2，增加静态物理随机化。
+- `Template-G1-Phase2-v0`：Phase 2，增加静态物理随机化和下肢执行延迟。
 - `Template-G1-Phase3-v0`：Phase 3，增加外部推力。
 - `Template-G1-Upper-v0`：固定根节点，控制腰部与双臂，按左手、右手、双手三种模式跟踪世界固定目标，观测使用实时盆骨相对位姿。
 - `Template-G1-Upper-Mobile-v0`：自由底座，Upper控制腰臂与六维下肢指令（速度、高度、骨盆偏移），冻结Lower执行。
@@ -136,7 +136,7 @@ Phase 1/3 同理：同时替换为对应阶段的任务 ID 和检查点。同阶
 选择目标阶段的任务 ID，并显式指定相邻上一阶段的检查点。无需手工填写上一阶段的指令范围、模式权重和扰动幅度：
 
 ```bash
-# Phase 1 → Phase 2：增加静态物理随机化
+# Phase 1 → Phase 2：增加静态物理随机化和下肢执行延迟
 uv run --extra isaacsim python -m g1.rl train --task Template-G1-Phase2-v0 --checkpoint "<phase1_model.pt>" --max_iterations 5000 physics=isaacsim_physx
 
 # Phase 2 → Phase 3：增加外部推力
@@ -144,6 +144,8 @@ uv run --extra isaacsim python -m g1.rl train --task Template-G1-Phase3-v0 --che
 ```
 
 跨阶段继承实际任务分布和累计课程进度，重新积累新阶段条件下的门控统计。Phase 2/3 必须加载检查点，不能跳过阶段或逆向迁移。
+
+下肢执行延迟从 Phase 2 起默认启用。每个子环境在回合重置时抽取 0–5 个物理步（约 0–41.7 ms），整回合固定。参数、日志和对照评估见 [下肢执行延迟](docs/EVALUATION.md#下肢执行延迟)。
 
 Phase 3 推扰从每轴 ±0.10 m/s 的速度增量开始，存活 EMA 和联合成功率同时达标后逐渐扩大至 ±0.70 m/s。
 两个门槛可在 Phase 3 课程配置中独立调整，见 [推扰课程与调参](docs/CURRICULUM_CHECKPOINTS.md#phase-3-推扰课程与调参)。

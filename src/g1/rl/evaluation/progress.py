@@ -334,6 +334,8 @@ class EvaluationProgress:
         context = f"当前：{self.job['checkpoint']['label']} · {module}"
         if module == UPPER_PROTOCOL:
             context += " · 近端" if self.job["condition_id"] == "near" else " · 远端"
+        elif module == "action_delay_sweep":
+            context += f" · 延迟 {self.job['action_delay_steps']} 物理步"
         elif module not in ("walk_axes", "squat_tracking", "squat_walk_tracking", "squat_push"):
             context += f" · 双臂 {self.job['arm_fraction']:g} · 腰部 {self.job['waist_fraction']:g}"
         context += f" · {self.job['policy_output']} · seed {self.job['seed']}"

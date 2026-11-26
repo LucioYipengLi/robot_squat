@@ -86,8 +86,8 @@ def _upper_body_target_source(record: dict) -> str:
     return source
 
 
-def _observation_layout(group: dict, *, upper_body_target_source="final_goal") -> dict:
-    """Describe active term order and effective processing, excluding benchmark noise."""
+def _observation_layout(group: dict, *, upper_body_target_source="final_goal", sensor_delay_terms=()) -> dict:
+    """Describe term order and processing, excluding benchmark-controlled noise and sensor delay bounds."""
     if not isinstance(group, dict):
         raise ValueError("Policy observation configuration must be a mapping")
     settings, terms = {}, []
@@ -96,6 +96,9 @@ def _observation_layout(group: dict, *, upper_body_target_source="final_goal") -
             continue
         if isinstance(value, dict) and "func" in value:
             term = {key: item for key, item in value.items() if key != "noise"}
+            if name in sensor_delay_terms:
+                term.pop("delay_min_lag", None)
+                term.pop("delay_max_lag", None)
             if (
                 name == "upper_body_target"
                 and term["func"] == "g1.tasks.lower_limb_agent.mdp.observations:upper_body_joint_pos_target_rel"
@@ -156,11 +159,15 @@ def _validate_saved_policy_semantics(env_cfg, saved: dict) -> None:
     """Check equal-sized observation/action layouts using official callable serialization."""
     from isaaclab.utils import to_dict
 
+    from g1.tasks.lower_limb_agent.config.g1.env_cfg import SENSOR_DELAY_TERMS
+
     try:
         expected_obs = _observation_layout(
-            saved["observations"]["policy"], upper_body_target_source=_upper_body_target_source(saved)
+            saved["observations"]["policy"],
+            upper_body_target_source=_upper_body_target_source(saved),
+            sensor_delay_terms=SENSOR_DELAY_TERMS,
         )
-        actual_obs = _observation_layout(to_dict(env_cfg.observations.policy))
+        actual_obs = _observation_layout(to_dict(env_cfg.observations.policy), sensor_delay_terms=SENSOR_DELAY_TERMS)
         expected_actions = _action_layout(saved["actions"])
         actual_actions = _action_layout(to_dict(env_cfg.actions))
     except (KeyError, TypeError, AttributeError) as error:

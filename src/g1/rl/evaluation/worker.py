@@ -277,6 +277,8 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                         "case_specs_sha256": canonical_digest(specs),
                     },
                 }
+                if "action_delay_steps" in job:
+                    result["action_delay_ms"] = job["action_delay_steps"] * raw_env.unwrapped.physics_dt * 1000
                 write_json(result_path(directory, job), result)
                 print(f"Saved {result_path(directory, job)}", flush=True)
             finally:

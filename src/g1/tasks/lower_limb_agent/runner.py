@@ -57,7 +57,13 @@ class CurriculumOnPolicyRunner(OnPolicyRunner):
 
     def save(self, path, infos=None):
         metadata = {} if infos is None else copy.deepcopy(infos)
-        metadata[STATE_KEY] = export_curriculum_state(self.env.unwrapped)
+        env = self.env.unwrapped
+        metadata[STATE_KEY] = export_curriculum_state(env)
+        metadata["g1_lower_action_delay"] = {
+            "range_physics_steps": list(env.cfg.lower_action_delay_steps),
+            "physics_dt_s": env.physics_dt,
+            "sampling": "uniform_per_environment_per_episode",
+        }
         super().save(path, infos=metadata)
 
     def load(self, path, load_cfg=None, strict=True, map_location=None):

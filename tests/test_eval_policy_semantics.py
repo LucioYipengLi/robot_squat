@@ -18,6 +18,7 @@ from g1.rl.evaluation.policy import (
     validate_policy_compatibility,
 )
 from g1.tasks.lower_limb_agent.config.g1.env_cfg import LowerLimbAgentEnvCfg
+from g1.tasks.lower_limb_agent.config.g1.env_cfg_phase import LowerLimbAgentEnvCfg_Phase2
 from g1.tasks.lower_limb_agent.curriculum_state import _compatibility
 
 
@@ -82,8 +83,6 @@ def test_reordered_equal_sized_observation_terms_are_rejected():
         ("clip", (-2.0, 2.0)),
         ("func", "isaaclab.envs.mdp.observations:base_ang_vel"),
         ("params", {"unexpected_argument": True}),
-        ("delay_min_lag", 1),
-        ("delay_max_lag", 2),
         ("delay_hold_prob", 0.5),
         ("modifiers", [{"func": "example.module:modifier", "params": {}}]),
     ],
@@ -93,6 +92,22 @@ def test_same_shape_processing_changes_are_rejected(field, value):
     saved = to_dict(env.cfg)
     saved["observations"]["policy"]["base_lin_vel"][field] = value
     with pytest.raises(ValueError, match="observation layout"):
+        _validate_saved_policy_semantics(env.cfg, saved)
+
+
+def test_phase2_sensor_delay_can_be_disabled_in_nominal_eval(tmp_path):
+    env = SimpleNamespace(cfg=LowerLimbAgentEnvCfg_Phase2(), step_dt=1 / 60)
+    checkpoint = _save_env(tmp_path, env)
+    env.cfg.play_mode()
+    assert validate_policy_compatibility(env, checkpoint, _infos(env)) == "checkpoint_metadata+saved_env_config"
+
+
+@pytest.mark.parametrize("field", ["delay_min_lag", "delay_max_lag"])
+def test_delay_changes_for_other_terms_are_rejected(field):
+    env = _raw_env()
+    saved = to_dict(env.cfg)
+    saved["observations"]["policy"]["velocity_commands"][field] = 1
+    with pytest.raises(ValueError, match=f"observation layout.*{field}"):
         _validate_saved_policy_semantics(env.cfg, saved)
 
 

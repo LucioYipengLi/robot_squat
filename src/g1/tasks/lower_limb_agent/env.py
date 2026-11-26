@@ -23,7 +23,10 @@ class LowerLimbAgentEnv(ManagerBasedRLEnv):
             term = self.command_manager.get_term(name)
             if isinstance(term, SquatWalkCommand):
                 term._update_metrics()
+        delay_ms = self.action_manager.get_term("joint_pos").completed_delay_ms(env_ids)
         super()._reset_idx(env_ids)
+        if delay_ms is not None and delay_ms.numel():
+            self.extras["log"]["ActionDelay/episode_ms"] = delay_ms
         motion = getattr(self, "upper_body_motion", None)
         if motion is not None:
             # Preserve per-episode samples before trajectory.reset clears them.
