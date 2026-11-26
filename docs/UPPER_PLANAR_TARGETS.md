@@ -53,8 +53,16 @@ uv run python -m g1.rl play --task Template-G1-Upper-Mobile-v0 --checkpoint "<ch
 续训需设置 `range_curriculum.reset_on_load=true`，并显式将 `initial_level` 设为所需起点。
 `failures mine` 默认恢复 checkpoint 的组内采样，指定 `--planar-sampling transition` 使用 v8 的统一分布做版本对照。
 
+Mobile 训练开启过渡场采样后，`planar_turn_focus` 从 Level 5 起自动加密本等级新增的绝对转角区间。
+默认将 Turn 组内 70%、Wide 组内 40% 的回合用于专项，左右等概率。Level 5–10 的专项分别抽
+45–65°、65–90°、90–115°、115–140°、140–160°、160–180°。各组配额和给定角度下的距离规则沿用原课程。
+晋级统计在每组保留同一比例的原生样本，保持原生组别分布。默认 Level 5–9 保留 30%，Level 10 保留 60%。
+专项训练从同一 checkpoint 开关对照时，设 `env.commands.wrist_pose.planar_turn_focus.enabled=false` 可恢复原生训练分布。
+Play、Teleop 和失败评估沿用原生采样。
+
 训练日志的 `Metrics/wrist_pose/task/planar/<group>/` 记录已结束回合数、每 10 机器人秒失败频率、
 进入近场比例、首次入场时间及完整评价窗的腕部达标率。近场以骨盆距离和朝向同时达标为准。
+`Metrics/wrist_pose/task/planar/turn_focus/<group>/` 另给出专项表现，包括前 0.1 秒内的 `base_contact` 比例。
 `failures mine` 在正常与失败的平面回合中均写入对应字段，并在 `summary.json` 汇总为 `planar_groups`。
 
 用同一个 v6 起点比较旧采样和新采样。两支都固定 Level 3、20% 平面比例、开启远场奖励，

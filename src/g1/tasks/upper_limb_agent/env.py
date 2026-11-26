@@ -4,9 +4,23 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
+from .config.g1.domain_randomization import configure_domain_randomization
+
 
 class UpperLimbMobileEnv(ManagerBasedRLEnv):
+    _target_pose_noise = None
+
+    def __init__(self, cfg, **kwargs):
+        configure_domain_randomization(cfg)
+        super().__init__(cfg, **kwargs)
+
     def load_managers(self):
+        dr = self.cfg.domain_randomization
+        self._target_pose_noise = None
+        if dr.phase >= 2 and (dr.target_position_noise_m > 0 or dr.target_rotation_noise_rad > 0):
+            from .mdp.observations import TargetPoseNoise
+
+            self._target_pose_noise = TargetPoseNoise(self, dr)
         if self.cfg.legacy_observations:
             from .config.g1.mobile_env_cfg import LegacyMobileObservationsCfg
 
@@ -55,4 +69,6 @@ class UpperLimbMobileEnv(ManagerBasedRLEnv):
                 f"Episode_Reward/{name}": means[index] for index, name in enumerate(self.reward_manager.active_terms)
             }
         super()._reset_idx(env_ids)
+        if self._target_pose_noise is not None:
+            self._target_pose_noise.reset(env_ids)
         self.extras["log"].update(rates)

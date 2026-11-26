@@ -33,6 +33,64 @@ uv run python -m g1.rl play --task Template-G1-Upper-Mobile-v0 --checkpoint "<23
 默认续训会把保留特征的首层权重迁移到最近一帧，其余历史和双腿输入列从零权重开始，使用新优化器。
 如需沿用旧布局，训练时指定 `env.legacy_observations=true`。该布局支持 `--resume_optimizer_state`。
 
+## Upper 域随机化续训
+
+通过 `env.domain_randomization.phase` 选择阶段，默认 Phase 1。Phase 2 至 4 使用 660 维观测，
+从上一阶段或同阶段的 checkpoint 续训。每个阶段继承前一阶段的扰动。
+
+| 阶段 | 新增扰动 |
+| --- | --- |
+| 1 | 标称环境 |
+| 2 | 29 轴关节位置 ±0.01 rad、速度 ±1.5 rad/s。基座线速度 ±0.10 m/s、角速度 ±0.20 rad/s、投影重力每轴 ±0.05。活动手目标观测每 0.10 s 重采样一次，位置和旋转扰动的模长分别限制在 3 mm 和 0.01 rad。 |
+| 3 | 腰臂 17 个关节的 Kp/Kd、躯干和双臂连杆质量使用 0.90–1.10 倍对数均匀缩放。左右手掌各叠加 0–0.30 kg 均匀负载并更新惯量。每个环境启动时采样一次。 |
+| 4 | 每个环境间隔 4–6 s，在世界 x/y 轴对根节点速度各叠加 ±0.30 m/s 内的均匀增量。 |
+
+腕部实际位姿由 IsaacLab 连杆位姿转换到骨盆坐标系。目标观测和位姿误差共用一次扰动采样，真实任务目标、
+跟踪奖励和达标统计沿用真值。噪声在写入五步观测历史前施加。冻结 Lower 使用自己的观测链路。
+
+续训读取源 checkpoint 的 Level、实际 Planar 占比、Regular 回收和 Planar 目标采样设置。专项转角配置优先
+从 checkpoint 恢复，旧 checkpoint 从同目录的 `params/env.yaml` 恢复。首次进入新阶段会清空 EMA、
+失败窗口和 Planar 扩频历史，并从当前进度开始一次完整检查。同阶段、同扰动配置续训恢复已有统计。
+
+顺序跑完 Phase 2、3、4 时，使用脚本并显式填写起始 checkpoint。脚本分别训练 4,000、10,000、6,000 轮，
+固定继承的 Level 与 Planar 占比，并在每阶段结束后校验最终 checkpoint 再继续。各阶段的终端输出保存在各自运行目录下的 `console.log`。
+
+```bash
+uv run python scripts/train_upper_dr.py --checkpoint ""
+```
+
+下方命令可单独试训 Phase 2。两条课程开关同时设置时固定 Level 和实际 Planar 占比。
+后续将 `checkpoint` 指向上一阶段的模型，并修改 `phase`。如曾调整扰动参数，续训时沿用对应的覆盖项。
+
+```bash
+checkpoint=/path/to/v10/model.pt
+phase=2
+uv run python -m g1.rl train --task Template-G1-Upper-Mobile-v0 \
+  --checkpoint "$checkpoint" --resume_optimizer_state \
+  --num_envs 4096 --seed 1217707953 --max_iterations 1200 --viz none physics=isaacsim_physx \
+  env.domain_randomization.phase="$phase" agent.run_name="upper_dr_phase${phase}" \
+  env.commands.wrist_pose.range_curriculum.advance=false \
+  env.commands.wrist_pose.range_curriculum.freeze_planar_sampling=true \
+  agent.mirror_augmentation=true \
+  env.commands.wrist_pose.planar_approach.enabled=true \
+  env.commands.wrist_pose.planar_approach.geometry_enabled=true \
+  env.commands.wrist_pose.planar_approach.arm_posture_weight=-0.35 \
+  env.commands.wrist_pose.planar_approach.wrist_posture_weight=-0.05 \
+  'env.commands.wrist_pose.planar_approach.waist_distance_axis_scale=[0.25,0.50,0.75]' \
+  env.commands.wrist_pose.planar_approach.waist_large_heading_yaw_gain=0.50 \
+  env.rewards.lower_command_magnitude.params.near_planar_gain=4.0
+```
+
+`play`、`teleop` 和 `failures mine` 默认使用标称环境。压力评估可显式指定 `--dr-phase 2`、`3` 或 `4`。
+比较模型时固定 Level、种子和评估配置，用已有 `--switch_pairs` 套件逐例比较 Regular 切换。
+以下示例使用 Phase 4 的较强推扰档，每轴 ±0.70 m/s。
+
+```bash
+uv run python -m g1.rl failures mine --checkpoint "$checkpoint" \
+  --level 9 --category planar --seed 42 --dr-phase 4 --dr-push-delta-v 0.70 \
+  --output outputs/failures/upper_dr_push_stress_l9
+```
+
 ## PPO 左右镜像增强
 
 `agent.mirror_augmentation=true` 在 Mobile 训练时接入 RSL-RL 数据增强，默认关闭。

@@ -11,7 +11,7 @@ import argparse
 import importlib
 import os
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 
 from .task_registry import TASK_FAMILIES, get_task_family, resolve_task_family
@@ -32,17 +32,17 @@ def _runner_adapter(backend, factory, *, restore_upper_observations=False):
         raise RuntimeError("Unsupported IsaacLab runner constructor seam; review the project adapter")
 
     if restore_upper_observations:
-        from g1.tasks.upper_limb_agent.checkpoint_observations import configure_checkpoint_observations
-
         resolve_checkpoint = backend._resolve_checkpoint
 
-        def resolve_with_observations(args, agent_cfg, env_cfg, log_root):
+        def resolve_upper_checkpoint(args, agent_cfg, env_cfg, log_root):
             checkpoint = resolve_checkpoint(args, agent_cfg, env_cfg, log_root)
             if checkpoint is not None:
+                from g1.tasks.upper_limb_agent.checkpoint_observations import configure_checkpoint_observations
+
                 configure_checkpoint_observations(env_cfg, checkpoint)
             return checkpoint
 
-        backend._resolve_checkpoint = resolve_with_observations
+        backend._resolve_checkpoint = resolve_upper_checkpoint
     backend.create_rsl_rl_runner = factory
     try:
         yield
@@ -50,6 +50,36 @@ def _runner_adapter(backend, factory, *, restore_upper_observations=False):
         backend.create_rsl_rl_runner = original
         if restore_upper_observations:
             backend._resolve_checkpoint = resolve_checkpoint
+
+
+@contextmanager
+def _upper_training_checkpoint_adapter(backend):
+    """Restore sampling after native checkpoint resolution and before creating command terms."""
+    resolve_checkpoint = backend._resolve_checkpoint
+    create_env = backend.create_isaaclab_env
+    checkpoint = None
+
+    def resolve_training_checkpoint(args, agent_cfg, log_root):
+        nonlocal checkpoint
+        checkpoint = resolve_checkpoint(args, agent_cfg, log_root)
+        return checkpoint
+
+    def create_training_env(task, env_cfg, *args, **kwargs):
+        if getattr(getattr(env_cfg, "domain_randomization", None), "phase", 1) > 1:
+            if checkpoint is None:
+                raise ValueError("Upper domain randomization training requires --checkpoint")
+            from g1.tasks.upper_limb_agent.checkpoint_sampling import configure_dr_checkpoint_sampling
+
+            configure_dr_checkpoint_sampling(env_cfg, checkpoint)
+        return create_env(task, env_cfg, *args, **kwargs)
+
+    backend._resolve_checkpoint = resolve_training_checkpoint
+    backend.create_isaaclab_env = create_training_env
+    try:
+        yield
+    finally:
+        backend._resolve_checkpoint = resolve_checkpoint
+        backend.create_isaaclab_env = create_env
 
 
 def main(argv=None):
@@ -147,11 +177,21 @@ def main(argv=None):
         snapshot_path=selected.curriculum_snapshot,
         evaluation=selected.action == "play",
     )
+    training_adapter = (
+        _upper_training_checkpoint_adapter(backend)
+        if selected.action == "train" and family_name == "upper_limb_agent"
+        else nullcontext()
+    )
     original_argv = sys.argv
     try:
         sys.argv = [original_argv[0], *remaining]
-        with _runner_adapter(
-            backend, factory, restore_upper_observations=selected.action == "play" and family_name == "upper_limb_agent"
+        with (
+            _runner_adapter(
+                backend,
+                factory,
+                restore_upper_observations=selected.action == "play" and family_name == "upper_limb_agent",
+            ),
+            training_adapter,
         ):
             result = backend.run(fuse_kit_args(remaining))
         return result or 0

@@ -36,8 +36,9 @@ class AdaptivePlanarSampling:
         self.cfg, self.base_probability = cfg, base_probability
         self.reset()
 
-    def reset(self):
-        self.probability = self.base_probability
+    def reset(self, *, keep_probability=False):
+        if not keep_probability:
+            self.probability = self.base_probability
         self.history = []
         self.cooldown = 0
         self.adjustments = 0  # Within this curriculum level.

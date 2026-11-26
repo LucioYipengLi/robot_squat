@@ -35,6 +35,7 @@ from .planar_targets import (
     PLANAR_SAMPLING_GROUPS,
     PlanarStationSampler,
     PlanarTaskCfg,
+    PlanarTurnFocusCfg,
     station_budget_bounds,
 )
 from .pose_override import PoseOverride, validate_pose
@@ -94,6 +95,8 @@ class BimanualPoseCommand(CommandTerm):
         self.planar_heading_rad = torch.zeros_like(self.height_shift)
         self.planar_sampling_group = torch.zeros_like(self.mode_id)
         self.planar_first_near_step = torch.full_like(self.mode_id, -1)
+        self._planar_turn_focused = torch.zeros_like(self.planar_task_mask)
+        self._planar_native_reference = torch.ones_like(self.planar_task_mask)
         self._regular_retract_counts = (
             torch.zeros(self.num_envs, 4, dtype=torch.long, device=self.device)
             if cfg.regular_retract_sampling.probability > 0
@@ -214,6 +217,9 @@ class BimanualPoseCommand(CommandTerm):
     @staticmethod
     def _validate_cfg(cfg):
         cfg.regular_retract_sampling.validate()
+        cfg.planar_turn_focus.validate()
+        if cfg.planar_turn_focus.enabled and (cfg.planar_task is None or cfg.range_curriculum is None):
+            raise ValueError("planar_turn_focus requires planar_task and range_curriculum")
         if cfg.planar_task is not None:
             cfg.planar_task.validate_parameters()
         if cfg.planar_approach is not None and cfg.planar_approach.enabled:
@@ -506,7 +512,10 @@ class BimanualPoseCommand(CommandTerm):
     @property
     def command(self) -> torch.Tensor:
         """Live pelvis-relative targets [14]; inactive blocks are [0,0,0,0,0,0,1]."""
-        position, orientation = self._pose_in_pelvis(self.goal_pose_w)
+        return self.targets_in_pelvis(self.goal_pose_w)
+
+    def targets_in_pelvis(self, goal_pose_w: torch.Tensor) -> torch.Tensor:
+        position, orientation = self._pose_in_pelvis(goal_pose_w)
         pose = torch.cat((position, orientation), dim=-1)
         neutral = torch.zeros_like(pose)
         neutral[..., 6] = 1.0
@@ -581,6 +590,8 @@ class BimanualPoseCommand(CommandTerm):
             timeouts = getattr(self._env, "reset_time_outs", None)
             if terminated is not None and timeouts is not None and not getattr(self, "_restoring_ranges", False):
                 completed = (terminated[ids] | timeouts[ids]) & (self._env.episode_length_buf[ids] > 0)
+                if self._planar_turn_focus_active():
+                    completed &= self._planar_native_reference[ids]
                 ended = ids[completed]
                 self.range_curriculum.complete(
                     ended,
@@ -612,6 +623,8 @@ class BimanualPoseCommand(CommandTerm):
         self._pose_window.reset(ids)
         self.planar_sampling_group[ids] = 0
         self.planar_first_near_step[ids] = -1
+        self._planar_turn_focused[ids] = False
+        self._planar_native_reference[ids] = True
         self._capture_default_pose(ids)
         if self._teleop is None:
             probabilities = torch.tensor(self.cfg.mode_probabilities, device=self.device, dtype=torch.float32)
@@ -733,6 +746,18 @@ class BimanualPoseCommand(CommandTerm):
         self._apply_planar_targets(env_ids[self.planar_task_mask[env_ids]])
         self._invalidate_approach_geometry()
 
+    def _planar_turn_focus_active(self) -> bool:
+        focus, course = self.cfg.planar_turn_focus, self.range_curriculum
+        return (
+            focus.enabled
+            and course is not None
+            and course.level >= focus.start_level
+            and not course.evaluation
+            and self._teleop is None
+            and self.cfg.planar_task.transition_sampling.enabled
+            and (focus.turn_probability > 0 or focus.wide_probability > 0)
+        )
+
     def _apply_planar_targets(self, ids):
         if len(ids) == 0:
             return
@@ -742,7 +767,14 @@ class BimanualPoseCommand(CommandTerm):
         anchor = self._env.scene.env_origins[ids] + self._default_pelvis_pos_e[ids]
         local = self.goal_pose_w[ids, :, :3] - anchor[:, None]
         radius = (local.norm(dim=-1) * self.active_mask[ids]).amax(-1)
-        shift, heading, group = self._planar_station_sampler.sample(levels, radius, cfg)
+        if self._planar_turn_focus_active():
+            shift, heading, group, focused, native_reference = self._planar_station_sampler.sample_turn_focus(
+                levels, radius, cfg, self.cfg.planar_turn_focus
+            )
+            self._planar_turn_focused[ids] = focused
+            self._planar_native_reference[ids] = native_reference
+        else:
+            shift, heading, group = self._planar_station_sampler.sample(levels, radius, cfg)
         if group is not None:
             self.planar_sampling_group[ids] = group
         displacement = torch.cat((shift, torch.zeros(len(ids), 1, device=self.device)), dim=-1)
@@ -1109,20 +1141,39 @@ class BimanualPoseCommand(CommandTerm):
 
     def _planar_group_metrics(self, ids, prefix, terminated):
         result = {}
+        focus_active = self._planar_turn_focus_active()
+        if focus_active:
+            result[f"{prefix}/turn_focus_fraction"] = self._planar_turn_focused[ids].float().mean()
+            result[f"{prefix}/native_reference_fraction"] = self._planar_native_reference[ids].float().mean()
         for group, name in enumerate(PLANAR_SAMPLING_GROUPS):
             selected = ids[self.planar_sampling_group[ids] == group]
             if not len(selected):
                 continue
-            key = f"{prefix}/{name}"
-            first = self.planar_first_near_step[selected]
-            entered = first >= 0
-            failures = terminated[selected].sum()
-            result[f"{key}/episodes"] = failures.new_tensor(len(selected), dtype=torch.float32)
-            result[f"{key}/failure_per_10s"] = failure_per_10s(failures, self.elapsed_seconds(selected).sum())
-            result[f"{key}/near_entry_fraction"] = entered.float().mean()
-            result[f"{key}/eval_pose_ready_fraction"] = self.episode_quality(selected).mean()
-            if entered.any():
-                result[f"{key}/first_near_s"] = first[entered].float().mean() * self._env.step_dt
+            result.update(self._planar_group_summary(selected, f"{prefix}/{name}", terminated))
+            if focus_active and name in ("turn", "wide"):
+                focused = selected[self._planar_turn_focused[selected]]
+                if len(focused):
+                    key = f"{prefix}/turn_focus/{name}"
+                    result.update(self._planar_group_summary(focused, key, terminated))
+                    manager = getattr(self._env, "termination_manager", None)
+                    if manager is not None and "base_contact" in manager.active_terms:
+                        early = self.elapsed_seconds(focused) <= 0.10 + 1e-6
+                        base_contact = manager.get_term("base_contact")[focused]
+                        result[f"{key}/early_base_contact_fraction"] = (early & base_contact).float().mean()
+        return result
+
+    def _planar_group_summary(self, ids, key, terminated):
+        first = self.planar_first_near_step[ids]
+        entered = first >= 0
+        failures = terminated[ids].sum()
+        result = {
+            f"{key}/episodes": failures.new_tensor(len(ids), dtype=torch.float32),
+            f"{key}/failure_per_10s": failure_per_10s(failures, self.elapsed_seconds(ids).sum()),
+            f"{key}/near_entry_fraction": entered.float().mean(),
+            f"{key}/eval_pose_ready_fraction": self.episode_quality(ids).mean(),
+        }
+        if entered.any():
+            result[f"{key}/first_near_s"] = first[entered].float().mean() * self._env.step_dt
         return result
 
     def _set_debug_vis_impl(self, debug_vis):
@@ -1217,6 +1268,8 @@ class BimanualPoseCommandCfg(CommandTermCfg):
     Probability zero preserves the old distribution, RNG and timeout. Planar
     quality uses the full assigned window; all sampled classes gate progression.
     """
+    planar_turn_focus: PlanarTurnFocusCfg = PlanarTurnFocusCfg()
+    """Optional training oversampling alongside the native target sampling contract."""
     planar_approach: PlanarApproachCfg | None = None
     """Optional training reward shaping, independent of the target sampling contract."""
 

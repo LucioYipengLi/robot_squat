@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,7 +16,7 @@ from isaaclab.envs.mdp.observations import (
     last_action,
     projected_gravity,
 )
-from isaaclab.utils.math import compute_pose_error
+from isaaclab.utils.math import compute_pose_error, quat_from_angle_axis, quat_mul
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -81,7 +82,44 @@ def end_effector_pose(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor
     return torch.cat((position, orientation), dim=-1).flatten(1)
 
 
-def end_effector_pose_error(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+class TargetPoseNoise:
+    """Share one held world-frame target perturbation across both policy terms."""
+
+    def __init__(self, env, cfg):
+        self.period_steps = max(1, math.ceil(cfg.target_noise_period_s / env.step_dt))
+        self.position_limit = cfg.target_position_noise_m
+        self.rotation_limit = cfg.target_rotation_noise_rad
+        self.position = torch.zeros((env.num_envs, 2, 3), device=env.device)
+        self.rotation = torch.zeros((env.num_envs, 2, 4), device=env.device)
+        self.rng = torch.Generator(device=env.device).manual_seed(
+            env.cfg.seed if env.cfg.seed is not None else torch.initial_seed()
+        )
+        self.next_refresh_step = 0
+
+    def reset(self, env_ids):
+        # Project onto the unit ball so the configured bounds are vector magnitudes.
+        shape = self.position[env_ids].shape
+        offsets = torch.rand((2, *shape), device=self.position.device, generator=self.rng) * 2.0 - 1.0
+        offsets = offsets / offsets.norm(dim=-1, keepdim=True).clamp_min(1.0)
+        self.position[env_ids] = offsets[0] * self.position_limit
+        rotation = offsets[1]
+        self.rotation[env_ids] = quat_from_angle_axis(rotation.norm(dim=-1) * self.rotation_limit, rotation)
+
+    def targets(self, step: int, term) -> torch.Tensor:
+        if step >= self.next_refresh_step:
+            self.reset(slice(None))
+            self.next_refresh_step = step + self.period_steps
+        goal = term.goal_pose_w
+        observed = torch.cat((goal[..., :3] + self.position, quat_mul(self.rotation, goal[..., 3:])), dim=-1)
+        return term.targets_in_pelvis(observed)
+
+
+def observed_wrist_targets(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    term = env.command_manager.get_term(command_name)
+    return env._target_pose_noise.targets(env.common_step_counter, term)
+
+
+def end_effector_pose_error(env: ManagerBasedRLEnv, command_name: str, noisy_target: bool = False) -> torch.Tensor:
     """Left/right pose errors [12] in the live pelvis frame, zero for inactive arms.
 
     Each wrist contributes target-minus-current position [m, 3] and the shortest
@@ -89,7 +127,8 @@ def end_effector_pose_error(env: ManagerBasedRLEnv, command_name: str) -> torch.
     """
     term = env.command_manager.get_term(command_name)
     position, orientation = term.current_pose_b()
-    target = term.command.reshape(-1, 2, 7)
+    target = observed_wrist_targets(env, command_name) if noisy_target else term.command
+    target = target.reshape(-1, 2, 7)
     position_error, rotation_error = compute_pose_error(
         position.reshape(-1, 3),
         orientation.reshape(-1, 4),

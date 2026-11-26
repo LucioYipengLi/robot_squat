@@ -40,7 +40,7 @@ from .observations import (
     term_action,
 )
 from .planar_approach import PlanarApproachCfg, PlanarApproachReward
-from .planar_targets import PlanarTaskCfg, PlanarTransitionSamplingCfg
+from .planar_targets import PlanarTaskCfg, PlanarTransitionSamplingCfg, PlanarTurnFocusCfg
 from .range_curriculum import RangeCurriculum, RangeCurriculumCfg
 from .rewards import (
     DwellReward,

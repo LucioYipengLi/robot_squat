@@ -120,8 +120,10 @@ def test_headless_train_and_play_use_task_runner(tmp_path, task, family, planar)
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
         events = EventAccumulator(str(checkpoint.parent)).Reload()
-        assert events.Scalars("Episode_Reward/walk_joint_reference")
-        assert events.Scalars("Episode_Reward/walk_support_timing")
+        assert events.Scalars("Episode_Reward/leg_synergy_walk")
+        for term in ("walk_joint_reference", "walk_support_timing"):
+            scalars = events.Scalars(f"Episode_Reward/{term}")
+            assert scalars and all(row.value == 0 for row in scalars)
         assert events.Scalars("Performance/task_command/walk/single_stance_fraction")
         assert events.Scalars("Performance/task_command/walk/hip_pitch_rms_rad")
     else:

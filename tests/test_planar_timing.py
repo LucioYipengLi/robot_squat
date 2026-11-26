@@ -78,6 +78,104 @@ def test_station_schedule_lookup_preserves_draws_and_observes_live_overrides():
         assert torch.equal(torch.random.get_rng_state(), expected_rng)
 
 
+@pytest.mark.parametrize("level,low_deg,high_deg", [(5, 45, 65), (6, 65, 90), (10, 160, 180)])
+def test_turn_focus_samples_new_bearings_and_reserves_the_native_group_mix(level, low_deg, high_deg):
+    command = MobileCommandsCfg().wrist_pose
+    cfg = command.planar_task
+    focus = command.planar_turn_focus
+    cfg.transition_sampling.enabled = True
+    sampler = PlanarStationSampler(11, "cpu")
+    levels = torch.full((8192,), level)
+    local_radius = torch.full_like(levels, 0.4, dtype=torch.float32)
+
+    torch.manual_seed(42)
+    native_shift, native_angle, native_group = sampler.sample(levels, local_radius, cfg)
+    native_rng = torch.random.get_rng_state()
+    torch.manual_seed(42)
+    shift, angle, group, focused, native_reference = sampler.sample_turn_focus(levels, local_radius, cfg, focus)
+    assert torch.equal(torch.random.get_rng_state(), native_rng)
+    assert torch.equal(group, native_group)
+    torch.testing.assert_close(shift[~focused], native_shift[~focused], atol=0, rtol=0)
+    torch.testing.assert_close(angle[~focused], native_angle[~focused], atol=0, rtol=0)
+    assert not (focused & native_reference).any()
+    assert (angle[focused].abs() >= math.radians(low_deg) - 1e-6).all()
+    assert (angle[focused].abs() <= math.radians(high_deg) + 1e-6).all()
+    assert ((angle[focused] > 0).float().mean()).item() == pytest.approx(0.5, abs=0.03)
+
+    turn, wide = group == 2, group == 3
+    assert not (focused & (group == 1)).any()
+    if turn.any():
+        assert focused[turn].float().mean().item() == pytest.approx(0.70, abs=0.04)
+        assert (shift[turn].norm(dim=-1) <= 0.30 + 1e-6).all()
+    assert focused[wide].float().mean().item() == pytest.approx(0.40, abs=0.04)
+    assert (shift[wide].abs() <= station_limits(level / 10, cfg)[0] + 1e-6).all()
+    for index in (1, 2, 3):
+        native_share = (group == index).float().mean().item()
+        assert (group[native_reference] == index).float().mean().item() == pytest.approx(native_share, abs=0.03)
+    assert native_reference.float().mean().item() == pytest.approx(0.30 if level < 10 else 0.60, abs=0.03)
+
+
+def configure_turn_focus(cfg, _env):
+    mobile = MobileCommandsCfg().wrist_pose
+    cfg.planar_task = mobile.planar_task.copy()
+    cfg.planar_task.probability = 1.0
+    cfg.planar_task.transition_sampling.enabled = True
+    cfg.planar_turn_focus = mobile.planar_turn_focus.copy()
+
+
+@pytest.mark.parametrize("level,evaluation", [(level, False) for level in range(5)] + [(6, True)])
+def test_turn_focus_preserves_native_command_targets_and_rng_before_level_five_and_in_evaluation(level, evaluation):
+    term = make_command(level=level, configure=configure_turn_focus)
+    term.range_curriculum.evaluation = evaluation
+
+    torch.manual_seed(311)
+    term.reset()
+    goal = term.goal_pose_w.clone()
+    heading = term.planar_heading_rad.clone()
+    expected_rng = torch.random.get_rng_state()
+    assert not term._planar_turn_focused.any()
+    assert term._planar_native_reference.all()
+
+    term.cfg.planar_turn_focus.enabled = False
+    torch.manual_seed(311)
+    term.reset()
+    torch.testing.assert_close(term.goal_pose_w, goal, atol=0, rtol=0)
+    torch.testing.assert_close(term.planar_heading_rad, heading, atol=0, rtol=0)
+    assert torch.equal(torch.random.get_rng_state(), expected_rng)
+
+
+def test_turn_focus_uses_only_native_reference_for_promotion_and_logs_early_contact():
+    def configure(cfg, env):
+        configure_turn_focus(cfg, env)
+        cfg.planar_task.probability = 0.50
+
+    term = make_command(level=5, configure=configure)
+    env, course = term._env, term.range_curriculum
+    saved = course.state_dict(0)
+    assert "planar_turn_focus" not in saved["contract"]["target"]
+    term.cfg.planar_turn_focus.enabled = False
+    course.load_state_dict(saved, 0)
+    term.cfg.planar_turn_focus.enabled = True
+
+    term.planar_task_mask[:] = torch.tensor([True, True, False])
+    term.height_task_mask[:] = False
+    term.planar_sampling_group[:] = torch.tensor([2, 3, 0])
+    term._planar_turn_focused[:] = torch.tensor([True, False, False])
+    term._planar_native_reference[:] = ~term._planar_turn_focused
+    term.planar_first_near_step[1] = 3
+    env.common_step_counter = 6
+    env.reset_terminated[:] = torch.tensor([True, False, False])
+    env.reset_time_outs[:] = ~env.reset_terminated
+    env.termination_manager = SimpleNamespace(active_terms=["base_contact"], get_term=lambda _: env.reset_terminated)
+
+    extras = term.reset()
+    assert course.counts.tolist() == [1, 0, 1]
+    assert course.failures.tolist() == [0, 0, 0]
+    assert extras["task/planar/turn_focus/turn/episodes"] == 1
+    assert extras["task/planar/turn_focus/turn/early_base_contact_fraction"] == 1
+    assert extras["task/planar/turn_focus/turn/near_entry_fraction"] == 0
+
+
 def test_regular_retract_refresh_is_bounded_per_arm_and_falls_back_at_rear_edge():
     def configure(cfg, _):
         cfg.mode_probabilities = (1.0, 0.0, 0.0)

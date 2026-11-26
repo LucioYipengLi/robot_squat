@@ -13,6 +13,7 @@ from isaaclab.utils import configclass, replace
 
 from ... import mdp
 from ...mdp.actions import MOBILE_OBSERVATION_JOINT_NAMES
+from .domain_randomization import UpperDomainRandomizationCfg
 from .env_cfg import (
     ActionsCfg,
     CommandsCfg,
@@ -130,6 +131,7 @@ class MobileCommandsCfg(CommandsCfg):
                 near_episode_s=10.0,
             ),
         ),
+        planar_turn_focus=mdp.PlanarTurnFocusCfg(enabled=True),
         planar_approach=mdp.PlanarApproachCfg(waist_posture_weight=-0.20),
         range_curriculum=mdp.RangeCurriculumCfg(
             initial_level=0,
@@ -220,6 +222,10 @@ class MobileObservationsCfg(LegacyMobileObservationsCfg):
 class MobileEventsCfg(EventCfg):
     # Root and joints return to the same authored placement each episode.
     reset_root = EventTerm(func=mdp.reset_mobile_root, mode="reset")
+    upper_gains: EventTerm | None = None
+    upper_mass: EventTerm | None = None
+    hand_payload: EventTerm | None = None
+    push_robot: EventTerm | None = None
 
 
 @configclass
@@ -319,6 +325,7 @@ class UpperLimbMobileEnvCfg(UpperLimbAgentEnvCfg):
     rewards: MobileRewardsCfg = MobileRewardsCfg()
     terminations: MobileTerminationsCfg = MobileTerminationsCfg()
     legacy_observations: bool = False
+    domain_randomization: UpperDomainRandomizationCfg = UpperDomainRandomizationCfg()
 
     def __post_init__(self):
         super().__post_init__()
@@ -329,3 +336,7 @@ class UpperLimbMobileEnvCfg(UpperLimbAgentEnvCfg):
         self.sim.dt = lower.sim.dt
         self.decimation = lower.decimation
         self.sim.render_interval = self.decimation
+
+    def play_mode(self) -> None:
+        super().play_mode()
+        self.domain_randomization.phase = 1

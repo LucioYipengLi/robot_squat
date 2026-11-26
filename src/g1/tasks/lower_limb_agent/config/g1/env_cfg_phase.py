@@ -27,7 +27,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
 
 from ... import mdp
-from .env_cfg import CurriculumCfg, EventCfg, LowerLimbAgentEnvCfg
+from .env_cfg import CurriculumCfg, EventCfg, LowerLimbAgentEnvCfg, RewardsCfg
 
 
 @configclass
@@ -118,6 +118,7 @@ class LowerLimbAgentEnvCfg_Phase2(LowerLimbAgentEnvCfg):
 
     training_phase: int = 2
     events: EventCfg_Phase2 = EventCfg_Phase2()
+    rewards: RewardsCfg = RewardsCfg()
 
     def play_mode(self) -> None:
         super().play_mode()

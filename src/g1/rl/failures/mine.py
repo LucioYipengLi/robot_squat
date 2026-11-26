@@ -123,6 +123,11 @@ def run_mining(args):
     if level is not None and not 0 <= level < num_levels:
         raise ValueError(f"--level must be between 0 and {num_levels - 1}, got {args.level}")
     configure_checkpoint(env_cfg, agent_cfg, checkpoint)
+    dr = getattr(env_cfg, "domain_randomization", None)
+    if dr is not None:
+        dr.phase = args.dr_phase
+        if args.dr_push_delta_v is not None:
+            dr.push_delta_v_m_s = args.dr_push_delta_v
     env_cfg.seed = agent_cfg.seed = args.seed
     env_cfg.sim.device = agent_cfg.device = args.device
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, version)
@@ -207,6 +212,7 @@ def run_mining(args):
                     "checkpoint": str(checkpoint),
                     "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
                     "seed": args.seed,
+                    **({"domain_randomization": dr.settings()} if dr is not None else {}),
                     "policy_output": args.policy_output,
                     "category": args.category,
                     "num_envs": raw.num_envs,

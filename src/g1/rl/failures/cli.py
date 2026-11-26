@@ -90,6 +90,8 @@ def parse_args(argv):
     )
     mine.add_argument("--switch-cases", nargs="+", metavar="ID", help="Run only these case IDs from the fixed suite")
     mine.add_argument("--seed", type=int, default=42)
+    mine.add_argument("--dr-phase", type=int, choices=(1, 2, 3, 4), default=1, help="Evaluate with this DR phase")
+    mine.add_argument("--dr-push-delta-v", type=positive_float, help="Override phase 4 push bounds per axis (m/s)")
     mine.add_argument("--device", default="cuda:0")
     view = modes.add_parser("view", help="Serve a local 3-D replay/force timeline; no simulator required")
     view.add_argument("--run", type=Path, required=True)
@@ -109,6 +111,8 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if args.mode == "mine" and args.level is not None and args.level < 0:
         parser.error("--level must be non-negative")
+    if args.mode == "mine" and args.dr_push_delta_v is not None and args.dr_phase != 4:
+        parser.error("--dr-push-delta-v requires --dr-phase 4")
     if args.mode == "mine" and args.planar_sampling is not None and args.category != "planar":
         parser.error("--planar-sampling requires --category planar")
     if args.mode == "mine" and args.planar_startup and args.planar_sampling != "transition":

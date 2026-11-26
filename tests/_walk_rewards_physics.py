@@ -17,7 +17,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    cfg, _ = resolve_task_config("Template-G1-v0", "rsl_rl_cfg_entry_point", overrides=["physics=isaacsim_physx"])
+    cfg, _ = resolve_task_config(
+        "Template-G1-v0",
+        "rsl_rl_cfg_entry_point",
+        overrides=[
+            "physics=isaacsim_physx",
+            "env.rewards.walk_joint_reference.weight=2.0",
+            "env.rewards.walk_support_timing.weight=-0.75",
+        ],
+    )
     cfg.scene.num_envs = 8
     cfg.seed = 42
     cfg.episode_length_s = 0.2
@@ -49,7 +57,7 @@ def main():
             assert [sensor.body_names[i] for i in foot_ids] == ["left_ankle_roll_link", "right_ankle_roll_link"]
             assert env.reward_manager.get_term_cfg("track_pelvis_height").weight == 2.0
             assert env.reward_manager.get_term_cfg("vertical_bounce").weight == -0.5
-            assert env.reward_manager.get_term_cfg("feet_gait_phase").params["walk_modes"] == (3,)
+            assert env.reward_manager.get_term_cfg("feet_gait_phase").params["walk_modes"] == (2, 3)
             original = env.reward_manager.compute
             checks, positive_frames, resets = 0, 0, 0
 

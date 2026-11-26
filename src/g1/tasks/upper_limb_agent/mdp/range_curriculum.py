@@ -30,6 +30,7 @@ class RangeCurriculumCfg:
     num_levels: int = 11
     advance: bool = True
     reset_on_load: bool = False
+    freeze_planar_sampling: bool = False
     # Order: height [m], vx/vy [m/s], yaw [rad/s], pelvis x/y [m].
     initial_lower_ranges: tuple = (
         (-0.10, 0.01),
@@ -147,6 +148,12 @@ class RangeCurriculum:
     def restart(self, step):
         """Explicit new experiment: clear progress while retaining the configured contract."""
         self.level = self.cfg.initial_level
+        self.clock_offset = -int(step)
+        self.reset_statistics(step, keep_planar_probability=False)
+        self.begin(slice(None))
+
+    def reset_statistics(self, step, *, keep_planar_probability=True):
+        """Start a full check window under a new physical distribution at the current level."""
         self.checked_level = self.level
         for name in (
             "counts",
@@ -162,12 +169,10 @@ class RangeCurriculum:
             "window_failure_per_10s",
         ):
             getattr(self, name).zero_()
-        self.clock_offset = -int(step)
-        self.last_check = 0
+        self.last_check = int(step) + self.clock_offset
         self.sample_ready = self.quality_ready = self.failure_ready = False
         if self.planar_sampling is not None:
-            self.planar_sampling.reset()
-        self.begin(slice(None))
+            self.planar_sampling.reset(keep_probability=keep_planar_probability)
 
     def target_scale(self, ids, *, orientation=False):
         start = self.cfg.initial_orientation_scale if orientation else self.cfg.initial_position_scale
@@ -227,8 +232,8 @@ class RangeCurriculum:
             self.ema.zero_()
             self.initialized.zero_()
             if self.planar_sampling is not None:
-                self.planar_sampling.reset()
-        elif sampling_window is not None:
+                self.planar_sampling.reset(keep_probability=self.cfg.freeze_planar_sampling)
+        elif sampling_window is not None and not self.cfg.freeze_planar_sampling:
             self.planar_sampling.observe(
                 *sampling_window,
                 self.cfg.failure_rate_limit,
@@ -271,7 +276,7 @@ class RangeCurriculum:
 
     def contract(self):
         cfg = asdict(self.cfg)
-        for k in ("advance", "reset_on_load", "planar_sampling"):
+        for k in ("advance", "reset_on_load", "freeze_planar_sampling", "planar_sampling"):
             cfg.pop(k)
         contract = {
             "failure_measure": "failures_per_10_robot_seconds",

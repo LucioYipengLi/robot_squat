@@ -5,21 +5,21 @@
 
 ## 配置与模式
 
-参数位于 `src/g1/tasks/lower_limb_agent/config/g1/env_cfg.py` 的 `RewardsCfg`。
-Phase 2/3 通过继承获得相同配置。观测仍为每帧 130 维、五帧 650 维，动作仍为 12 维。
+下肢 Phase 1 默认采用 `lower_base_p3` 的奖惩。Phase 2/3 沿用实际离地参考配置。
+参数位于 `src/g1/tasks/lower_limb_agent/config/g1/env_cfg.py`，观测为每帧 130 维、五帧 650 维，动作为 12 维。
 
-| 项目 | 本机配置 |
-| --- | --- |
-| `walk_joint_reference` | 新增，权重 +2.0 |
-| `walk_support_timing` | 新增，权重 -0.75 |
-| `leg_synergy_walk` | 配置已删除；静止模式的 `leg_synergy` 保留 |
-| `feet_gait_phase` | 仅 SQUAT_WALK 生效，权重与频率参数保留 |
-| `track_pelvis_height` | 所有模式维持权重 +2.0、原公式和原参数 |
-| `vertical_bounce` | 所有模式维持 `lin_vel_z_l2`、权重 -0.5 |
-| 接触计时阈值 | 显式保留本机 PhysX 原有 1.0 N |
+| 项目 | Phase 1 | Phase 2/3 |
+| --- | --- | --- |
+| `walk_joint_reference` | 0 | +2.0 |
+| `walk_support_timing` | 0 | -0.75 |
+| `leg_synergy_walk` | +0.4，仅 `WALK` | — |
+| `feet_gait_phase` | +0.5，覆盖 `WALK` 和 `SQUAT_WALK` | 同 Phase 1 |
+| `track_pelvis_height` | +2.0，覆盖所有模式 | 同 Phase 1 |
+| `vertical_bounce` | `lin_vel_z_l2`，权重 -0.5 | 同 Phase 1 |
+| 接触计时阈值 | PhysX 1.0 N | 同 Phase 1 |
 
 本机原本没有 `feet_swing_height` 项，无需删除相关实现。
-新增奖励只在 `mode == WALK` 且平面指令速度 > 0.1 m/s 或转向指令绝对值 > 0.2 rad/s 时生效。
+实际离地参考和支撑时长奖励启用后，只在 `mode == WALK` 且平面指令速度 > 0.1 m/s 或转向指令绝对值 > 0.2 rad/s 时生效。
 六维指令仍为 `[height_offset, vx, vy, wz, pelvis_dx, pelvis_dy]`。
 
 ## 接触与参考

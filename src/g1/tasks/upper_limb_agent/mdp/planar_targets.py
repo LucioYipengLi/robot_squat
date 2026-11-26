@@ -9,9 +9,26 @@ from isaaclab.utils import configclass
 
 from .goal_timing import GoalTimingCfg
 
-__all__ = ["PlanarTaskCfg", "PlanarTransitionSamplingCfg"]
+__all__ = ["PlanarTaskCfg", "PlanarTransitionSamplingCfg", "PlanarTurnFocusCfg"]
 
 PLANAR_SAMPLING_GROUPS = ("legacy", "walk", "turn", "wide")
+
+
+@configclass
+class PlanarTurnFocusCfg:
+    """Training-only oversampling of newly available bearings within Turn and Wide."""
+
+    enabled: bool = False
+    start_level: int = 5
+    turn_probability: float = 0.70
+    wide_probability: float = 0.40
+
+    def validate(self):
+        if not isinstance(self.start_level, int) or isinstance(self.start_level, bool) or self.start_level < 1:
+            raise ValueError("planar_turn_focus.start_level must be a positive integer")
+        for probability in (self.turn_probability, self.wide_probability):
+            if not math.isfinite(probability) or not 0 <= probability < 1:
+                raise ValueError("planar_turn_focus probabilities must be in [0, 1) to retain native samples")
 
 
 @configclass
@@ -192,7 +209,7 @@ def station_budget_bounds(progress, cfg):
 
 def sample_transition_station(progress, local_radius, cfg):
     """Sample a walk, turn or wide target, with area-weighted radius in a bounded interval."""
-    return _sample_transition_station(*_transition_limits(progress, cfg), local_radius, cfg, progress)
+    return _sample_transition_station(*_transition_limits(progress, cfg), local_radius, cfg, progress)[:3]
 
 
 def _transition_limits(progress, cfg):
@@ -204,16 +221,33 @@ def _transition_limits(progress, cfg):
 
 
 def _sample_transition_station(
-    extent, bearing, walk_fraction, wide_fraction, turn_span, local_radius, cfg, random_like
+    extent, bearing, walk_fraction, wide_fraction, turn_span, local_radius, cfg, random_like, *, focus_limits=None
 ):
     transition = cfg.transition_sampling
     choice = torch.rand_like(random_like)
     wide = choice < wide_fraction
     walk = ~wide & (choice < wide_fraction + walk_fraction)
     signed = 2 * torch.rand_like(random_like) - 1
+    sign = torch.where(signed < 0, -1.0, 1.0)
     turn_min = transition.turn_bearing_rad[0]
-    turn = (turn_min + signed.abs() * turn_span) * torch.where(signed < 0, -1.0, 1.0)
+    turn = (turn_min + signed.abs() * turn_span) * sign
     angle = torch.where(wide, signed * bearing, torch.where(walk, signed * transition.walk_max_bearing_rad, turn))
+    focused = native_reference = None
+    if focus_limits is not None:
+        prev_turn, prev_wide, turn_probability, wide_probability = focus_limits
+        group_start = torch.where(wide, 0.0, torch.where(walk, wide_fraction, wide_fraction + walk_fraction))
+        turn_fraction = 1.0 - (wide_fraction + walk_fraction)
+        group_width = torch.where(wide, wide_fraction, torch.where(walk, walk_fraction, turn_fraction))
+        # The within-group quantile of the group draw is uniform for every group.
+        # Reserving the same top quantile in each group keeps the native mix for promotion.
+        quantile = (choice - group_start) / group_width.clamp_min(torch.finfo(choice.dtype).tiny)
+        probability = torch.where(wide, wide_probability, torch.where(walk, 0.0, turn_probability))
+        focused = quantile < probability
+        native_reference = quantile >= torch.maximum(turn_probability, wide_probability)
+        low = torch.where(wide, prev_wide, prev_turn)
+        high = torch.where(wide, bearing, turn_min + turn_span)
+        focus_angle = torch.lerp(low, high, signed.abs()) * sign
+        angle = torch.where(focused, focus_angle, angle)
     direction = torch.stack((angle.cos(), angle.sin()), dim=-1)
     upper = torch.where(
         wide,
@@ -226,7 +260,7 @@ def _sample_transition_station(
     lower_sq = transition.min_distance_m**2
     radius = (lower_sq + (upper.square() - lower_sq) * torch.rand_like(random_like)).sqrt()
     group = torch.where(wide, 3, torch.where(walk, 1, 2))
-    return direction * radius[:, None], angle, group
+    return direction * radius[:, None], angle, group, focused, native_reference
 
 
 class PlanarStationSampler:
@@ -241,7 +275,7 @@ class PlanarStationSampler:
         self._schedule = None
         self._table = None
 
-    def sample(self, levels, local_radius, cfg):
+    def _limits(self, levels, cfg):
         transition = cfg.transition_sampling
         # Evaluation can override the sampling schedule after the environment is built.
         schedule = (
@@ -271,8 +305,26 @@ class PlanarStationSampler:
                 dim=-1,
             )
             self._schedule = deepcopy(schedule)
-        values = self._table[levels].unbind(dim=-1)
-        if transition.enabled:
-            return _sample_transition_station(*values, local_radius, cfg, values[0])
+        return self._table[levels].unbind(dim=-1)
+
+    def sample(self, levels, local_radius, cfg):
+        values = self._limits(levels, cfg)
+        if cfg.transition_sampling.enabled:
+            return _sample_transition_station(*values, local_radius, cfg, values[0])[:3]
         shift, angle = _sample_station(*values, local_radius, cfg, values[0])
         return shift, angle, None
+
+    def sample_turn_focus(self, levels, local_radius, cfg, focus):
+        values = self._limits(levels, cfg)
+        extent, bearing, walk_fraction, wide_fraction, turn_span = values
+        _, prev_bearing, _, _, prev_turn_span = self._table[(levels - 1).clamp_min(0)].unbind(dim=-1)
+        active = levels >= focus.start_level
+        turn_grew = (turn_span > prev_turn_span) & (walk_fraction + wide_fraction < 1)
+        wide_grew = (bearing > prev_bearing) & (wide_fraction > 0)
+        focus_limits = (
+            cfg.transition_sampling.turn_bearing_rad[0] + prev_turn_span,
+            prev_bearing,
+            torch.where(active & turn_grew, focus.turn_probability, 0.0),
+            torch.where(active & wide_grew, focus.wide_probability, 0.0),
+        )
+        return _sample_transition_station(*values, local_radius, cfg, extent, focus_limits=focus_limits)

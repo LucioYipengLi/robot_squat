@@ -3,7 +3,9 @@
 import copy
 import hashlib
 import json
+import logging
 import shutil
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -22,7 +24,15 @@ from .symmetry import (
 class UpperLimbOnPolicyRunner(OnPolicyRunner):
     """Keep PPO updates unchanged and archive the configured prior and frozen Lower model."""
 
+    _evaluation = False
+    _checkpoint_loaded = False
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        dr = self._domain_randomization()
+        if dr is not None and dr.phase > 1 and not self._checkpoint_loaded:
+            raise ValueError(
+                "Upper domain randomization training requires --checkpoint from the same or preceding phase"
+            )
         manager = getattr(self.env.unwrapped, "command_manager", None)
         if manager is not None and "wrist_pose" in manager.active_terms:
             command = manager.get_term("wrist_pose")
@@ -31,6 +41,9 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
                 # distance-budget episode must start at its real reset time.
                 init_at_random_ep_len = False
         return super().learn(num_learning_iterations, init_at_random_ep_len=init_at_random_ep_len)
+
+    def _domain_randomization(self):
+        return getattr(getattr(self.env.unwrapped, "cfg", None), "domain_randomization", None)
 
     def _range_curriculum(self):
         manager = getattr(self.env.unwrapped, "command_manager", None)
@@ -97,6 +110,14 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
         manager = getattr(self.env.unwrapped, "command_manager", None)
         if manager is not None and "wrist_pose" in manager.active_terms:
             command = manager.get_term("wrist_pose")
+            dr = self._domain_randomization()
+            if dr is not None:
+                infos = copy.deepcopy(infos) if infos is not None else {}
+                infos["g1_upper_domain_randomization"] = {
+                    "settings": dr.settings(),
+                    "seed": self.env.unwrapped.cfg.seed,
+                    "planar_turn_focus": asdict(command.cfg.planar_turn_focus),
+                }
             quality = getattr(command, "workspace_quality_map", None)
             if quality is not None:
                 artifact = Path(path).parent / "artifacts" / "workspace_quality.npz"
@@ -143,6 +164,16 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
 
     def load(self, path, load_cfg=None, strict=True, map_location=None):
         saved = torch.load(path, weights_only=False, map_location="cpu")
+        dr = self._domain_randomization()
+        new_distribution = False
+        if dr is not None and not self._evaluation:
+            metadata = (saved.get("infos") or {}).get("g1_upper_domain_randomization") or {}
+            source = metadata.get("settings", {"phase": 1})
+            if source["phase"] not in (dr.phase, dr.phase - 1):
+                raise ValueError(
+                    "Resume Upper training from a checkpoint of the same or immediately preceding DR phase"
+                )
+            new_distribution = json.dumps(source, sort_keys=True) != json.dumps(dr.settings(), sort_keys=True)
         control = self._control_interface()
         saved_control = (saved.get("infos") or {}).get("g1_control_interface")
         migrate_observations = False
@@ -208,11 +239,26 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
             raise ValueError("A mobile Upper checkpoint requires the frozen Lower environment")
         curriculum = self._range_curriculum()
         range_state = (saved.get("infos") or {}).get("g1_upper_ranges")
+        if (
+            dr is not None
+            and dr.phase > 1
+            and not self._evaluation
+            and (curriculum is None or curriculum.cfg.reset_on_load)
+        ):
+            raise ValueError("Upper domain randomization must resume its saved task curriculum (reset_on_load=false)")
         if curriculum is not None and not curriculum.cfg.reset_on_load:
             if range_state is None:
                 raise ValueError("Upper range curriculum state is missing; use range_curriculum.reset_on_load=true")
             # Validate and restore before any simulation reset; PPO owns all optimizer restoration.
             curriculum.load_state_dict(range_state, self.env.unwrapped.common_step_counter)
+            if new_distribution:
+                curriculum.reset_statistics(self.env.unwrapped.common_step_counter)
+                logging.getLogger(__name__).info(
+                    "Upper DR phase %s started a fresh evaluation window at level %s, Planar probability %.2f",
+                    dr.phase,
+                    curriculum.level,
+                    curriculum.planar_probability,
+                )
         elif curriculum is not None:
             curriculum.restart(self.env.unwrapped.common_step_counter)
         elif range_state is not None and curriculum is None:
@@ -231,6 +277,7 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
                 raw.reset()  # Fresh physical episodes; checkpoint stores curriculum, not simulator state.
             finally:
                 command._restoring_ranges = False
+        self._checkpoint_loaded = True
         return result
 
 
@@ -255,6 +302,7 @@ def create_upper_limb_runner(env, agent_cfg, log_dir=None, *, snapshot_path=None
             )
         )
     runner = UpperLimbOnPolicyRunner(env, cfg, log_dir=log_dir, device=agent_cfg.device)
+    runner._evaluation = evaluation
     curriculum = runner._range_curriculum()
     if curriculum is not None:
         curriculum.evaluation = evaluation

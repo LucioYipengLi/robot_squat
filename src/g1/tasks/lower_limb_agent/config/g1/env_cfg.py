@@ -525,6 +525,21 @@ class RewardsCfg:
     )
 
 
+_reward_defaults = RewardsCfg()
+
+
+@configclass
+class Phase1RewardsCfg(RewardsCfg):
+    """Use the lower_base_p3 reward weights for nominal training from scratch."""
+
+    walk_joint_reference = replace(_reward_defaults.walk_joint_reference, weight=0.0)
+    walk_support_timing = replace(_reward_defaults.walk_support_timing, weight=0.0)
+    leg_synergy_walk = replace(
+        _reward_defaults.leg_synergy,
+        weight=0.4,
+        params={**_reward_defaults.leg_synergy.params, "zero_modes": (2,)},
+    )
+
 
 @configclass
 class TerminationsCfg:
@@ -624,7 +639,7 @@ class LowerLimbAgentEnvCfg(ManagerBasedRLEnvCfg):
     commands: CommandsCfg = CommandsCfg()
     events: EventCfg = EventCfg()
     # MDP settings
-    rewards: RewardsCfg = RewardsCfg()
+    rewards: Phase1RewardsCfg = Phase1RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
 
     curriculum: CurriculumCfg = CurriculumCfg()

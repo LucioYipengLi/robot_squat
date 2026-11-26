@@ -286,7 +286,14 @@ def test_upper_cli_forwards_native_options_and_restores_backend(
     def resolve_checkpoint(*_):
         return None
 
-    backend = SimpleNamespace(create_rsl_rl_runner=create_rsl_rl_runner, _resolve_checkpoint=resolve_checkpoint)
+    def create_env(*_):
+        return None
+
+    backend = SimpleNamespace(
+        create_rsl_rl_runner=create_rsl_rl_runner,
+        _resolve_checkpoint=resolve_checkpoint,
+        create_isaaclab_env=create_env,
+    )
 
     def run(argv):
         assert argv == native and sys.argv[1:] == native
@@ -312,6 +319,33 @@ def test_upper_cli_forwards_native_options_and_restores_backend(
     assert sys.argv is original_argv
     assert backend.create_rsl_rl_runner is create_rsl_rl_runner
     assert backend._resolve_checkpoint is resolve_checkpoint
+    assert backend.create_isaaclab_env is create_env
+
+
+@pytest.mark.parametrize("phase", [1, 2])
+def test_upper_train_resolves_checkpoint_through_native_signature_before_constructing_env(monkeypatch, phase):
+    from g1.tasks.upper_limb_agent import checkpoint_sampling
+
+    args = SimpleNamespace(checkpoint="latest")
+    env_cfg = SimpleNamespace(domain_randomization=SimpleNamespace(phase=phase))
+    agent_cfg = object()
+    restored = []
+
+    def resolve(native_args, native_agent_cfg, log_root):
+        assert (native_args, native_agent_cfg, log_root) == (args, agent_cfg, "/logs")
+        return "/logs/model.pt"
+
+    def create(task, cfg, args_cli, *, convert_marl_to_single_agent):
+        assert (task, cfg, args_cli) == ("Upper", env_cfg, args)
+        assert convert_marl_to_single_agent is False
+        assert restored == ([(env_cfg, "/logs/model.pt")] if phase == 2 else [])
+        return "env"
+
+    monkeypatch.setattr(checkpoint_sampling, "configure_dr_checkpoint_sampling", lambda *pair: restored.append(pair))
+    backend = SimpleNamespace(_resolve_checkpoint=resolve, create_isaaclab_env=create)
+    with cli._upper_training_checkpoint_adapter(backend):
+        assert backend._resolve_checkpoint(args, agent_cfg, "/logs") == "/logs/model.pt"
+        assert backend.create_isaaclab_env("Upper", env_cfg, args, convert_marl_to_single_agent=False) == "env"
 
 
 @pytest.mark.parametrize(
