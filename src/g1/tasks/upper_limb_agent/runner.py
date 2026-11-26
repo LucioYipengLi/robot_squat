@@ -57,8 +57,8 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
             return None
         return getattr(manager.get_term("joint_pos"), "frozen_policy", None)
 
-    def _control_interface(self):
-        raw = self.env.unwrapped
+    @staticmethod
+    def mobile_control_interface(raw):
         manager = getattr(raw, "action_manager", None)
         if manager is None or "lower_command" not in manager.active_terms:
             return None
@@ -103,7 +103,7 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
         if curriculum is not None:
             infos = copy.deepcopy(infos) if infos is not None else {}
             infos["g1_upper_ranges"] = curriculum.state_dict(self.env.unwrapped.common_step_counter)
-        control = self._control_interface()
+        control = self.mobile_control_interface(self.env.unwrapped)
         if control is not None:
             infos = copy.deepcopy(infos) if infos is not None else {}
             infos["g1_control_interface"] = control
@@ -174,7 +174,7 @@ class UpperLimbOnPolicyRunner(OnPolicyRunner):
                     "Resume Upper training from a checkpoint of the same or immediately preceding DR phase"
                 )
             new_distribution = json.dumps(source, sort_keys=True) != json.dumps(dr.settings(), sort_keys=True)
-        control = self._control_interface()
+        control = self.mobile_control_interface(self.env.unwrapped)
         saved_control = (saved.get("infos") or {}).get("g1_control_interface")
         migrate_observations = False
         if control is not None:

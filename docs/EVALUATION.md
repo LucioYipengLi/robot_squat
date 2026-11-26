@@ -6,8 +6,25 @@
 
 只测试推扰可使用 [独立推扰评估](LOWER_PUSH_EVALUATION.md)，入口为 `--suite g1_lower_push`，默认使用 Phase 3 最终训练幅度 ±0.70 m/s。
 
+- [Upper Mobile 固定目标评估](#upper-mobile-固定目标评估)
 - [第一部分：快速评估与查看结果](#第一部分快速评估与查看结果)：选择内置套件、运行评估、恢复任务、阅读 TensorBoard。
 - [第二部分：创建 suite 与评估过程详解](#第二部分创建-suite-与评估过程详解)：编写自定义套件，了解参数、用例生成、模型加载和指标口径。
+
+## Upper Mobile 固定目标评估
+
+内置套件 [g1_upper_fixed_targets](../src/g1/rl/evaluation/suites/g1_upper_fixed_targets.yaml) 使用 `Template-G1-Upper-Mobile-v0` 的 660 维观测和 23 维动作。运行时从检查点配套存档中优先加载冻结 Lower，并校验模型哈希和控制接口。
+
+```powershell
+uv run python -m g1.rl eval --suite g1_upper_fixed_targets --checkpoints "upper_p4=logs/rsl_rl/g1_upper_mobile/upper_p4/model_123197.pt" --num-envs 128 --output outputs/eval/upper_fixed_targets_p4
+```
+
+默认种子为 42，每组 96 回合，左手、右手和双手交替。可用 `--seeds` 和 `--episodes-per-seed` 调整。用例目标独立于并行环境数、检查点和自动重置顺序。
+
+要改范围，复制内置 YAML，修改 `benchmark.target_ranges_m.near` 和 `far` 下的轴范围，单位均为 m。用 `--suite config/你的文件.yaml` 加载副本。目标相对默认腕位姿生成，水平轴采用重置朝向，双手共享平移，目标在世界坐标中保持一回合。近端默认运行 10 s，远端按水平距离分配移动时间，再留 2 s 安定时间。两组均使用末段 2 s 评价腕部。
+
+- 躯干稳定性为从目标生效到终止的平均绝对 Roll 和 Pitch，再对两轴取平均，单位为度。
+- 腕部到达精度为末段窗口内活动腕的平均位置误差，单位为 mm。汇总使用完整窗口；部分窗口仍保留有效帧及误差。
+- `cases/<job_id>/case_specs.json` 保存偏移与时序，`result.json` 保存实际目标、失败原因及逐回合指标。通过 `report_latest.json` 找到 CSV、JSON 和 TensorBoard 报告。TensorBoard 横轴 0 为近端，1 为远端。
 
 ## 第一部分：快速评估与查看结果
 

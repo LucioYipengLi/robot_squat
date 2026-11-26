@@ -156,9 +156,11 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
     cell = result_path(directory, job).parent
     cell.mkdir(parents=True, exist_ok=True)
     config, runtime = manifest["config"], manifest["runtime"]
-    from .four_stage import benchmark_for_job
+    from .modules import benchmark_for_job
+    from .upper_fixed_targets import PROTOCOL as UPPER_PROTOCOL
 
     benchmark = benchmark_for_job(config, job, runtime)
+    upper = benchmark.get("protocol") == UPPER_PROTOCOL
     from .progress import PROGRESS_ID_ENV, ProgressWriter
 
     progress = ProgressWriter(cell / "progress.json", job_id, os.environ.get(PROGRESS_ID_ENV) or uuid.uuid4().hex)
@@ -179,9 +181,6 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
         from isaaclab_tasks.utils import resolve_task_config
 
         import g1.tasks  # noqa: F401
-        from g1.tasks.lower_limb_agent.evaluation import EvaluationScenarioController, prepare_env_cfg
-
-        from .policy import load_policy
 
         configure_logging(save_logs_to_file=False)
         progress.update("configuring")
@@ -191,7 +190,21 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
             play_mode=False,
             overrides=[f"physics={runtime['physics']}"],
         )
-        prepare_env_cfg(env_cfg, benchmark, job, runtime["num_envs"], job["seed"])
+        if upper:
+            from g1.tasks.upper_limb_agent import evaluation as upper_eval
+
+            from .upper_fixed_targets import episode_specs as upper_specs
+
+            specs = upper_specs(benchmark, job)
+            saved = upper_eval.prepare_env_cfg(env_cfg, benchmark, job["checkpoint"], runtime["num_envs"], job["seed"])
+            write_json(cell / "case_specs.json", specs)
+        else:
+            from g1.tasks.lower_limb_agent.evaluation import EvaluationScenarioController, prepare_env_cfg
+
+            from .policy import load_policy
+
+            specs = episode_specs(benchmark)
+            prepare_env_cfg(env_cfg, benchmark, job, runtime["num_envs"], job["seed"])
         env_cfg.sim.device = runtime["device"]
         launch_args = {"headless": True, "device": runtime["device"], "visualizer": None}
         configure_seed(job["seed"])
@@ -206,31 +219,43 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                 # Agent-specific clipping is applied after its saved configuration is resolved.
                 env = RslRlVecEnvWrapper(raw_env, clip_actions=None)
                 progress.update("loading_policy")
-                policy, effective_agent, policy_metadata = load_policy(
-                    env,
-                    agent_cfg,
-                    job["checkpoint"],
-                    device=runtime["device"],
-                    allow_unverified=runtime["allow_unverified_checkpoint"],
-                )
+                if upper:
+                    policy, effective_agent, policy_metadata = upper_eval.load_policy(
+                        env, agent_cfg, job["checkpoint"], saved, device=runtime["device"]
+                    )
+                else:
+                    policy, effective_agent, policy_metadata = load_policy(
+                        env,
+                        agent_cfg,
+                        job["checkpoint"],
+                        device=runtime["device"],
+                        allow_unverified=runtime["allow_unverified_checkpoint"],
+                    )
                 env.clip_actions = effective_agent.get("clip_actions")
-                controller_type = EvaluationScenarioController
-                if benchmark.get("protocol") == "four_stage":
-                    from g1.tasks.lower_limb_agent.evaluation_four_stage import FourStageScenarioController
-
-                    controller_type = FourStageScenarioController
-                controller = controller_type(raw_env.unwrapped, benchmark, job, job["seed"])
                 dump_yaml(str(cell / "effective_env.yaml"), env_cfg)
                 dump_yaml(str(cell / "effective_agent.yaml"), effective_agent)
-                records = run_rollouts(
-                    env,
-                    policy,
-                    controller,
-                    benchmark,
+                rollout_args = dict(
                     seed=job["seed"],
                     policy_output=job["policy_output"],
                     progress=progress,
                 )
+                if upper:
+                    records = upper_eval.run_rollouts(env, policy, specs, **rollout_args)
+                    task_metadata = {"level": benchmark["level"], "domain_randomization_phase": 1}
+                else:
+                    controller_type = EvaluationScenarioController
+                    if benchmark.get("protocol") == "four_stage":
+                        from g1.tasks.lower_limb_agent.evaluation_four_stage import FourStageScenarioController
+
+                        controller_type = FourStageScenarioController
+                    controller = controller_type(raw_env.unwrapped, benchmark, job, job["seed"])
+                    records = run_rollouts(env, policy, controller, benchmark, **rollout_args)
+                    task_metadata = {
+                        "upper_body_motion": benchmark["upper_body_motion"],
+                        "upper_body_target_source": env_cfg.observations.policy.upper_body_target.params[
+                            "target_source"
+                        ],
+                    }
                 progress.update("saving_results")
                 device_name = torch.cuda.get_device_name(env_cfg.sim.device) if "cuda" in env_cfg.sim.device else "cpu"
                 result = {
@@ -240,6 +265,7 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                     "episodes": records,
                     "metadata": {
                         **policy_metadata,
+                        **task_metadata,
                         "versions": _versions(),
                         "device_name": device_name,
                         "config_sha256": manifest["config_sha256"],
@@ -247,12 +273,8 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                         "environment": manifest["environment"],
                         "control_dt": raw_env.unwrapped.step_dt,
                         "num_envs": runtime["num_envs"],
-                        "upper_body_motion": benchmark["upper_body_motion"],
-                        "upper_body_target_source": env_cfg.observations.policy.upper_body_target.params[
-                            "target_source"
-                        ],
                         "actual_episode_length_s": raw_env.unwrapped.max_episode_length * raw_env.unwrapped.step_dt,
-                        "case_specs_sha256": canonical_digest(episode_specs(benchmark)),
+                        "case_specs_sha256": canonical_digest(specs),
                     },
                 }
                 write_json(result_path(directory, job), result)

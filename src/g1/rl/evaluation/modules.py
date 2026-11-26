@@ -5,6 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from .config import fraction_axis_step, validate_suite
+from .upper_fixed_targets import CONDITIONS, PROTOCOL, SCHEMA_VERSION, upper_benchmark_for_job
+
+
+def benchmark_for_job(config, job, runtime):
+    if config["schema_version"] == SCHEMA_VERSION:
+        return upper_benchmark_for_job(config, job)
+    from .four_stage import benchmark_for_job as lower_benchmark_for_job
+
+    return lower_benchmark_for_job(config, job, runtime)
 
 
 def conditions(config: Mapping) -> list[dict]:
@@ -14,6 +23,8 @@ def conditions(config: Mapping) -> list[dict]:
     fraction in per mille, so 0.555 is logged at TensorBoard step 555.
     """
     config = validate_suite(config)
+    if config["schema_version"] == SCHEMA_VERSION:
+        return [{"module": PROTOCOL, "condition_id": name, "axis_step": i} for i, name in enumerate(CONDITIONS)]
     if config["schema_version"] == 2:
         from .four_stage import STAGES
 

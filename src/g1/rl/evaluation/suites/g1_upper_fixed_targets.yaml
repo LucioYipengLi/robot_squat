@@ -1,0 +1,24 @@
+schema_version: 3
+suite: g1_upper_fixed_targets
+task: Template-G1-Upper-Mobile-v0
+policy_outputs: [mean]
+benchmark:
+  seeds: [42]
+  # Per seed, per target group. Left, right and both arms alternate.
+  episodes_per_seed: 96
+  level: 10
+  # Offsets from default wrist pose. X/Y follow reset heading; Z is world up.
+  target_ranges_m:
+    near:
+      x: [-0.05, 0.15]
+      y: [-0.05, 0.10]
+      z: [-0.20, 0.20]
+    far:
+      x: [-2.50, 2.50]
+      y: [-2.50, 2.50]
+      z: [-0.05, 0.20]
+  near_episode_s: 10.0
+  settle_s: 2.0
+  evaluation_s: 2.0
+  far_speed_m_s: 0.40
+  far_acceleration_m_s2: 0.30

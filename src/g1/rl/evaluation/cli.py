@@ -8,9 +8,17 @@ from datetime import datetime
 from pathlib import Path
 
 from .jobs import build_manifest, checkpoint_records, execute_jobs, validate_resume, write_json
+from .upper_fixed_targets import SCHEMA_VERSION as UPPER_SCHEMA_VERSION
 
 
-def run(argv: list[str]) -> int:
+def _check_task_family(config, expected):
+    actual = "upper_limb_agent" if config["schema_version"] == UPPER_SCHEMA_VERSION else "lower_limb_agent"
+    if expected is not None and expected != actual:
+        raise ValueError(f"Suite {config['suite']} requires --task-family {actual}")
+    return actual
+
+
+def run(argv: list[str], *, task_family=None) -> int:
     parser = argparse.ArgumentParser(description="Compare G1 checkpoints using fixed, versioned evaluation suites.")
     parser.add_argument("--suite", "--eval-config", default=None, help="Built-in suite name or YAML/JSON path")
     parser.add_argument("--checkpoints", nargs="+", help="Files/globs, optionally LABEL=PATH")
@@ -22,7 +30,7 @@ def run(argv: list[str]) -> int:
     parser.add_argument("--resume", type=Path, help="Continue an existing manifest without changing conditions")
     parser.add_argument("--policy-output", choices=("mean", "sample", "both"))
     parser.add_argument("--seeds", type=int, nargs="+")
-    parser.add_argument("--episodes-per-seed", type=int)
+    parser.add_argument("--episodes-per-seed", type=int, help="Upper: episodes per target group per seed")
     parser.add_argument("--repetitions", type=int, help="Lower suite (schema 2): repeated full batches per stage")
     parser.add_argument("--episode-length-s", type=float, help="Lower suite (schema 2): seconds per episode")
     parser.add_argument("--height-range", type=float, nargs=2, metavar=("MIN", "MAX"))
@@ -89,6 +97,7 @@ def run(argv: list[str]) -> int:
                 raise ValueError("--resume reuses its saved configuration; omit configuration overrides")
             directory = args.resume.resolve()
             manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            _check_task_family(manifest["config"], task_family)
             validate_resume(manifest, require_source=not args.report_only)
         else:
             from .config import load_suite, validate_suite
@@ -135,6 +144,9 @@ def run(argv: list[str]) -> int:
             if args.episodes_per_seed is not None:
                 config["benchmark"]["episodes_per_seed"] = args.episodes_per_seed
             config = validate_suite(config)
+            family = _check_task_family(config, task_family)
+            if family == "upper_limb_agent" and args.allow_unverified_checkpoint:
+                raise ValueError("Upper eval requires verified Mobile control and frozen Lower metadata")
             if args.num_envs is not None and args.num_envs <= 0:
                 raise ValueError("--num_envs must be positive")
             if not args.checkpoints:
@@ -165,7 +177,8 @@ def run(argv: list[str]) -> int:
                 runtime["agent_config_sha256"] = digest_file(agent_path)
             manifest = build_manifest(config, checkpoints, runtime)
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-            directory = (args.output or Path("logs/eval/g1_flat") / timestamp).resolve()
+            task_dir = "g1_upper_mobile" if family == "upper_limb_agent" else "g1_flat"
+            directory = (args.output or Path("logs/eval") / task_dir / timestamp).resolve()
             directory.mkdir(parents=True, exist_ok=False)
             write_json(directory / "manifest.json", manifest)
         print(

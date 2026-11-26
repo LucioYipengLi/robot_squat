@@ -13,6 +13,8 @@ import unicodedata
 from contextlib import suppress
 from pathlib import Path
 
+from .upper_fixed_targets import PROTOCOL as UPPER_PROTOCOL
+
 PROGRESS_ID_ENV = "G1_EVAL_PROGRESS_ID"
 STAGES = {
     "starting_worker": "启动评估进程",
@@ -328,15 +330,13 @@ class EvaluationProgress:
         allocation = f"本次完成 {self.completed} · 已跳过 {self.cached}"
         if self.job is None:
             return [total, f"阶段：{self.phase}", allocation, self.detail or ""]
-        context = (
-            f"当前：{self.job['checkpoint']['label']} · {self.job['module']} · 双臂 {self.job['arm_fraction']:g} "
-            f"· 腰部 {self.job['waist_fraction']:g} · {self.job['policy_output']} · seed {self.job['seed']}"
-        )
-        if self.job["module"] in ("walk_axes", "squat_tracking", "squat_walk_tracking", "squat_push"):
-            context = (
-                f"当前：{self.job['checkpoint']['label']} · {self.job['module']} "
-                f"· {self.job['policy_output']} · seed {self.job['seed']}"
-            )
+        module = self.job["module"]
+        context = f"当前：{self.job['checkpoint']['label']} · {module}"
+        if module == UPPER_PROTOCOL:
+            context += " · 近端" if self.job["condition_id"] == "near" else " · 远端"
+        elif module not in ("walk_axes", "squat_tracking", "squat_walk_tracking", "squat_push"):
+            context += f" · 双臂 {self.job['arm_fraction']:g} · 腰部 {self.job['waist_fraction']:g}"
+        context += f" · {self.job['policy_output']} · seed {self.job['seed']}"
         stage_time = self.state.get("stage_elapsed_s", 0) + max(0, self.clock() - self.observed)
         stage = (
             f"阶段：{STAGES[self.state['stage']]} | 单元已用 {_duration(self.clock() - self.job_started)} "

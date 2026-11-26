@@ -109,15 +109,13 @@ def main(argv=None):
         from .failures.cli import run
 
         return run(remaining)
-    if selected.action == "eval" and selected.task_family not in (None, "lower_limb_agent"):
-        parser.error(f"{selected.action} currently supports only --task-family lower_limb_agent")
     if selected.action == "eval":
         if selected.curriculum_snapshot:
             parser.error("eval uses its suite conditions; omit --curriculum-snapshot")
         # Keep help, planning and report generation usable without importing a simulator.
         from .evaluation.cli import run
 
-        return run(remaining)
+        return run(remaining, task_family=selected.task_family)
     if selected.curriculum_snapshot and not any(
         arg == "--checkpoint" or arg.startswith("--checkpoint=") for arg in remaining
     ):

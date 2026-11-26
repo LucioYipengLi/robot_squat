@@ -155,8 +155,7 @@ def source_digest() -> str:
 
 def build_manifest(config: dict, checkpoints: list[dict], runtime: dict) -> dict:
     from .config import suite_config_digest
-    from .four_stage import benchmark_for_job
-    from .modules import conditions
+    from .modules import benchmark_for_job, conditions
 
     jobs = []
     for checkpoint in checkpoints:
@@ -254,7 +253,7 @@ def execute_jobs(directory: Path, manifest: dict, *, progress=None) -> tuple[lis
     def ordered_results():
         return [results[job["job_id"]] for job in manifest["jobs"] if job["job_id"] in results]
 
-    from .four_stage import benchmark_for_job
+    from .modules import benchmark_for_job
 
     num_envs = manifest["runtime"]["num_envs"]
     for job in manifest["jobs"]:

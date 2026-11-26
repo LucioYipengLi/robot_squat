@@ -229,41 +229,13 @@ def validate_policy_compatibility(env, checkpoint: dict, infos: dict | None, *, 
 def load_policy(env, agent_cfg, checkpoint: dict, *, device: str, allow_unverified=False):
     """Build only the actor, including its normalizer and output distribution."""
     import torch
-    from rsl_rl.utils import resolve_class, resolve_obs_groups
-
-    from isaaclab.utils import to_dict
-    from isaaclab.utils.io import load_yaml
-
-    from isaaclab_rl.rsl_rl import check_rsl_rl_version, handle_deprecated_rsl_rl_cfg
 
     verify_checkpoint_files(checkpoint)
-    agent_cfg = copy.deepcopy(agent_cfg)
-    if checkpoint.get("agent_config"):
-        agent_cfg.from_dict(load_yaml(checkpoint["agent_config"]))
-    agent_cfg.device = device
-    # The upstream migration deletes legacy attributes and is not idempotent on
-    # already-normalized configs. An absent flag means a modern configuration.
-    for model_name in ("actor", "critic"):
-        model = getattr(agent_cfg, model_name)
-        if not hasattr(model, "stochastic"):
-            model.stochastic = False
-    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())
-    cfg = to_dict(agent_cfg)
-    if cfg["class_name"] != "OnPolicyRunner":
-        raise ValueError("Evaluation currently supports RSL-RL OnPolicyRunner actors only")
     saved = torch.load(checkpoint["path"], weights_only=False, map_location=device)
     compatibility = validate_policy_compatibility(
         env.unwrapped, checkpoint, saved.get("infos"), allow_unverified=allow_unverified
     )
-    if "actor_state_dict" not in saved:
-        raise ValueError("Expected the current RSL-RL actor_state_dict checkpoint format")
-    observations = env.get_observations().to(device)
-    groups = resolve_obs_groups(observations, cfg["obs_groups"], ["actor"])
-    actor_class, actor_cfg = resolve_class(cfg["actor"])
-    actor = actor_class(observations, groups, "actor", env.num_actions, **actor_cfg).to(device)
-    actor.load_state_dict(saved["actor_state_dict"], strict=True)
-    actor.eval()
-    actor.requires_grad_(False)
+    actor, cfg = build_actor(env, agent_cfg, checkpoint, saved, device=device)
     metadata = {
         "compatibility_source": compatibility,
         "compatibility_limitations": (
@@ -279,6 +251,41 @@ def load_policy(env, agent_cfg, checkpoint: dict, *, device: str, allow_unverifi
         "agent_config_source": checkpoint.get("agent_config") or "registered_task_default",
     }
     return actor, cfg, metadata
+
+
+def build_actor(env, agent_cfg, checkpoint, saved, *, device):
+    """Construct a verified checkpoint's inference actor using its saved agent config."""
+    from rsl_rl.utils import resolve_class, resolve_obs_groups
+
+    from isaaclab.utils import to_dict
+    from isaaclab.utils.io import load_yaml
+
+    from isaaclab_rl.rsl_rl import check_rsl_rl_version, handle_deprecated_rsl_rl_cfg
+
+    agent_cfg = copy.deepcopy(agent_cfg)
+    if checkpoint.get("agent_config"):
+        agent_cfg.from_dict(load_yaml(checkpoint["agent_config"]))
+    agent_cfg.device = device
+    # The upstream migration deletes legacy attributes and is not idempotent on
+    # already-normalized configs. An absent flag means a modern configuration.
+    for model_name in ("actor", "critic"):
+        model = getattr(agent_cfg, model_name)
+        if not hasattr(model, "stochastic"):
+            model.stochastic = False
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())
+    cfg = to_dict(agent_cfg)
+    if cfg["class_name"] != "OnPolicyRunner":
+        raise ValueError("Evaluation currently supports RSL-RL OnPolicyRunner actors only")
+    if "actor_state_dict" not in saved:
+        raise ValueError("Expected the current RSL-RL actor_state_dict checkpoint format")
+    observations = env.get_observations().to(device)
+    groups = resolve_obs_groups(observations, cfg["obs_groups"], ["actor"])
+    actor_class, actor_cfg = resolve_class(cfg["actor"])
+    actor = actor_class(observations, groups, "actor", env.num_actions, **actor_cfg).to(device)
+    actor.load_state_dict(saved["actor_state_dict"], strict=True)
+    actor.eval()
+    actor.requires_grad_(False)
+    return actor, cfg
 
 
 def policy_action(policy, observations, *, stochastic: bool, seed: int):

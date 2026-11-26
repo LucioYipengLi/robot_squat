@@ -84,7 +84,7 @@ def _wilson(successes, count):
     return max(0.0, center - radius), min(1.0, center + radius)
 
 
-def _group_results(config, results):
+def _group_results(config, results, *, fields=_GROUP_FIELDS):
     seeds = set(config["seeds"])
     if not seeds:
         raise ValueError("At least one evaluation seed is required")
@@ -93,7 +93,7 @@ def _group_results(config, results):
         if result.get("schema_version") != 1:
             raise ValueError("Unsupported evaluation result schema_version")
         checkpoint = result["checkpoint"]
-        key = (checkpoint["label"], checkpoint["path"], checkpoint["sha256"], *(result[x] for x in _GROUP_FIELDS))
+        key = (checkpoint["label"], checkpoint["path"], checkpoint["sha256"], *(result[x] for x in fields))
         seed = result["seed"]
         if seed not in seeds:
             raise ValueError(f"Unexpected evaluation seed: {seed}")
@@ -108,7 +108,7 @@ def _group_results(config, results):
             incomplete.append(
                 {
                     "checkpoint": key[0],
-                    **dict(zip(_GROUP_FIELDS, key[3:], strict=True)),
+                    **dict(zip(fields, key[3:], strict=True)),
                     "completed_seeds": sorted(cases),
                     "missing_seeds": missing,
                 }
@@ -265,6 +265,11 @@ def summarize_results(config, results):
     between-seed variation separately and are omitted for a single seed.
     """
     config = _configuration(config)
+    if config.get("schema_version") == 3:
+        from .upper_fixed_targets_reporting import GROUP_FIELDS, summarize_upper
+
+        groups, _ = _group_results(config["benchmark"], results, fields=GROUP_FIELDS)
+        return summarize_upper(config["benchmark"], groups)
     if config.get("schema_version") == 2:
         from .four_stage_reporting import summarize_four_stage
 
@@ -424,6 +429,28 @@ _PANELS = (
 )
 
 
+_UPPER_PANELS = (
+    (
+        "躯干稳定性",
+        (
+            ("平均躯干倾角 (°)", "torso_angle_mean_deg"),
+            ("平均绝对 Roll (°)", "roll_abs_mean_deg"),
+            ("平均绝对 Pitch (°)", "pitch_abs_mean_deg"),
+        ),
+    ),
+    ("腕部到达精度", (("末段腕部位置平均误差 (mm)", "wrist_error_mm"),)),
+    (
+        "回合与窗口",
+        (
+            ("物理失败率", "failure_rate"),
+            ("完整窗口比例", "window_completion_rate"),
+            ("窗口覆盖率", "window_coverage_fraction"),
+            ("回合数", "episode_count"),
+        ),
+    ),
+)
+
+
 def _write_events(directory, rows):
     # TensorBoard is imported only when a report is actually published; no torch/Kit imports.
     from tensorboard.compat.proto import event_pb2, summary_pb2, tensor_pb2, types_pb2
@@ -437,14 +464,17 @@ def _write_events(directory, rows):
         runs[run].append(row)
     for (module, policy, checkpoint), entries in runs.items():
         from .four_stage import STAGES
+        from .upper_fixed_targets import PROTOCOL as UPPER_PROTOCOL
 
-        panels = _PANELS if module in STAGES else _PANELS[1:]
+        panels = _UPPER_PANELS if module == UPPER_PROTOCOL else _PANELS if module in STAGES else _PANELS[1:]
         layout = Layout()
         available = {key for row in entries for key in row}
         modes = list(dict.fromkeys(row["mode"] for row in entries))
         axis = (
             "双臂目标范围比例‰"
             if module == "upper_body_sweep"
+            else "0 近端，1 远端"
+            if module == UPPER_PROTOCOL
             else "高度编号"
             if module == "squat_push"
             else "固定场景编号"
@@ -491,7 +521,7 @@ def _write_events(directory, rows):
                         metrics += [key for key in row if key.endswith("_lower_95") or key.endswith("_upper_95")]
                         metrics += [key for key in row if key.endswith("_seed_std")]
                     for metric in metrics:
-                        if metric in row:
+                        if row.get(metric) is not None:
                             values.append(
                                 summary_pb2.Summary.Value(
                                     tag=f"{panel}/{row['mode']}/{metric}", simple_value=_finite(row[metric], metric)
@@ -516,9 +546,13 @@ def write_report(output_dir, config, results):
     config = _configuration(config)
     results = list(results)
     rows = summarize_results(config, results)
-    _, incomplete = _group_results(
-        config["benchmark"] if config.get("schema_version") == 2 else _benchmark(config), results
-    )
+    version = config.get("schema_version", 1)
+    if version == 3:
+        from .upper_fixed_targets_reporting import GROUP_FIELDS, NOTES
+
+        _, incomplete = _group_results(config["benchmark"], results, fields=GROUP_FIELDS)
+    else:
+        _, incomplete = _group_results(config["benchmark"] if version == 2 else _benchmark(config), results)
     generation = datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     directory = Path(output_dir) / "reports" / generation
     directory.mkdir(parents=True, exist_ok=False)
@@ -539,7 +573,9 @@ def write_report(output_dir, config, results):
             "confidence_intervals": "per-mode pooled binomial Wilson 95%; seed std reported separately",
         },
     }
-    if config.get("schema_version") == 2:
+    if version == 3:
+        summary["notes"] = NOTES
+    elif version == 2:
         summary["notes"] = {
             "rmse": "sqrt(pooled squared-error sum / executed steps); includes terminal and transient samples",
             "walking": "equal weights: straight vx, lateral vy, turn wz; scales: configured max absolute bounds",
