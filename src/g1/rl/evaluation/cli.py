@@ -9,6 +9,9 @@ from pathlib import Path
 
 from .jobs import build_manifest, checkpoint_records, execute_jobs, validate_resume, write_json
 from .upper_fixed_targets import SCHEMA_VERSION as UPPER_SCHEMA_VERSION
+from .upper_fixed_targets import upper_height_bounds
+from .upper_q import MODES as Q_MODES
+from .upper_q import PROTOCOL as Q_PROTOCOL
 
 
 def _check_task_family(config, expected):
@@ -31,8 +34,27 @@ def run(argv: list[str], *, task_family=None) -> int:
     parser.add_argument("--policy-output", choices=("mean", "sample", "both"))
     parser.add_argument("--seeds", type=int, nargs="+")
     parser.add_argument("--episodes-per-seed", type=int, help="Upper: episodes per target group per seed")
+    parser.add_argument("--q-mode", choices=(*Q_MODES, "both"), help="Workspace Q target mode (default: both)")
+    for side in ("left", "right"):
+        parser.add_argument(
+            f"--{side}-wrist-pose",
+            type=float,
+            nargs=6,
+            metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+            help=f"Workspace Q: fixed {side} wrist position (m) and roll/pitch/yaw (deg)",
+        )
+    parser.add_argument(
+        "--frozen-lower-checkpoint", type=Path, help="Upper: evaluate with a different frozen Lower model_*.pt"
+    )
+    parser.add_argument(
+        "--upper-height-range",
+        type=float,
+        nargs=2,
+        metavar=("MIN", "MAX"),
+        help="Upper: fix the height action range in m inside both policies' bounds",
+    )
     parser.add_argument("--repetitions", type=int, help="Lower suite (schema 2): repeated full batches per stage")
-    parser.add_argument("--episode-length-s", type=float, help="Lower suite (schema 2): seconds per episode")
+    parser.add_argument("--episode-length-s", type=float, help="Lower or workspace Q suite: seconds per episode")
     parser.add_argument("--height-range", type=float, nargs=2, metavar=("MIN", "MAX"))
     parser.add_argument("--vx-range", type=float, nargs=2, metavar=("MIN", "MAX"))
     parser.add_argument("--vy-range", type=float, nargs=2, metavar=("MIN", "MAX"))
@@ -83,6 +105,11 @@ def run(argv: list[str], *, task_family=None) -> int:
                 args.policy_output,
                 args.seeds,
                 args.episodes_per_seed,
+                args.q_mode,
+                args.left_wrist_pose,
+                args.right_wrist_pose,
+                args.frozen_lower_checkpoint,
+                args.upper_height_range,
                 args.agent_config,
                 args.allow_unverified_checkpoint,
                 args.repetitions,
@@ -105,7 +132,6 @@ def run(argv: list[str], *, task_family=None) -> int:
             config = load_suite(args.suite or "g1_core")
             four_stage_options = (
                 args.repetitions,
-                args.episode_length_s,
                 args.height_range,
                 args.vx_range,
                 args.vy_range,
@@ -135,6 +161,10 @@ def run(argv: list[str], *, task_family=None) -> int:
                     benchmark.pop("push_height_offsets", None)
             elif any(value is not None for value in four_stage_options):
                 raise ValueError("These options require a schema 2 suite: g1_lower_four_stage or g1_lower_push")
+            elif args.episode_length_s is not None:
+                if config.get("protocol") != Q_PROTOCOL:
+                    raise ValueError("--episode-length-s requires a schema 2 or workspace Q suite")
+                config["benchmark"]["episode_length_s"] = args.episode_length_s
             if args.task:
                 config["task"] = args.task
             if args.policy_output:
@@ -143,10 +173,20 @@ def run(argv: list[str], *, task_family=None) -> int:
                 config["benchmark"]["seeds"] = args.seeds
             if args.episodes_per_seed is not None:
                 config["benchmark"]["episodes_per_seed"] = args.episodes_per_seed
+            if any(value is not None for value in (args.q_mode, args.left_wrist_pose, args.right_wrist_pose)):
+                if config.get("protocol") != Q_PROTOCOL:
+                    raise ValueError("--q-mode and --left/right-wrist-pose require a workspace Q suite")
+                if args.q_mode is not None:
+                    config["benchmark"]["modes"] = list(Q_MODES) if args.q_mode == "both" else [args.q_mode]
+                for side, pose in (("left", args.left_wrist_pose), ("right", args.right_wrist_pose)):
+                    if pose is not None:
+                        config["benchmark"]["fixed_wrist_poses"][side] = {"position_m": pose[:3], "rpy_deg": pose[3:]}
             config = validate_suite(config)
             family = _check_task_family(config, task_family)
             if family == "upper_limb_agent" and args.allow_unverified_checkpoint:
                 raise ValueError("Upper eval requires verified Mobile control and frozen Lower metadata")
+            if family != "upper_limb_agent" and (args.frozen_lower_checkpoint or args.upper_height_range is not None):
+                raise ValueError("--frozen-lower-checkpoint and --upper-height-range require an Upper Eval suite")
             if args.num_envs is not None and args.num_envs <= 0:
                 raise ValueError("--num_envs must be positive")
             if not args.checkpoints:
@@ -163,8 +203,14 @@ def run(argv: list[str], *, task_family=None) -> int:
                 "agent_config_sha256": None,
                 "allow_unverified_checkpoint": args.allow_unverified_checkpoint,
             }
-            from .jobs import digest_file
+            from .jobs import digest_file, frozen_lower_record
 
+            lower_override = frozen_lower_record(args.frozen_lower_checkpoint) if args.frozen_lower_checkpoint else None
+            upper_height = (
+                upper_height_bounds(args.upper_height_range, "--upper-height-range")
+                if args.upper_height_range is not None
+                else None
+            )
             for checkpoint in checkpoints:
                 adjacent = Path(checkpoint["path"]).parent / "params" / "agent.yaml"
                 resolved_agent = agent_path or (adjacent if adjacent.is_file() else None)
@@ -173,6 +219,10 @@ def run(argv: list[str], *, task_family=None) -> int:
                 adjacent_env = Path(checkpoint["path"]).parent / "params" / "env.yaml"
                 checkpoint["env_config"] = str(adjacent_env) if adjacent_env.is_file() else None
                 checkpoint["env_config_sha256"] = digest_file(adjacent_env) if adjacent_env.is_file() else None
+                if lower_override is not None:
+                    checkpoint["frozen_lower_override"] = lower_override
+                if upper_height is not None:
+                    checkpoint["upper_height_range"] = list(upper_height)
             if agent_path:
                 runtime["agent_config_sha256"] = digest_file(agent_path)
             manifest = build_manifest(config, checkpoints, runtime)
@@ -212,6 +262,8 @@ def run(argv: list[str], *, task_family=None) -> int:
                 f'Report: {report["report_dir"]}\nTensorBoard: tensorboard --logdir "{report["tensorboard_dir"]}"',
                 flush=True,
             )
+            if "replay_dir" in report:
+                print(f'Viewer: python -m g1.rl failures view --run "{report["replay_dir"]}"', flush=True)
         return 0 if complete else 1
     except (ValueError, OSError, KeyError) as error:
         parser.error(str(error))

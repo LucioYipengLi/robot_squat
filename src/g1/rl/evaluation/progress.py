@@ -14,6 +14,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from .upper_fixed_targets import PROTOCOL as UPPER_PROTOCOL
+from .upper_q import PROTOCOL as Q_PROTOCOL
 
 PROGRESS_ID_ENV = "G1_EVAL_PROGRESS_ID"
 STAGES = {
@@ -334,6 +335,8 @@ class EvaluationProgress:
         context = f"当前：{self.job['checkpoint']['label']} · {module}"
         if module == UPPER_PROTOCOL:
             context += " · 近端" if self.job["condition_id"] == "near" else " · 远端"
+        elif module == Q_PROTOCOL:
+            context += " · 种子随机双腕" if self.job["condition_id"] == "random" else " · 指定双腕"
         elif module == "action_delay_sweep":
             context += f" · 延迟 {self.job['action_delay_steps']} 物理步"
         elif module not in ("walk_axes", "squat_tracking", "squat_walk_tracking", "squat_push"):

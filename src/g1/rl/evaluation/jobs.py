@@ -145,6 +145,25 @@ def checkpoint_records(patterns: list[str]) -> list[dict]:
     return records
 
 
+def frozen_lower_record(path: Path) -> dict:
+    """Pin the Lower file and the adjacent configs used by the frozen actor."""
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Frozen Lower checkpoint does not exist: {path}")
+    env = path.parent / "params" / "env.yaml"
+    if not env.is_file():
+        raise FileNotFoundError(f"Frozen Lower observation contract requires {env}")
+    agent = env.with_name("agent.yaml")
+    return {
+        "path": str(path),
+        "sha256": digest_file(path),
+        "env_config": str(env),
+        "env_config_sha256": digest_file(env),
+        "agent_config": str(agent),
+        "agent_config_sha256": digest_file(agent) if agent.is_file() else None,
+    }
+
+
 def source_digest() -> str:
     """Record project Python source, including the task, as part of the execution identity."""
     package = Path(__file__).resolve().parents[2]
@@ -201,14 +220,21 @@ def validate_resume(manifest: dict, *, require_source=True) -> None:
         raise ValueError("Evaluation dependencies or editable upstream sources changed; start a new batch")
     if not require_source:
         return
-    for checkpoint in manifest["checkpoints"]:
+    checkpoints = manifest["checkpoints"]
+    # Include overrides in the input check even when all results are cached.
+    lower_overrides = {
+        override["path"]: override for item in checkpoints if (override := item.get("frozen_lower_override"))
+    }
+    for checkpoint in (*checkpoints, *lower_overrides.values()):
         for key, digest_key in (
             ("path", "sha256"),
             ("agent_config", "agent_config_sha256"),
             ("env_config", "env_config_sha256"),
         ):
-            if checkpoint.get(key) and digest_file(checkpoint[key]) != checkpoint[digest_key]:
-                raise ValueError(f"Checkpoint input changed: {checkpoint[key]}")
+            if file := checkpoint.get(key):
+                actual = digest_file(file) if Path(file).is_file() else None
+                if actual != checkpoint[digest_key]:
+                    raise ValueError(f"Checkpoint input changed: {file}")
 
 
 def result_path(directory: Path, job: dict) -> Path:

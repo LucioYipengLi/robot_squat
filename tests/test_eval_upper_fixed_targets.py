@@ -15,7 +15,7 @@ def test_targets_are_replayed_across_models_and_batch_sizes():
     b = config["benchmark"]
     assert b["target_ranges_m"] == {
         "near": {"x": [-0.05, 0.15], "y": [-0.05, 0.1], "z": [-0.2, 0.2]},
-        "far": {"x": [-2.5, 2.5], "y": [-2.5, 2.5], "z": [-0.2, 0.2]},
+        "far": {"x": [-2.5, 2.5], "y": [-2.5, 2.5], "z": [-0.05, 0.2]},
     }
     for condition in conditions(config):
         job = {**condition, "seed": 42, "checkpoint": "baseline"}
@@ -70,7 +70,15 @@ def test_upper_report_accounts_for_failed_and_partial_windows(tmp_path):
             zip(episode_specs(config["benchmark"], job), [120, 30, 0], [12.0, 1.0, None], strict=True)
         )
     ]
-    result = {**job, "schema_version": 1, "episodes": records}
+    result = {
+        **job,
+        "schema_version": 1,
+        "episodes": records,
+        "metadata": {
+            "frozen_lower": {"checkpoint": "lower.pt", "sha256": "lower-sha"},
+            "episode_height_range_m": [-0.38999998569488525, 0.05000000074505806],
+        },
+    }
     rows = summarize_results(config, [result])
     assert rows[0]["mode"] == "aggregate"
     assert rows[0]["torso_angle_mean_deg"] == 2
@@ -78,6 +86,8 @@ def test_upper_report_accounts_for_failed_and_partial_windows(tmp_path):
     assert rows[0]["failure_rate"] == pytest.approx(2 / 3)
     assert rows[0]["window_completion_rate"] == pytest.approx(1 / 3)
     assert rows[0]["window_coverage_fraction"] == pytest.approx(150 / 360)
+    assert rows[0]["frozen_lower_sha256"] == "lower-sha"
+    assert rows[0]["episode_height_min_m"] == -0.39
     assert rows[2]["wrist_error_mm"] is None
     report = write_report(tmp_path, config, [result])
     with open(report["summary_json"], encoding="utf-8") as stream:

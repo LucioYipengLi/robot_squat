@@ -1,0 +1,27 @@
+schema_version: 3
+protocol: upper_workspace_q
+suite: g1_upper_workspace_q
+task: Template-G1-Upper-Mobile-v0
+policy_outputs: [mean]
+benchmark:
+  modes: [random, fixed]
+  seeds: [42]
+  episodes_per_seed: 24
+  level: 7
+  episode_length_s: 20.0
+  evaluation_s: 2.0
+  steady_speed_mps: 0.03
+  map_sha256: 0c105d6f451be4ed22a1846a1f8098e080263f7ac97e71a84d0976b84404dc98
+  # Shared translation from both nominal wrists: forward, lateral, and world up.
+  random_offset_ranges_m:
+    x: [0.08, 0.25]
+    y: [-0.04, 0.04]
+    z: [-0.13, 0.03]
+  # Environment-local XYZ in meters; world-aligned roll/pitch/yaw in degrees.
+  fixed_wrist_poses:
+    left:
+      position_m: [-0.15, 0.3, 0.75]
+      rpy_deg: [0.003, 0.003, 89.989]
+    right:
+      position_m: [0.15, 0.3, 0.75]
+      rpy_deg: [-0.003, 0.003, 90.011]

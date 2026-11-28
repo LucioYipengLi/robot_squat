@@ -93,7 +93,7 @@ def parse_args(argv):
     mine.add_argument("--dr-phase", type=int, choices=(1, 2, 3, 4), default=1, help="Evaluate with this DR phase")
     mine.add_argument("--dr-push-delta-v", type=positive_float, help="Override phase 4 push bounds per axis (m/s)")
     mine.add_argument("--device", default="cuda:0")
-    view = modes.add_parser("view", help="Serve a local 3-D replay/force timeline; no simulator required")
+    view = modes.add_parser("view", help="Serve a local 3-D replay of failure or Q Eval archives without a simulator")
     view.add_argument("--run", type=Path, required=True)
     view.add_argument("--port", type=int, default=8765)
     view.add_argument("--no_browser", action="store_true")

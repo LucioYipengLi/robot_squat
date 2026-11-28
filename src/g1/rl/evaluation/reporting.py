@@ -456,6 +456,35 @@ _UPPER_PANELS = (
     ),
 )
 
+_UPPER_Q_PANELS = (
+    (
+        "腕部 Q",
+        tuple(
+            (f"{label} · {kind_label}", f"wrist_{side}_q_{kind}")
+            for kind, kind_label in (("actual", "实际 Q"), ("target", "目标 Q"))
+            for side, label in (("left", "左腕"), ("right", "右腕"), ("both", "双腕"))
+        ),
+    ),
+    (
+        "稳态腕部误差",
+        tuple(
+            (f"{label} · {title}", f"wrist_{side}_{metric}")
+            for side, label in (("left", "左腕"), ("right", "右腕"))
+            for title, metric in (("位置误差 (mm)", "error_mm"), ("朝向误差 (rad)", "orientation_error_rad"))
+        ),
+    ),
+    (
+        "稳态与覆盖",
+        (
+            ("稳态窗口比例", "steady_window_rate"),
+            ("双腕实际 Q 覆盖率", "wrist_both_q_actual_coverage"),
+            ("双腕目标 Q 覆盖率", "wrist_both_q_target_coverage"),
+            ("物理失败率", "failure_rate"),
+            ("完整窗口比例", "window_completion_rate"),
+        ),
+    ),
+)
+
 
 def _write_events(directory, rows):
     # TensorBoard is imported only when a report is actually published; no torch/Kit imports.
@@ -471,8 +500,12 @@ def _write_events(directory, rows):
     for (module, policy, checkpoint), entries in runs.items():
         from .four_stage import STAGES
         from .upper_fixed_targets import PROTOCOL as UPPER_PROTOCOL
+        from .upper_q import PROTOCOL as Q_PROTOCOL
 
-        panels = _UPPER_PANELS if module == UPPER_PROTOCOL else _PANELS if module in STAGES else _PANELS[1:]
+        panels = {
+            Q_PROTOCOL: _UPPER_Q_PANELS,
+            UPPER_PROTOCOL: _UPPER_PANELS,
+        }.get(module, _PANELS if module in STAGES else _PANELS[1:])
         layout = Layout()
         available = {key for row in entries for key in row}
         modes = list(dict.fromkeys(row["mode"] for row in entries))
@@ -483,6 +516,8 @@ def _write_events(directory, rows):
             if module == "action_delay_sweep"
             else "0 近端，1 远端"
             if module == UPPER_PROTOCOL
+            else "0 种子随机，1 指定位姿"
+            if module == Q_PROTOCOL
             else "高度编号"
             if module == "squat_push"
             else "固定场景编号"
@@ -556,7 +591,8 @@ def write_report(output_dir, config, results):
     rows = summarize_results(config, results)
     version = config.get("schema_version", 1)
     if version == 3:
-        from .upper_fixed_targets_reporting import GROUP_FIELDS, NOTES
+        from .upper_fixed_targets_reporting import GROUP_FIELDS, NOTES, Q_NOTES
+        from .upper_q import PROTOCOL as Q_PROTOCOL
 
         _, incomplete = _group_results(config["benchmark"], results, fields=GROUP_FIELDS)
     else:
@@ -582,7 +618,7 @@ def write_report(output_dir, config, results):
         },
     }
     if version == 3:
-        summary["notes"] = NOTES
+        summary["notes"] = Q_NOTES if config.get("protocol") == Q_PROTOCOL else NOTES
     elif version == 2:
         summary["notes"] = {
             "rmse": "sqrt(pooled squared-error sum / executed steps); includes terminal and transient samples",
@@ -601,4 +637,8 @@ def write_report(output_dir, config, results):
         writer.writeheader()
         writer.writerows(rows)
     _write_events(directory / "tensorboard", rows)
+    if version == 3 and config.get("protocol") == Q_PROTOCOL:
+        from .q_outputs import write_q_outputs
+
+        paths.update(write_q_outputs(Path(output_dir), directory, results))
     return paths

@@ -16,8 +16,8 @@ benchmark:
   push_height_offsets: [-0.15, -0.075, 0.0]
   push_windows_fraction: [[0.25, 0.4], [0.6, 0.75]]
   push_velocity_range:
-    x: [-0.10, 0.10]
-    y: [-0.10, 0.10]
+    x: [-0.70, 0.70]
+    y: [-0.70, 0.70]
   recovery:
     height_m: 0.03
     tilt_rad: 0.1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -15,9 +16,13 @@ from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, yaw_quat
 
 from g1.rl.evaluation.jobs import digest_file
 from g1.rl.evaluation.policy import build_actor, policy_action, verify_checkpoint_files
-from g1.rl.evaluation.upper_fixed_targets import ARM_MODES
+from g1.rl.evaluation.upper_fixed_targets import ARM_MODES, resolve_upper_height_range
+from g1.rl.evaluation.upper_q import PROTOCOL as Q_PROTOCOL
+from g1.rl.evaluation.upper_q import SIDES, quaternion_xyzw
 
 from .mdp.pose_override import PoseOverride
+from .mdp.workspace_quality import WorkspaceQualityCfg
+from .q_eval_recording import QWindows
 from .runner import UpperLimbOnPolicyRunner
 from .symmetry import FULL_OBSERVATION_DIM
 
@@ -37,18 +42,18 @@ class UpperEvalRecordersCfg(RecorderManagerBaseCfg):
     upper_eval = RecorderTermCfg(class_type=UpperEvalRecorder)
 
 
-def prepare_env_cfg(cfg, benchmark, checkpoint, num_envs, seed):
-    verify_checkpoint_files(checkpoint)
-    saved = torch.load(checkpoint["path"], map_location="cpu", weights_only=True)
-    infos = saved.get("infos") or {}
-    interface = infos.get("g1_control_interface") or {}
-    if interface.get("schema_version") != 4 or interface.get("policy_observation_dim") != FULL_OBSERVATION_DIM:
-        raise ValueError(f"Upper eval requires a schema 4 Mobile checkpoint with {FULL_OBSERVATION_DIM} observations")
-    lower = infos.get("g1_frozen_lower") or {}
-    if not lower.get("sha256") or not lower.get("interface"):
-        raise ValueError("Upper checkpoint must identify its frozen Lower actor and interface")
+@dataclass(frozen=True)
+class UpperEvalSetup:
+    lower_sha256: str
+    height_range: tuple[float, float] | None = None
+    map_sha256: str | None = None
+
+
+def _select_lower(checkpoint, lower, default_path):
+    if override := checkpoint.get("frozen_lower_override"):
+        return Path(override["path"]), override["sha256"]
     archive = Path(checkpoint["path"]).parent / "artifacts/frozen_lower_model.pt"
-    default = Path(cfg.actions.joint_pos.checkpoint_path).expanduser()
+    default = Path(default_path).expanduser()
     original = Path(lower["checkpoint"]).expanduser() if lower.get("checkpoint") else default
     lower_path = next(
         (
@@ -62,6 +67,46 @@ def prepare_env_cfg(cfg, benchmark, checkpoint, num_envs, seed):
         raise ValueError(
             f"Matching frozen Lower model not found for {checkpoint['path']}; expected archive at {archive}"
         )
+    return lower_path, lower["sha256"]
+
+
+def _lower_training_height(path):
+    saved = torch.load(path, map_location="cpu", weights_only=True)
+    state = (saved.get("infos") or {}).get("g1_curriculum") or {}
+    if state.get("family") != "g1.lower_limb_agent" or "actor_state_dict" not in saved:
+        raise ValueError(f"Expected a frozen Lower actor checkpoint with curriculum metadata: {path}")
+    height = state.get("distribution", {}).get("ranges", {}).get("height_offset")
+    if height is None:
+        raise ValueError(f"Frozen Lower checkpoint does not record its training height range: {path}")
+    return height
+
+
+def prepare_env_cfg(cfg, benchmark, checkpoint, num_envs, seed):
+    verify_checkpoint_files(checkpoint)
+    saved = torch.load(checkpoint["path"], map_location="cpu", weights_only=True)
+    infos = saved.get("infos") or {}
+    interface = infos.get("g1_control_interface") or {}
+    if interface.get("schema_version") != 4 or interface.get("policy_observation_dim") != FULL_OBSERVATION_DIM:
+        raise ValueError(f"Upper eval requires a schema 4 Mobile checkpoint with {FULL_OBSERVATION_DIM} observations")
+    lower = infos.get("g1_frozen_lower") or {}
+    if not lower.get("sha256") or not lower.get("interface"):
+        raise ValueError("Upper checkpoint must identify its frozen Lower actor and interface")
+    lower_path, lower_sha256 = _select_lower(checkpoint, lower, cfg.actions.joint_pos.checkpoint_path)
+    curriculum = cfg.commands.wrist_pose.range_curriculum
+    height_range = None
+    requested = checkpoint.get("upper_height_range")
+    if checkpoint.get("frozen_lower_override") or requested is not None:
+        original = cfg.actions.height_offset.height_offset_range
+        if list(original) != interface.get("height_offset_range"):
+            raise ValueError("Upper checkpoint control interface differs before adaptation: height_offset_range")
+        height_range = resolve_upper_height_range(original, _lower_training_height(lower_path), requested)
+        cfg.actions.height_offset.height_offset_range = height_range
+        initial_lo, initial_hi = curriculum.initial_lower_ranges[0]
+        # Preserve curriculum interpolation even when the new Lower has a smaller range than Level 0.
+        curriculum.initial_lower_ranges = (
+            (max(initial_lo, height_range[0]), min(initial_hi, height_range[1])),
+            *curriculum.initial_lower_ranges[1:],
+        )
 
     cfg.actions.joint_pos.checkpoint_path = str(lower_path)
     cfg.legacy_observations = False
@@ -71,21 +116,30 @@ def prepare_env_cfg(cfg, benchmark, checkpoint, num_envs, seed):
     cfg.episode_length_s = max(cfg.episode_length_s, benchmark["episode_length_s"])
     cfg.recorders = UpperEvalRecordersCfg()
     wrist = cfg.commands.wrist_pose
+    map_sha256 = None
+    if benchmark.get("protocol") == Q_PROTOCOL:
+        wrist.workspace_quality = WorkspaceQualityCfg()
+        map_path = Path(__file__).resolve().parent / wrist.workspace_quality.map_path
+        map_sha256 = benchmark["map_sha256"]
+        if digest_file(map_path) != map_sha256:
+            raise ValueError(f"Workspace Q map hash differs from the suite: {map_path}")
     wrist.debug_vis = False
     wrist.planar_turn_focus.enabled = False
-    wrist.range_curriculum.initial_level = benchmark["level"]
-    wrist.range_curriculum.advance = False
-    wrist.range_curriculum.freeze_planar_sampling = True
+    curriculum.initial_level = benchmark["level"]
+    curriculum.advance = False
+    curriculum.freeze_planar_sampling = True
     dt = cfg.sim.dt * cfg.decimation
     if not math.isclose(dt, benchmark["control_dt"], rel_tol=0, abs_tol=1e-10):
         raise ValueError(f"Upper suite requires control dt {benchmark['control_dt']}, got {dt}")
-    return saved
+    return saved, UpperEvalSetup(lower_sha256, height_range, map_sha256)
 
 
-def load_policy(env, agent_cfg, checkpoint, saved, *, device):
+def load_policy(env, agent_cfg, checkpoint, saved, setup, *, device):
     raw = env.unwrapped
     infos = saved["infos"]
     expected = infos["g1_control_interface"]
+    if setup.height_range is not None:
+        expected = {**expected, "height_offset_range": list(setup.height_range)}
     actual = UpperLimbOnPolicyRunner.mobile_control_interface(raw)
     if actual is None:
         raise ValueError("Upper evaluation requires the Mobile control interface")
@@ -97,18 +151,34 @@ def load_policy(env, agent_cfg, checkpoint, saved, *, device):
         raise ValueError(f"Upper checkpoint control interface differs: {', '.join(differing)}")
     lower = raw.action_manager.get_term("joint_pos").frozen_policy
     expected_lower = infos["g1_frozen_lower"]
-    if lower.metadata["sha256"] != expected_lower["sha256"] or lower.interface != expected_lower["interface"]:
+    if lower.metadata["sha256"] != setup.lower_sha256 or lower.interface != expected_lower["interface"]:
         raise ValueError("Frozen Lower model or interface differs from the Upper checkpoint")
+    command = raw.command_manager.get_term("wrist_pose")
+    curriculum = command.range_curriculum
+    q_metadata = {}
+    if setup.map_sha256 is not None:
+        quality = command.workspace_quality_map
+        if quality is None or quality.sha256 != setup.map_sha256:
+            raise ValueError("Loaded workspace Q map differs from the suite")
+        q_metadata = {
+            "workspace_q_map_sha256": quality.sha256,
+            "workspace_q_reference": quality.q_reference,
+            "training_q_map_sha256": (infos.get("g1_workspace_quality") or {}).get("map_sha256"),
+        }
     actor, cfg = build_actor(env, agent_cfg, checkpoint, saved, device=device)
     return (
         actor,
         cfg,
         {
+            **q_metadata,
             "compatibility_source": "g1_control_interface+g1_frozen_lower",
             "training_iteration": saved.get("iter"),
             "training_level": (infos.get("g1_upper_ranges") or {}).get("level"),
             "training_phase": ((infos.get("g1_upper_domain_randomization") or {}).get("settings") or {}).get("phase"),
             "frozen_lower": lower.metadata,
+            "frozen_lower_overridden": bool(checkpoint.get("frozen_lower_override")),
+            "upper_height_range_m": actual["height_offset_range"],
+            "episode_height_range_m": curriculum.lower_ranges[0, 0].tolist(),
             "actor_class": str(cfg["actor"]["class_name"]),
             "agent_config_source": checkpoint.get("agent_config") or "registered_task_default",
         },
@@ -146,11 +216,14 @@ class UpperFixedTargets(PoseOverride):
         selected = slice(0, len(specs))
         self.active[selected] = True
         self.modes[selected] = self.modes.new_tensor([ARM_MODES.index(spec["arm_mode"]) for spec in specs])
-        self.offsets[selected] = self.offsets.new_tensor([spec["offset_m"] for spec in specs])
+        self._load_targets(selected, specs)
         self.starts[selected] = self.starts.new_tensor([spec["evaluation_start_step"] for spec in specs])
         self.deadlines[selected] = self.deadlines.new_tensor([spec["deadline_step"] for spec in specs])
         for buffer in (self.tracking_steps, self.window_steps, self.tilt_sum, self.error_sum):
             buffer.zero_()
+
+    def _load_targets(self, selected, specs):
+        self.offsets[selected] = self.offsets.new_tensor([spec["offset_m"] for spec in specs])
 
     def prepare_reset(self, term, ids):
         super().prepare_reset(term, ids)
@@ -164,10 +237,13 @@ class UpperFixedTargets(PoseOverride):
         term.goal_pose_w[fresh] = term.default_wrist_pose_e[fresh]
         term.goal_pose_w[fresh, :, :3] += self.env.scene.env_origins[fresh, None, :]
         selected = fresh[self.active[fresh]]
-        world_offset = quat_apply(yaw_quat(term._sampling_quat_w[selected]), self.offsets[selected])
-        term.goal_pose_w[selected, :, :3] += world_offset[:, None] * term.active_mask[selected, :, None]
+        self._set_targets(term, selected)
         term.command_counter[fresh] += 1
         term.time_left[ids] = torch.inf
+
+    def _set_targets(self, term, selected):
+        world_offset = quat_apply(yaw_quat(term._sampling_quat_w[selected]), self.offsets[selected])
+        term.goal_pose_w[selected, :, :3] += world_offset[:, None] * term.active_mask[selected, :, None]
 
     def capture(self):
         """Sample the physical step once, before any automatic reset."""
@@ -180,14 +256,21 @@ class UpperFixedTargets(PoseOverride):
         angles = torch.stack((roll, pitch), dim=-1)
         # Euler angles can be returned modulo 2 pi. Map to signed principal angles first.
         abs_tilt_deg = torch.rad2deg(torch.atan2(angles.sin(), angles.cos()).abs())
-        position, _ = term.pose_error()
+        position, orientation = term.pose_error()
         self.tracking_steps += active
         self.window_steps += window
         self.tilt_sum += torch.where(active[:, None], abs_tilt_deg, 0)
         self.error_sum += torch.where(window[:, None] & term.active_mask, position, 0)
+        self._capture_step(active, window, age, position, orientation)
         ended = (active & (env.reset_terminated | env.reset_time_outs)).nonzero().flatten()
         if len(ended):
             self._finish(ended)
+
+    def _capture_step(self, active, window, age, position, orientation):
+        pass
+
+    def _extra_records(self, ids):
+        return [{} for _ in range(len(ids))]
 
     def _finish(self, ids):
         env, term = self.env, self.term
@@ -203,6 +286,7 @@ class UpperFixedTargets(PoseOverride):
             name: env.termination_manager.get_term(name)[ids].tolist() for name in env.termination_manager.active_terms
         }
         masks = term.active_mask[ids].tolist()
+        extras = self._extra_records(ids)
         for row, (slot, goal, mask) in enumerate(zip(ids.tolist(), goals.tolist(), masks, strict=True)):
             spec = self.specs[slot]
             arms = [
@@ -213,6 +297,7 @@ class UpperFixedTargets(PoseOverride):
             self.batch_records.append(
                 {
                     **spec,
+                    **extras[row],
                     "goal_pose_env_xyzw": [value if armed else None for value, armed in zip(goal, mask, strict=True)],
                     "steps": steps[row],
                     "elapsed_s": steps[row] * env.step_dt,
@@ -235,9 +320,55 @@ class UpperFixedTargets(PoseOverride):
         self.active[ids] = False
 
 
-def run_rollouts(env, policy, specs, *, seed, policy_output, progress):
+class UpperQTargets(UpperFixedTargets):
+    def __init__(self, env, steady_speed_mps, replay):
+        super().__init__(env)
+        self.q_windows = QWindows(env, steady_speed_mps)
+        self.motion_replay = replay
+        self.fixed_pose = None
+
+    def _load_targets(self, selected, specs):
+        if "wrist_poses" not in specs[0]:
+            self.fixed_pose = None
+            super()._load_targets(selected, specs)
+            return
+        poses = []
+        for spec in specs:
+            wrist = spec["wrist_poses"]
+            poses.append([(*wrist[side]["position_m"], *quaternion_xyzw(wrist[side]["rpy_deg"])) for side in SIDES])
+        self.fixed_pose = self.term.goal_pose_w.new_zeros(self.term.goal_pose_w.shape)
+        self.fixed_pose[selected] = self.fixed_pose.new_tensor(poses)
+
+    def _set_targets(self, term, selected):
+        if self.fixed_pose is None:
+            super()._set_targets(term, selected)
+        else:
+            term.goal_pose_w[selected] = self.fixed_pose[selected]
+            term.goal_pose_w[selected, :, :3] += self.env.scene.env_origins[selected, None, :]
+
+    def start_batch(self, specs):
+        super().start_batch(specs)
+        self.q_windows.reset(max(spec["deadline_step"] for spec in specs))
+
+    def _capture_step(self, active, window, age, position, orientation):
+        if self.motion_replay is not None:
+            self.motion_replay.capture()
+        term = self.term
+        speed_square = term.robot.data.body_link_vel_w.torch[:, term.body_indices, :3].square().sum(-1)
+        self.q_windows.add(active, window, age, position, orientation, speed_square, term.workspace_quality_state())
+
+    def _extra_records(self, ids):
+        slots = ids.tolist()
+        if self.motion_replay is not None and 0 in slots:
+            self.motion_replay.done = True
+        return self.q_windows.records(
+            ids, [self.specs[slot] for slot in slots], self.term.workspace_quality_map.q_reference
+        )
+
+
+def run_rollouts(env, policy, specs, *, seed, policy_output, progress, steady_speed_mps=None, replay=None):
     raw = env.unwrapped
-    controller = UpperFixedTargets(raw)
+    controller = UpperFixedTargets(raw) if steady_speed_mps is None else UpperQTargets(raw, steady_speed_mps, replay)
     term = controller.term
     previous = term._teleop
     term._teleop = controller
@@ -249,6 +380,8 @@ def run_rollouts(env, policy, specs, *, seed, policy_output, progress):
                 batch = specs[offset : offset + env.num_envs]
                 controller.start_batch(batch)
                 obs, _ = env.reset()
+                if replay is not None:
+                    replay.capture()
                 policy.reset()
                 horizon = max(spec["deadline_step"] for spec in batch)
                 for step in range(1, horizon + 1):

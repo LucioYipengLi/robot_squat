@@ -158,9 +158,11 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
     config, runtime = manifest["config"], manifest["runtime"]
     from .modules import benchmark_for_job
     from .upper_fixed_targets import PROTOCOL as UPPER_PROTOCOL
+    from .upper_q import PROTOCOL as Q_PROTOCOL
 
     benchmark = benchmark_for_job(config, job, runtime)
-    upper = benchmark.get("protocol") == UPPER_PROTOCOL
+    q_eval = benchmark.get("protocol") == Q_PROTOCOL
+    upper = q_eval or benchmark.get("protocol") == UPPER_PROTOCOL
     from .progress import PROGRESS_ID_ENV, ProgressWriter
 
     progress = ProgressWriter(cell / "progress.json", job_id, os.environ.get(PROGRESS_ID_ENV) or uuid.uuid4().hex)
@@ -193,10 +195,15 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
         if upper:
             from g1.tasks.upper_limb_agent import evaluation as upper_eval
 
-            from .upper_fixed_targets import episode_specs as upper_specs
+            if q_eval:
+                from .upper_q import episode_specs as upper_specs
+            else:
+                from .upper_fixed_targets import episode_specs as upper_specs
 
             specs = upper_specs(benchmark, job)
-            saved = upper_eval.prepare_env_cfg(env_cfg, benchmark, job["checkpoint"], runtime["num_envs"], job["seed"])
+            saved, upper_setup = upper_eval.prepare_env_cfg(
+                env_cfg, benchmark, job["checkpoint"], runtime["num_envs"], job["seed"]
+            )
             write_json(cell / "case_specs.json", specs)
         else:
             from g1.tasks.lower_limb_agent.evaluation import EvaluationScenarioController, prepare_env_cfg
@@ -221,7 +228,7 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                 progress.update("loading_policy")
                 if upper:
                     policy, effective_agent, policy_metadata = upper_eval.load_policy(
-                        env, agent_cfg, job["checkpoint"], saved, device=runtime["device"]
+                        env, agent_cfg, job["checkpoint"], saved, upper_setup, device=runtime["device"]
                     )
                 else:
                     policy, effective_agent, policy_metadata = load_policy(
@@ -240,8 +247,31 @@ def run_worker(manifest_path: Path, job_id: str) -> int:
                     progress=progress,
                 )
                 if upper:
+                    replay = None
+                    if q_eval:
+                        from g1.tasks.upper_limb_agent.q_eval_recording import QReplay
+
+                        raw = raw_env.unwrapped
+                        replay = QReplay(raw, raw.command_manager.get_term("wrist_pose"), specs[0])
+                        rollout_args["steady_speed_mps"] = benchmark["steady_speed_mps"]
+                        rollout_args["replay"] = replay
                     records = upper_eval.run_rollouts(env, policy, specs, **rollout_args)
                     task_metadata = {"level": benchmark["level"], "domain_randomization_phase": 1}
+                    if replay is not None:
+                        task_metadata["q_replay"] = replay.save(cell)
+                        geometry_path = directory / "replay_geometry.json"
+                        if not geometry_path.is_file():
+                            from isaaclab.sim import get_current_stage
+
+                            from g1.rl.failures.geometry import export_geometry
+                            from g1.rl.failures.storage import write_json as write_geometry
+
+                            robot_prim = get_current_stage().GetPrimAtPath("/World/envs/env_0/Robot")
+                            write_geometry(
+                                geometry_path,
+                                export_geometry(robot_prim, list(replay.term.robot.body_names)),
+                                indent=None,
+                            )
                 else:
                     controller_type = EvaluationScenarioController
                     if benchmark.get("protocol") == "four_stage":

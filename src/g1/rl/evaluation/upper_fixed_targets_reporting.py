@@ -3,6 +3,9 @@
 from statistics import fmean, pstdev
 
 from .upper_fixed_targets import ARM_MODES, episode_specs
+from .upper_q import PROTOCOL as Q_PROTOCOL
+from .upper_q import SIDES
+from .upper_q import episode_specs as q_episode_specs
 
 GROUP_FIELDS = ("module", "policy_output", "condition_id", "axis_step")
 NOTES = {
@@ -13,15 +16,59 @@ NOTES = {
     "window_completion_rate": "Fraction of assigned cases with all planned end-window samples.",
     "window_coverage_fraction": "Fraction of all assigned end-window samples actually observed.",
 }
+Q_NOTES = {
+    **NOTES,
+    "q": "Per-frame pelvis-frame lookup on the shared 0 kg map. Right wrist is mirrored on Y. "
+    "Q means use successful, full, steady windows only; per-wrist means use valid frames, "
+    "and bilateral means use frames where both wrists are valid. Missing values are null.",
+    "q_coverage": "Mean per-episode fraction of valid frames across complete windows, including nonsteady cases.",
+    "steady": "A successful full window is steady when both world-frame wrist linear speed RMS values meet the limit.",
+    "pose": "Per-wrist position/orientation means use steady windows; wrist_error_mm still uses all full windows.",
+}
+
+
+def _mean_known(episodes, key):
+    values = [value for episode in episodes if (value := episode[key]) is not None]
+    return fmean(values) if values else None
+
+
+def _summarize_q(row, metadata, episodes, windows):
+    steady = [record for record in windows if not record["failed"] and record["wrists_steady"]]
+    row.update(
+        workspace_q_map_sha256=metadata["workspace_q_map_sha256"],
+        workspace_q_reference=metadata["workspace_q_reference"],
+        steady_window_count=len(steady),
+        steady_window_rate=len(steady) / len(episodes),
+    )
+    for side in SIDES:
+        for metric in ("error_mm", "orientation_error_rad"):
+            key = f"wrist_{side}_{metric}"
+            row[key] = _mean_known(steady, key)
+        key = f"wrist_{side}_speed_rms_mps"
+        row[key] = _mean_known(windows, key)
+    for kind in ("actual", "target"):
+        for side in (*SIDES, "both"):
+            key = f"wrist_{side}_q_{kind}"
+            row[key] = _mean_known(steady, key)
+            row[f"{key}_raw"] = _mean_known(steady, f"{key}_raw")
+            row[f"{key}_coverage"] = _mean_known(windows, f"{key}_coverage")
 
 
 def summarize_upper(benchmark, groups):
     rows = []
     for group in groups:
         first = group[0]
+        q_eval = first["module"] == Q_PROTOCOL
+        metadata = first.get("metadata", {})
+        lower = metadata.get("frozen_lower") or {}
+        provenance = {}
+        if lower:
+            provenance.update(frozen_lower_checkpoint=lower["checkpoint"], frozen_lower_sha256=lower["sha256"])
+        if height := metadata.get("episode_height_range_m"):
+            provenance.update(episode_height_min_m=round(height[0], 6), episode_height_max_m=round(height[1], 6))
         episodes = []
         for case in group:
-            expected = episode_specs(benchmark, case)
+            expected = (q_episode_specs if q_eval else episode_specs)(benchmark, case)
             records = case["episodes"]
             if len(records) != len(expected) or any(
                 any(record.get(key) != value for key, value in spec.items())
@@ -30,7 +77,7 @@ def summarize_upper(benchmark, groups):
                 raise ValueError(f"Upper evaluation cases differ from the suite for seed {case['seed']}")
             episodes.extend(records)
 
-        for mode in ("aggregate", *ARM_MODES):
+        for mode in ("aggregate",) if q_eval else ("aggregate", *ARM_MODES):
             selected = (
                 episodes if mode == "aggregate" else [record for record in episodes if record["arm_mode"] == mode]
             )
@@ -41,6 +88,7 @@ def summarize_upper(benchmark, groups):
                 "checkpoint": first["checkpoint"]["label"],
                 "checkpoint_path": first["checkpoint"]["path"],
                 "checkpoint_sha256": first["checkpoint"]["sha256"],
+                **provenance,
                 **{field: first[field] for field in GROUP_FIELDS},
                 "mode": mode,
                 "seed_count": len(group),
@@ -60,5 +108,7 @@ def summarize_upper(benchmark, groups):
                 values = [record[key] for record in records]
                 row[key] = fmean(values) if values else None
                 row[f"{key}_std"] = pstdev(values) if values else None
+            if q_eval:
+                _summarize_q(row, metadata, selected, windows)
             rows.append(row)
     return rows

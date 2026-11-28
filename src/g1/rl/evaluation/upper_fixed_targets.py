@@ -17,8 +17,28 @@ CONTROL_DT = 1 / 60
 AXES = ("x", "y", "z")
 
 
+def upper_height_bounds(value, name):
+    lo, hi = _bounds(value, name)
+    if lo == hi or not lo <= 0 <= hi:
+        raise ValueError(f"{name} must have nonzero width and contain zero (default standing height)")
+    return lo, hi
+
+
+def resolve_upper_height_range(upper, lower, requested=None):
+    """Constrain the Upper action mapping to both policies' command ranges."""
+    upper_lo, upper_hi = upper_height_bounds(upper, "Upper checkpoint height range")
+    lower_lo, lower_hi = upper_height_bounds(lower, "Frozen Lower training height range")
+    common = upper_height_bounds((max(upper_lo, lower_lo), min(upper_hi, lower_hi)), "Common height range")
+    if requested is None:
+        return common
+    lo, hi = upper_height_bounds(requested, "--upper-height-range")
+    if lo < common[0] - 1e-9 or hi > common[1] + 1e-9:
+        raise ValueError(f"--upper-height-range {lo, hi} must be within the common height range {common}")
+    return upper_height_bounds((max(lo, common[0]), min(hi, common[1])), "Effective height range")
+
+
 def validate_upper_suite(raw):
-    _mapping(raw, "suite", ("schema_version", "suite", "task", "benchmark"), ("policy_outputs",))
+    _mapping(raw, "suite", ("schema_version", "suite", "task", "benchmark"), ("policy_outputs", "protocol"))
     _integer(raw["schema_version"], "schema_version", minimum=SCHEMA_VERSION, maximum=SCHEMA_VERSION)
     name = raw["suite"]
     if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
@@ -28,6 +48,21 @@ def validate_upper_suite(raw):
     outputs = list(_sequence(raw.get("policy_outputs", ["mean"]), "policy_outputs"))
     if any(output not in ("mean", "sample") for output in outputs) or len(set(outputs)) != len(outputs):
         raise ValueError("policy_outputs must contain unique entries from mean and sample")
+
+    if "protocol" in raw:
+        from .upper_q import PROTOCOL as Q_PROTOCOL
+        from .upper_q import validate_q_benchmark
+
+        if raw["protocol"] != Q_PROTOCOL:
+            raise ValueError(f"Unknown Upper Eval protocol: {raw['protocol']}")
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "suite": name,
+            "task": TASK,
+            "protocol": Q_PROTOCOL,
+            "policy_outputs": outputs,
+            "benchmark": validate_q_benchmark(raw["benchmark"]),
+        }
 
     timing = ("near_episode_s", "settle_s", "evaluation_s", "far_speed_m_s", "far_acceleration_m_s2")
     fields = ("seeds", "episodes_per_seed", "level", "target_ranges_m", *timing)

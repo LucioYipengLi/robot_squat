@@ -18,9 +18,10 @@ def read_index(directory):
     directory = Path(directory)
     run = json.loads((directory / "run.json").read_text(encoding="utf-8"))
     if run.get("schema_version") != 1:
-        raise ValueError("Unsupported failure archive schema")
+        raise ValueError("Unsupported replay archive schema")
     samples = []
-    with (directory / "failures.jsonl").open(encoding="utf-8") as stream:
+    index_file = "clips.jsonl" if run.get("archive_kind") == "upper_q_eval" else "failures.jsonl"
+    with (directory / index_file).open(encoding="utf-8") as stream:
         for line in stream:
             if line.endswith("\n"):
                 samples.append(json.loads(line))
@@ -39,7 +40,9 @@ def sample_payload(directory, sample_id):
     if path.parent != directory / "clips":
         raise ValueError("Clip must be inside the archive")
     with np.load(path, allow_pickle=False) as data:
-        names = ("time", "body_pose", "goal_pose", "pair_force", "net_force", "contact_pos")
+        names = ("time", "body_pose", "goal_pose")
+        if "pair_force" in data:
+            names += ("pair_force", "net_force", "contact_pos")
         return plain({key: np.asarray(data[key], dtype=np.float64).round(6) for key in names})
 
 
@@ -79,7 +82,7 @@ class ArchiveHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
         except (OSError, ValueError, KeyError) as error:
-            self.send_error(400, "Invalid or incomplete failure archive", str(error))
+            self.send_error(400, "Invalid or incomplete replay archive", str(error))
 
     def log_message(self, *_):
         pass

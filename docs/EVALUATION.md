@@ -7,6 +7,7 @@
 只测试推扰可使用 [独立推扰评估](LOWER_PUSH_EVALUATION.md)，入口为 `--suite g1_lower_push`，默认使用 Phase 3 最终训练幅度 ±0.70 m/s。
 
 - [Upper Mobile 固定目标评估](#upper-mobile-固定目标评估)
+- [Upper Mobile 双腕 Q 评估](#upper-mobile-双腕-q-评估)
 - [第一部分：快速评估与查看结果](#第一部分快速评估与查看结果)：选择内置套件、运行评估、恢复任务、阅读 TensorBoard。
 - [第二部分：创建 suite 与评估过程详解](#第二部分创建-suite-与评估过程详解)：编写自定义套件，了解参数、用例生成、模型加载和指标口径。
 
@@ -20,11 +21,53 @@ uv run python -m g1.rl eval --suite g1_upper_fixed_targets --checkpoints "upper_
 
 默认种子为 42，每组 96 回合，左手、右手和双手交替。可用 `--seeds` 和 `--episodes-per-seed` 调整。用例目标独立于并行环境数、检查点和自动重置顺序。
 
+### 对比同一 Upper 搭配不同 Lower
+
+`--frozen-lower-checkpoint` 仅在本次 Upper Eval 中替换下肢权重；省略时仍按 Upper 检查点的哈希查找原下肢。替换模型使用自己目录的 `params/env.yaml`（以及存在时的 `params/agent.yaml`），仍须通过冻结 Lower 的接口校验。
+
+替换时默认取 Upper 原高度动作范围与选定 Lower 训练高度范围的交集。要固定两组的高度动作映射，可分别传入相同的 `--upper-height-range MIN MAX`（相对默认站高，单位 m），范围须落在交集内。以下是 `upper_p4` 的两组命令：
+
+```powershell
+uv run python -m g1.rl eval --suite g1_upper_fixed_targets --checkpoints "p4_original=logs/rsl_rl/g1_upper_mobile/upper_p4/model_123197.pt" --upper-height-range -0.39 0.05 --num-envs 128 --output outputs/eval/upper_p4_original_lower
+uv run python -m g1.rl eval --suite g1_upper_fixed_targets --checkpoints "p4_new_lower=logs/rsl_rl/g1_upper_mobile/upper_p4/model_123197.pt" --frozen-lower-checkpoint logs/rsl_rl/g1_flat/11-27_p3/model_19997.pt --upper-height-range -0.39 0.05 --num-envs 128 --output outputs/eval/upper_p4_lower_11_27
+```
+
+两组使用同一批目标；各 Lower 仍使用自己的高度–速度包络，因此比较的是实际搭配效果。`summary.csv` 记录加载的 Lower 路径和哈希，以及当前 Level 的每回合高度动作范围。覆盖模型与配置的哈希写入 `manifest.json`，`--resume` 会验证这些输入；`--plan-only` 仅检查文件与参数格式，模型接口与范围交集在执行时验证。
+
+### 目标与指标
+
 要改范围，复制内置 YAML，修改 `benchmark.target_ranges_m.near` 和 `far` 下的轴范围，单位均为 m。用 `--suite config/你的文件.yaml` 加载副本。目标相对默认腕位姿生成，水平轴采用重置朝向，双手共享平移，目标在世界坐标中保持一回合。近端默认运行 10 s，远端按水平距离分配移动时间，再留 2 s 安定时间。两组均使用末段 2 s 评价腕部。
 
 - 躯干稳定性为从目标生效到终止的平均绝对 Roll 和 Pitch，再对两轴取平均，单位为度。
 - 腕部到达精度为末段窗口内活动腕的平均位置误差，单位为 mm。汇总使用完整窗口；部分窗口仍保留有效帧及误差。
 - `cases/<job_id>/case_specs.json` 保存偏移与时序，`result.json` 保存实际目标、失败原因及逐回合指标。通过 `report_latest.json` 找到 CSV、JSON 和 TensorBoard 报告。TensorBoard 横轴 0 为近端，1 为远端。
+
+## Upper Mobile 双腕 Q 评估
+
+独立套件 [g1_upper_workspace_q](../src/g1/rl/evaluation/suites/g1_upper_workspace_q.yaml) 在同一份地图和用例下比较 Upper 检查点。默认在 Level 7、标称物理配置、策略均值动作下运行，可用以下命令对照三组 Q 权重：
+
+```powershell
+uv run python -m g1.rl eval --suite g1_upper_workspace_q --checkpoints "q0p0=logs/rsl_rl/g1_upper_mobile/q0p0/model_5999.pt" "q0p2=logs/rsl_rl/g1_upper_mobile/q0p2/model_5999.pt" "q1p2=logs/rsl_rl/g1_upper_mobile/q1p2/model_5999.pt" --q-mode both --num-envs 24 --output outputs/eval/upper_workspace_q_compare
+```
+
+- `--q-mode random`：按种子生成默认 24 对目标。每对目标对两个默认腕位姿施加相同平移，保留默认朝向，平移的 X/Y 使用机器人初始朝向的前向/侧向，Z 使用世界竖直轴。`--episodes-per-seed` 只调整此模式的数量。
+- `--q-mode fixed`：每个种子运行一对指定目标。默认左腕 `[-0.1, 0.3, 0.75] / [0.003, 0.003, 89.989]`，右腕 `[0.1, 0.3, 0.75] / [-0.003, 0.003, 90.011]`。可传 `--left-wrist-pose X Y Z ROLL PITCH YAW`、`--right-wrist-pose X Y Z ROLL PITCH YAW` 覆盖。XYZ 为子环境原点相对的米数，RPY 为世界对齐坐标轴下的角度（度），按 `Rz × Ry × Rx` 转为四元数。
+- `--q-mode both`（默认）：两组一起运行，TensorBoard 横轴 0 为随机，1 为指定。两种模式都只跑双手，世界目标在回合内不移动。
+
+默认每回合 20 秒，统一取最后 2 秒。完整、未失败且左右腕世界系线速度 RMS 都不超过 0.03 m/s 的窗口进入稳态 Q 和分腕位姿误差汇总。`summary.csv` 包含基于当前骨盆姿态查表的实际腕部 Q、目标 Q、归一化和原始值、覆盖率以及各腕的稳态位置（mm）和朝向（rad）误差。双腕 Q 只使用两腕同时有有效地图值的帧。地图外或缺格点为空；非稳态或提前失败的回合保留在 `result.json`，同时看稳态窗口比例和失败率。
+
+Q 表固定为同一份 0 kg 位置先验，右腕按现有 Y 镜像查询。Q 值描述该位置的先验评分；比较时要同时看腕部误差和覆盖率。默认三组各自使用归档 Lower；这三个 checkpoint 的归档下肢权重相同。如需统一换成另一版 Lower，可给整批评估传 `--frozen-lower-checkpoint`。
+
+要复盘 20 秒 fixed 用例，将上方命令改成 `--q-mode fixed --episode-length-s 20`，并指定新的 `--output`。若需要完全匹配既有的 `upper_workspace_q_compare_20s`，右腕 yaw 用 `90.011`，即加上 `--right-wrist-pose 0.1 0.3 0.75 -0.003 0.003 90.011`。新报告的 `timeline.csv` 按回合每 2 秒记录左右腕误差、线速度 RMS、实际/目标 Q 和查表覆盖率；提前终止的尾段用实际帧数汇总。这些是观察窗口的数值，仍在运动的窗也保留。原来的最后 2 秒稳态汇总逻辑不变。
+
+每个模型、模式和种子保留第一个相同用例的控制步轨迹，包含初始帧、终止帧、全身刚体位姿、关节状态、动作、有效下肢指令和腕部目标。评估结束时会打印 Viewer 命令；也可在 PowerShell 中读取报告路径：
+
+```powershell
+$report = Get-Content outputs/eval/upper_workspace_q_compare/report_latest.json -Raw | ConvertFrom-Json
+uv run python -m g1.rl failures view --run $report.replay_dir
+```
+
+Viewer 在浏览器中原样播放记录的运动，可切换模型、拖动时间轴并查看对应的 2 秒指标，无需重新跑物理或推理。旧评估只保存了末段汇总，需重跑才能生成分窗和轨迹。
 
 ## 第一部分：快速评估与查看结果
 
